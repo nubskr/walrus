@@ -47,6 +47,18 @@ fn now_millis_str() -> String {
         .to_string()
 }
 
+fn checksum64(data: &[u8]) -> u64 {
+    // FNV-1a 64-bit checksum
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 #[derive(Clone)]
 
 struct Entry {
@@ -59,6 +71,7 @@ struct Metadata {
     read_size: usize,
     owned_by: String,
     next_block_start: u64,
+    checksum: u64,
 }
 
 // todo: add checksum and mmap object here too
@@ -80,6 +93,7 @@ impl Block {
             read_size: data.len(),
             owned_by: owned_by.to_string(),
             next_block_start,
+            checksum: checksum64(data),
         };
         
         // Serialize metadata with rkyv - MUCH faster than JSON
@@ -103,7 +117,7 @@ impl Block {
         Ok(())
     }
 
-    fn read(&self, in_block_offset: u64) -> Option<Entry>{
+    fn read(&self, in_block_offset: u64) -> std::io::Result<Entry>{
         let mut meta_buffer = vec![0; PREFIX_META_SIZE];
         let file_offset = self.offset + in_block_offset;
         self.mmap.read(file_offset as usize, &mut meta_buffer);
@@ -121,7 +135,13 @@ impl Block {
         let mut ret_buffer = vec![0; actual_entry_size as usize];
         self.mmap.read(new_offset as usize, &mut ret_buffer);
 
-        Some(Entry { data: ret_buffer })
+        // Verify checksum; error on mismatch
+        let expected = archived.checksum;
+        if checksum64(&ret_buffer) != expected {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch, data corruption detected"));
+        }
+
+        Ok(Entry { data: ret_buffer })
     }
 
 }
@@ -481,7 +501,6 @@ impl Walrus {
     // TODO: we need to add checksums in the entry metadata btw
     // TODO: Crash recovery ?? we need to make some things durable...
     // truncation(dealing with this right now)
-    // checksums
     // failure recovery!!
 }
 
