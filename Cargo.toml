@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 memmap2 = "0.9.8"
+rkyv = { version = "0.7", features = ["validation", "strict"] }
