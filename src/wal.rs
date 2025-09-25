@@ -4,8 +4,9 @@ just do the dumbest thing now, first thing which comes to your mind, that's it
 we will do it all in one file
 */
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::SystemTime;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use memmap2::MmapMut;
@@ -161,15 +162,25 @@ impl BlockAllocator {
         })
     }
     
+    // I NEED TO LOCK THE FUCKING BLOCK WE ARE ALLOCATING, WHERE DO I PUT IT HERE AAAAAAAAAAAAAAA
     pub unsafe fn get_next_available_block(&self) -> Block {
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };
+        let mut prev_block_file_path = data.file_path.clone();
         if data.offset >= MAX_FILE_SIZE {
+            // mark previous file as fully allocated before switching
+            FileStateTracker::set_fully_allocated(prev_block_file_path);
             data.file_path = make_new_file();
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path);
             data.offset = 0;
             data.used = 0;
         }
+
+        // set the cur block as locked
+        BlockStateTracker::register_block(data.id as usize, &data.file_path);
+        FileStateTracker::register_file_if_absent(&data.file_path);
+        FileStateTracker::add_block_to_file_state(&data.file_path);
+        FileStateTracker::set_block_locked(data.id as usize);
         let ret = data.clone();
         data.offset += DEFAULT_BLOCK_SIZE;
         data.id += 1;
@@ -187,9 +198,12 @@ impl BlockAllocator {
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };
         if data.offset + alloc_size > MAX_FILE_SIZE {
+            let prev_block_file_path = data.file_path.clone();
             data.file_path = make_new_file();
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path);
             data.offset = 0;
+            // mark the previous file fully allocated now
+            FileStateTracker::set_fully_allocated(prev_block_file_path);
         }
         let ret = Block {
             id: data.id,
@@ -199,6 +213,11 @@ impl BlockAllocator {
             mmap: data.mmap.clone(),
             used: 0,
         };
+        // register the new block before handing it out
+        BlockStateTracker::register_block(ret.id as usize, &ret.file_path);
+        FileStateTracker::register_file_if_absent(&ret.file_path);
+        FileStateTracker::add_block_to_file_state(&ret.file_path);
+        FileStateTracker::set_block_locked(ret.id as usize);
         data.offset += alloc_size;
         data.id += 1;
         self.unlock();
@@ -241,9 +260,12 @@ impl Writer {
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
+            FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
             self.reader.append_block_to_chain(&self.col, sealed);
+            // okay, so I think we can umm.. release the lock on this block now
+            // atomically -1 on the 
             let new_block = unsafe { self.allocator.alloc_block(data.len() as u64) }?;
             *block = new_block;
             *cur = 0;
@@ -361,7 +383,7 @@ impl SharedMmapKeeper {
 
 struct ColReaderInfo {
     chain: Vec<Block>,
-    cur_block_idx: usize,
+    cur_block_idx: usize, // this is just block id my man
     cur_block_offset: u64
 }
 
@@ -423,12 +445,13 @@ pub struct WalIndex {
 }
 
 impl WalIndex {
-    pub fn new() -> Self {
+    pub fn new(file_name: &str) -> Self {
+        // let tmp_path = format!("{}", );
         fs::create_dir_all("./wal_files").ok();
-        let path = "./wal_files/index.db";
-        
-        let store = Path::new(path).exists()
-            .then(|| fs::read(path).ok())
+        let path = format!("./wal_files/{}_index.db",file_name) ;
+
+        let store = Path::new(&path).exists()
+            .then(|| fs::read(&path).ok())
             .flatten()
             .and_then(|bytes| (!bytes.is_empty()).then(|| unsafe {
                 rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes)
@@ -481,7 +504,8 @@ pub struct Walrus {
     reader: Arc<Reader>,
     writers: RwLock<HashMap<String, Arc<Writer>>>,
     fsync_tx: Arc<mpsc::Sender<String>>,
-    index: Arc<RwLock<WalIndex>>,
+    read_offset_index: Arc<RwLock<WalIndex>>,
+    lock_idx: Arc<RwLock<WalIndex>>,
 }
 
 impl Walrus {
@@ -490,12 +514,17 @@ impl Walrus {
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
         let tx_arc = Arc::new(tx);
+        let (del_tx, del_rx) = mpsc::channel::<String>();
+        let del_tx_arc = Arc::new(del_tx);
+        let _ = DELETION_TX.set(del_tx_arc.clone());
         let pool: HashMap<String, MmapMut> = HashMap::new();
         let tick = Arc::new(AtomicU64::new(0));
         // background flusher
         thread::spawn(move || {
             let mut pool = pool;
             let tick = tick;
+            let del_rx = del_rx;
+            let mut delete_pending = std::collections::HashSet::new();
             loop {
                 thread::sleep(Duration::from_secs(FSYNC_SCHEDULE));
                 let mut unique = std::collections::HashSet::new();
@@ -509,16 +538,24 @@ impl Walrus {
                     });
                     let _ = mmap.flush();
                 }
+                // collect deletion requests
+                while let Ok(path) = del_rx.try_recv() {
+                    delete_pending.insert(path);
+                }
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
                 if n >= 3600 { // WARN: this currently assumes the FSYNC runs every second
                     if tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                         let mut empty: HashMap<String, MmapMut> = HashMap::new();
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
+                        // perform batched deletions now that mmaps are dropped
+                        for path in delete_pending.drain() {
+                            let _ = fs::remove_file(&path);
+                        }
                     }
                 }
             }
         });
-        Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, index: Arc::new(RwLock::new(WalIndex::new())) }
+        Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))),lock_idx: Arc::new(RwLock::new(WalIndex::new("lock_idx"))) }
     }
 
     pub fn append_for_topic(&self, col_name: &str, raw_bytes: &[u8]) -> std::io::Result<()> {
@@ -547,7 +584,7 @@ impl Walrus {
         let mut info = info_arc.write().ok()?;
 
         // Load current persisted position for this column and clamp to bounds
-        if let Ok(idx_guard) = self.index.read() {
+        if let Ok(idx_guard) = self.read_offset_index.read() {
             if let Some(pos) = idx_guard.get(col_name) {
                 let mut ib = pos.cur_block_idx as usize;
                 if ib > info.chain.len() { ib = info.chain.len(); }
@@ -568,6 +605,9 @@ impl Walrus {
             let block = &info.chain[info.cur_block_idx];
 
             if info.cur_block_offset >= block.used {
+                // we have fully read this block, now mark it as read in the BlockStateTracker
+                // so we need to 
+                BlockStateTracker::set_checkpointed_true(block.id as usize);
                 info.cur_block_idx += 1;
                 info.cur_block_offset = 0;
                 continue;
@@ -577,7 +617,7 @@ impl Walrus {
                 Ok((entry, consumed)) => {
                     info.cur_block_offset += consumed as u64;
                     // Persist updated position
-                    if let Ok(mut idx_guard) = self.index.write() {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
                         idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
                     }
                     return Some(entry);
@@ -633,3 +673,229 @@ got it ?
 okay, so we got a persistent state store now, what we'll do is:
 - whenever we do read_next() we update state store too!!
 */
+
+
+/*
+so we want three persistent states (WALIdx):
+
+- M[file_path] -> how much space is allocated in this // future nubskr: "not needed"
+---
+- M[col_name] -> what block and where in it are we at, i.e. block checkpoints
+- M[file_path] -> what blocks in this shit are locked by writers (and their counts as well)
+
+okay, okay, so... whenever a... block allocator is... changing to a new file, it does some of these checks
+
+like.... it already knows that this file is full huh... yeah, so I think we can skip the first persistent state.... yayyy
+nice, what else...
+
+- any writer still on this ??? okay.. this is tricky to do in sync, because.... it's blocking... or not ? oh wait, we have it all in mem huh, yeah, so just check for locks, ehehehh, nice
+okay, no locks, what after that
+all blocks acknowledged.... hmmm, tricky one, how to do this ? 
+so... for this, we would need to have.... block list per file in memory ?? yeah, seems like it or we can do it lazily(should we ? it's on the blockAllocator critical path sir)
+is there anythign we can do here ?? 
+
+blockallocator, what if we look at it..
+
+blockallocator knows when a file is fully allocated,
+blockallocator can easily... put it such that what block belongs to what file, can also add a... flag there, smth smth `is_checkpointed` for some block in that list for some file
+hmm, so... when a... block gets fully done... we make read_next() to update it in that state , oh wow, I see it now, this is beautiful
+what about the writer thingy... how to know if no... oh... okay
+
+so.... whenever we get an update in that file block chain thingy.... we would just check... "is this all ?" maybe have a darn.. counter there, 
+we would also need to only let it happen when a file is fully allocated...
+
+this is nice, I must draw it before it flies away...
+
+but what after it ? what after we realize that it's fully allocated ? 
+what/how to take it `into consideration` ?? 
+
+checks remaining after that:
+- no block in here locked by any writer (hmm, doable with the counter thing though..)
+- each individual block acknowledged, easy one with the checkpointed_block_ctr thingy 
+
+but the thing is... how the hell do we check... like, we check it after full allocation lock goes away, it has some writer block or some pending checkpoint acknowledgements, then what ?
+hmmm, fucking polling is annoying, idek from where to do it... and I don't want to do it... the thing is.. we just have to check two atomic counters each time huh.., yeah...
+
+`unlocked_block_ctr` and `checkpointed_block_ctr` , that's it
+but how/when to check ?? hmm, whenever update any of those two I guess ? :)))) eheheh
+holy fuck, woah, waow UwU , so just attempt the check of all done whenever:
+1. some writer unlocks some block and does atomic +1 on unlocked_block_ctr
+2. some read_next() call completes checkpointing a whole block
+
+and once we're good, we just.. do a mpsc producer event to delete a file and the consumer in our occasional job thread would pick it up, dedup and delete the file(s) :))))
+lets go mog everyone
+
+so the second one is literally free O(1) , the first one... can we do something similar to that cnt thingy ?
+smth like locked_block_ctr, I hope there are no race conditions here man.. like... I mean... we can just put that there before letting the darn fully_allocated lock go huh, LMAO, no race conditions then, eeheheheheheh
+ughh, 
+
+where to even start...
+let's add some sort of shitty first, the carcass
+
+I will destroy every single one of them
+own everything, destroy it all, burn it down
+*/
+
+static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();
+
+fn flush_check(file_path: String) {
+    // Quick readiness check; hook actual reclamation later
+    if let Some((locked, checkpointed, total, fully_allocated)) = FileStateTracker::get_state_snapshot(&file_path) {
+        let ready_to_delete = fully_allocated && locked == 0 && total > 0 && checkpointed >= total;
+        if ready_to_delete {
+            if let Some(tx) = DELETION_TX.get() {
+                let _ = tx.send(file_path);
+            }
+        }
+    }
+}
+
+struct BlockState {
+    is_checkpointed: AtomicBool, // is this thingy fully done or not, that's it, good thing that block IDs are unique globally
+    file_path: String,
+}
+
+struct BlockStateTracker {}
+
+impl BlockStateTracker {
+    fn map() -> &'static RwLock<HashMap<usize, BlockState>> {
+        static MAP: OnceLock<RwLock<HashMap<usize, BlockState>>> = OnceLock::new();
+        MAP.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    fn new() {
+        let _ = Self::map();
+    }
+
+    fn register_block(block_id: usize, file_path: &str) {
+        let map = Self::map();
+        let mut w = map.write().unwrap();
+        w.entry(block_id).or_insert_with(|| BlockState {
+            is_checkpointed: AtomicBool::new(false),
+            file_path: file_path.to_string(),
+        });
+    }
+
+    fn get_file_path_for_block(block_id: usize) -> Option<String> {
+        let map = Self::map();
+        let r = map.read().ok()?;
+        r.get(&block_id).map(|b| b.file_path.clone())
+    }
+
+    fn set_checkpointed_true(block_id: usize) {
+        let path_opt = {
+            let map = Self::map();
+            let r = map.read().unwrap();
+            if let Some(b) = r.get(&block_id) {
+                b.is_checkpointed.store(true, Ordering::Release);
+                Some(b.file_path.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(path) = path_opt {
+            FileStateTracker::inc_checkpoint_for_file(&path);
+            flush_check(path);
+        }
+    }
+}
+
+struct FileState {
+    // need to fucking keep track of what blocks this shit has too 
+    locked_block_ctr: AtomicU16, // no. of block locked by writers
+    checkpoint_block_ctr: AtomicU16, // no. of blocks already checkpointed
+    total_blocks: AtomicU16, // total blocks in this file
+    is_fully_allocated: AtomicBool // all blocks in the file allocated or not
+}
+
+struct FileStateTracker {}
+
+impl FileStateTracker {
+    fn map() -> &'static RwLock<HashMap<String, FileState>> {
+        static MAP: OnceLock<RwLock<HashMap<String, FileState>>> = OnceLock::new();
+        MAP.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    fn new() {
+        let _ = Self::map();
+    }
+
+    fn register_file_if_absent(file_path: &str) {
+        let map = Self::map();
+        let mut w = map.write().unwrap();
+        w.entry(file_path.to_string()).or_insert_with(|| FileState {
+            locked_block_ctr: AtomicU16::new(0),
+            checkpoint_block_ctr: AtomicU16::new(0),
+            total_blocks: AtomicU16::new(0),
+            is_fully_allocated: AtomicBool::new(false),
+        });
+    }
+
+    fn add_block_to_file_state(file_path: &str) {
+        Self::register_file_if_absent(file_path);
+        let map = Self::map();
+        if let Ok(r) = map.read() {
+            if let Some(st) = r.get(file_path) {
+                st.total_blocks.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn set_fully_allocated(file_path: String) {
+        Self::register_file_if_absent(&file_path);
+        let map = Self::map();
+        if let Ok(r) = map.read() {
+            if let Some(st) = r.get(&file_path) {
+                st.is_fully_allocated.store(true, Ordering::Release);
+            }
+        }
+        flush_check(file_path);
+    }
+
+    fn set_block_locked(block_id: usize) {
+        if let Some(path) = BlockStateTracker::get_file_path_for_block(block_id) {
+            let map = Self::map();
+            if let Ok(r) = map.read() {
+                if let Some(st) = r.get(&path) {
+                    st.locked_block_ctr.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+
+    fn set_block_unlocked(block_id: usize) {
+        if let Some(path) = BlockStateTracker::get_file_path_for_block(block_id) {
+            let map = Self::map();
+            if let Ok(r) = map.read() {
+                if let Some(st) = r.get(&path) {
+                    st.locked_block_ctr.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            flush_check(path);
+        }
+    }
+
+    fn inc_checkpoint_for_file(file_path: &str) {
+        let map = Self::map();
+        if let Ok(r) = map.read() {
+            if let Some(st) = r.get(file_path) {
+                st.checkpoint_block_ctr.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn get_state_snapshot(file_path: &str) -> Option<(u16, u16, u16, bool)> {
+        let map = Self::map();
+        let r = map.read().ok()?;
+        let st = r.get(file_path)?;
+        let locked = st.locked_block_ctr.load(Ordering::Acquire);
+        let checkpointed = st.checkpoint_block_ctr.load(Ordering::Acquire);
+        let total = st.total_blocks.load(Ordering::Acquire);
+        let fully = st.is_fully_allocated.load(Ordering::Acquire);
+        Some((locked, checkpointed, total, fully))
+    }
+}
+
+
+// make sure to use AcqRelease while updating Atomics ffs or you'll be fucked by entropy when you least expect it AHAHAHAH
