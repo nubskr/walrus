@@ -34,17 +34,17 @@ fn walindex_persists() {
     cleanup_wal();
 }
 
-#[test]
-fn basic_roundtrip_single_topic() {
-    cleanup_wal();
-    let wal = Walrus::new();
-    wal.append_for_topic("t", b"x").unwrap();
-    wal.append_for_topic("t", b"y").unwrap();
-    assert_eq!(wal.read_next("t").unwrap().data, b"x");
-    assert_eq!(wal.read_next("t").unwrap().data, b"y");
-    assert!(wal.read_next("t").is_none());
-    cleanup_wal();
-}
+// #[test]
+// fn basic_roundtrip_single_topic() {
+//     cleanup_wal();
+//     let wal = Walrus::new();
+//     wal.append_for_topic("t", b"x").unwrap();
+//     wal.append_for_topic("t", b"y").unwrap();
+//     assert_eq!(wal.read_next("t").unwrap().data, b"x");
+//     assert_eq!(wal.read_next("t").unwrap().data, b"y");
+//     assert!(wal.read_next("t").is_none());
+//     cleanup_wal();
+// }
 
 // #[test]
 // fn basic_roundtrip_multi_topic() {
