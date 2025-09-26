@@ -555,7 +555,9 @@ impl Walrus {
                 }
             }
         });
-        Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))),lock_idx: Arc::new(RwLock::new(WalIndex::new("lock_idx"))) }
+        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))),lock_idx: Arc::new(RwLock::new(WalIndex::new("lock_idx"))) };
+        instance.startup_chore();
+        instance
     }
 
     pub fn append_for_topic(&self, col_name: &str, raw_bytes: &[u8]) -> std::io::Result<()> {
@@ -637,11 +639,108 @@ impl Walrus {
 
     }
 
-    fn startup_chore() {
-        // what this is does is:
-        // - go to ./wal_files and checks all the files in there
-        // let's take care of the darn truncate from offset stuff
-        // okay, so for that to work, I need to ? /
+    fn startup_chore(&self) {
+        // Minimal recovery: scan wal_files, build reader chains, and rebuild trackers
+        let dir = match fs::read_dir("./wal_files") { Ok(d) => d, Err(_) => return };
+        let mut files: Vec<String> = Vec::new();
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if let Some(s) = path.to_str() {
+                // skip index files
+                if s.ends_with("_index.db") { continue; }
+                files.push(s.to_string());
+            }
+        }
+        files.sort();
+
+        // assign synthetic block ids
+        let mut next_block_id: usize = 1;
+        let mut seen_files = std::collections::HashSet::new();
+
+        for file_path in files.iter() {
+            let mmap = SharedMmapKeeper::get_mmap_arc(file_path);
+            seen_files.insert(file_path.clone());
+            FileStateTracker::register_file_if_absent(file_path);
+
+            let mut block_offset: u64 = 0;
+            while block_offset + DEFAULT_BLOCK_SIZE <= MAX_FILE_SIZE {
+                // heuristic: if first bytes are zero, assume no more blocks
+                let mut probe = [0u8; 8];
+                mmap.read((block_offset as usize), &mut probe);
+                if probe.iter().all(|&b| b == 0) {
+                    break;
+                }
+
+                let mut used: u64 = 0;
+                let mut col_name: Option<String> = None;
+
+                // try to read first metadata to get column name
+                let mut meta_buf = vec![0u8; PREFIX_META_SIZE];
+                mmap.read((block_offset as usize), &mut meta_buf);
+                let col_opt = (|| {
+                    let archived = unsafe { rkyv::archived_root::<Metadata>(&meta_buf[..]) };
+                    let md: Metadata = archived.deserialize(&mut rkyv::Infallible).ok()?;
+                    Some(md.owned_by)
+                })();
+                if col_opt.is_none() {
+                    break;
+                }
+                col_name = col_opt;
+
+                // scan entries to compute used
+                let block_stub = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used: 0 };
+                let mut in_block_off: u64 = 0;
+                loop {
+                    match block_stub.read(in_block_off) {
+                        Ok((_entry, consumed)) => {
+                            used += consumed as u64;
+                            in_block_off += consumed as u64;
+                            if in_block_off >= DEFAULT_BLOCK_SIZE { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if used == 0 { break; }
+
+                let mut block = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
+                // register and append
+                BlockStateTracker::register_block(next_block_id, file_path);
+                FileStateTracker::add_block_to_file_state(file_path);
+                if let Some(col) = col_name {
+                    self.reader.append_block_to_chain(&col, block.clone());
+                }
+                next_block_id += 1;
+                block_offset += DEFAULT_BLOCK_SIZE;
+            }
+        }
+
+        // restore read positions and checkpoint state
+        if let Ok(idx_guard) = self.read_offset_index.read() {
+            let map = self.reader.data.read().ok();
+            if let Some(map) = map {
+                for (col, info_arc) in map.iter() {
+                    if let Some(pos) = idx_guard.get(col) {
+                        let mut info = info_arc.write().unwrap();
+                        let mut ib = pos.cur_block_idx as usize;
+                        if ib > info.chain.len() { ib = info.chain.len(); }
+                        info.cur_block_idx = ib;
+                        if ib < info.chain.len() {
+                            let used = info.chain[ib].used;
+                            info.cur_block_offset = pos.cur_block_offset.min(used);
+                        } else {
+                            info.cur_block_offset = 0;
+                        }
+                        // checkpoint all blocks strictly before ib
+                        for i in 0..ib { BlockStateTracker::set_checkpointed_true(info.chain[i].id as usize); }
+                        // and checkpoint current if at end
+                        if ib < info.chain.len() && info.cur_block_offset >= info.chain[ib].used { BlockStateTracker::set_checkpointed_true(info.chain[ib].id as usize); }
+                    }
+                }
+            }
+        }
+
+        // enqueue deletion checks
+        for f in seen_files.into_iter() { flush_check(f); }
     }
 
     // TODO: we need to add checksums in the entry metadata btw
