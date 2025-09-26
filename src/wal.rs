@@ -46,7 +46,7 @@ fn checksum64(data: &[u8]) -> u64 {
     hash
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 
 pub struct Entry {
     pub data: Vec<u8> // raw bytes
@@ -85,9 +85,7 @@ impl Block {
         };
         
         // Serialize metadata with rkyv - MUCH faster than JSON
-        let mut serializer = AllocSerializer::<256>::default();
-        serializer.serialize_value(&new_meta).unwrap();
-        let meta_bytes = serializer.into_serializer().into_inner();
+        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).unwrap();
         if meta_bytes.len() > PREFIX_META_SIZE {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large for prefix"));
         }
@@ -111,13 +109,14 @@ impl Block {
         let file_offset = self.offset + in_block_offset;
         self.mmap.read(file_offset as usize, &mut meta_buffer);
 
+        // Ensure alignment for rkyv archived access
+        let mut aligned = rkyv::AlignedVec::with_capacity(PREFIX_META_SIZE);
+        aligned.extend_from_slice(&meta_buffer);
 
         // Zero-copy access to metadata - NO DESERIALIZATION
-        let archived = unsafe {
-            // This is safe because we know the buffer is valid
-            rkyv::archived_root::<Metadata>(&meta_buffer[..])
-        };
-        let actual_entry_size = archived.read_size;
+        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let actual_entry_size = meta.read_size;
 
         // Now read the actual data
         let new_offset = file_offset + PREFIX_META_SIZE as u64;
@@ -125,7 +124,7 @@ impl Block {
         self.mmap.read(new_offset as usize, &mut ret_buffer);
 
         // Verify checksum; error on mismatch
-        let expected = archived.checksum;
+        let expected = meta.checksum;
         if checksum64(&ret_buffer) != expected {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch, data corruption detected"));
         }
@@ -264,8 +263,7 @@ impl Writer {
             let mut sealed = block.clone();
             sealed.used = *cur;
             self.reader.append_block_to_chain(&self.col, sealed);
-            // okay, so I think we can umm.. release the lock on this block now
-            // atomically -1 on the 
+            // allocate and switch to a new block
             let new_block = unsafe { self.allocator.alloc_block(data.len() as u64) }?;
             *block = new_block;
             *cur = 0;
@@ -505,7 +503,6 @@ pub struct Walrus {
     writers: RwLock<HashMap<String, Arc<Writer>>>,
     fsync_tx: Arc<mpsc::Sender<String>>,
     read_offset_index: Arc<RwLock<WalIndex>>,
-    lock_idx: Arc<RwLock<WalIndex>>,
 }
 
 impl Walrus {
@@ -555,7 +552,7 @@ impl Walrus {
                 }
             }
         });
-        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))),lock_idx: Arc::new(RwLock::new(WalIndex::new("lock_idx"))) };
+        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))) };
         instance.startup_chore();
         instance
     }
