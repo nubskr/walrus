@@ -263,7 +263,8 @@ impl Writer {
             let mut sealed = block.clone();
             sealed.used = *cur;
             self.reader.append_block_to_chain(&self.col, sealed);
-            // allocate and switch to a new block
+            // okay, so I think we can umm.. release the lock on this block now
+            // atomically -1 on the 
             let new_block = unsafe { self.allocator.alloc_block(data.len() as u64) }?;
             *block = new_block;
             *cur = 0;
