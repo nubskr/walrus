@@ -28,5 +28,8 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      - name: Run tests
-        run: RUSTFLAGS=-Awarnings cargo test --lib --bins --tests -- --test-threads=1
+      - name: Run unit tests
+        run: RUSTFLAGS=-Awarnings cargo test --lib --bins --test unit -- --test-threads=1
+
+      - name: Run integration tests
+        run: RUSTFLAGS=-Awarnings cargo test --test integration -- --test-threads=1
