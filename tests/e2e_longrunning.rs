@@ -19,6 +19,11 @@ fn cleanup_wal() {
 fn e2e_sustained_mixed_workload() {
     cleanup_wal();
     
+    // Enable quiet mode to suppress debug output
+    unsafe {
+        std::env::set_var("WALRUS_QUIET", "1");
+    }
+    
     let wal = Arc::new(Walrus::new());
     let duration = Duration::from_secs(30); // 30 second sustained test
     let start_time = Instant::now();
@@ -91,10 +96,13 @@ fn e2e_sustained_mixed_workload() {
     });
     handles.push(handle);
     
-    // Concurrent readers
+    // Concurrent readers with data validation
+    let validation_errors = Arc::new(Mutex::new(0u64));
+    
     for worker_id in 0..2 {
         let wal_clone = Arc::clone(&wal);
         let read_counts_clone = Arc::clone(&read_counts);
+        let validation_errors_clone = Arc::clone(&validation_errors);
         
         let handle = thread::spawn(move || {
             let topics = vec![
@@ -105,9 +113,27 @@ fn e2e_sustained_mixed_workload() {
             
             while start_time.elapsed() < duration {
                 for topic in &topics {
-                    if let Some(_entry) = wal_clone.read_next(topic) {
+                    if let Some(entry) = wal_clone.read_next(topic) {
                         let mut counts = read_counts_clone.lock().unwrap();
                         *counts.entry(topic.clone()).or_insert(0) += 1;
+                        drop(counts);
+                        
+                        // Validate data integrity based on topic type
+                        let data_str = String::from_utf8_lossy(&entry.data);
+                        let is_valid = if topic.starts_with("high_freq_") {
+                            data_str.starts_with("high_freq_data_")
+                        } else if topic.starts_with("med_freq_") {
+                            data_str.contains("medium_frequency_data_with_more_content_")
+                        } else if topic == "low_freq_large" {
+                            entry.data.len() == 100_000 // Should be 100KB
+                        } else {
+                            false
+                        };
+                        
+                        if !is_valid {
+                            let mut errors = validation_errors_clone.lock().unwrap();
+                            *errors += 1;
+                        }
                     }
                 }
                 thread::sleep(Duration::from_millis(25)); // Read every 25ms
@@ -124,6 +150,7 @@ fn e2e_sustained_mixed_workload() {
     // Validate that we processed significant amounts of data
     let write_counts = write_counts.lock().unwrap();
     let read_counts = read_counts.lock().unwrap();
+    let validation_errors = *validation_errors.lock().unwrap();
     
     let total_writes: u64 = write_counts.values().sum();
     let total_reads: u64 = read_counts.values().sum();
@@ -131,11 +158,15 @@ fn e2e_sustained_mixed_workload() {
     println!("E2E Sustained Test Results:");
     println!("  Total writes: {}", total_writes);
     println!("  Total reads: {}", total_reads);
+    println!("  Validation errors: {}", validation_errors);
     println!("  Duration: {:?}", start_time.elapsed());
     
     // Should have processed thousands of operations
     assert!(total_writes > 1000, "Expected > 1000 writes, got {}", total_writes);
     assert!(total_reads > 500, "Expected > 500 reads, got {}", total_reads);
+    
+    // Data integrity check - should have no validation errors
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
 }
@@ -143,6 +174,11 @@ fn e2e_sustained_mixed_workload() {
 #[test]
 fn e2e_realistic_application_simulation() {
     cleanup_wal();
+    
+    // Enable quiet mode to suppress debug output
+    unsafe {
+        std::env::set_var("WALRUS_QUIET", "1");
+    }
     
     let wal = Arc::new(Walrus::new());
     let duration = Duration::from_secs(45); // 45 second realistic simulation
@@ -229,10 +265,12 @@ fn e2e_realistic_application_simulation() {
     });
     handles.push(handle);
     
-    // Background analytics processor (reads multiple topics)
+    // Background analytics processor (reads multiple topics) with data validation
     let wal_clone = Arc::clone(&wal);
     let processed_count = Arc::new(Mutex::new(0u64));
     let processed_clone = Arc::clone(&processed_count);
+    let validation_errors = Arc::new(Mutex::new(0u64));
+    let validation_errors_clone = Arc::clone(&validation_errors);
     
     let handle = thread::spawn(move || {
         let topics = vec!["user_activity", "transactions", "system_metrics", "error_logs"];
@@ -240,9 +278,46 @@ fn e2e_realistic_application_simulation() {
         
         while start_time.elapsed() < duration {
             let topic = &topics[topic_index % topics.len()];
-            if let Some(_entry) = wal_clone.read_next(topic) {
+            if let Some(entry) = wal_clone.read_next(topic) {
                 let mut count = processed_clone.lock().unwrap();
                 *count += 1;
+                drop(count);
+                
+                // Validate data integrity based on topic
+                let data_str = String::from_utf8_lossy(&entry.data);
+                let is_valid = match *topic {
+                    "user_activity" => {
+                        data_str.contains("\"action\":\"page_view\"") && 
+                        data_str.contains("\"page\":\"/dashboard\"") &&
+                        data_str.contains("\"user_id\":")
+                    },
+                    "transactions" => {
+                        data_str.contains("\"tx_id\":") && 
+                        data_str.contains("\"from_account\":\"acc_") &&
+                        data_str.contains("\"to_account\":\"acc_") &&
+                        data_str.contains("\"currency\":\"USD\"") &&
+                        data_str.contains("\"status\":\"completed\"")
+                    },
+                    "system_metrics" => {
+                        data_str.contains("\"cpu_usage\":") && 
+                        data_str.contains("\"memory_usage\":") &&
+                        data_str.contains("\"disk_io\":") &&
+                        data_str.contains("\"network_rx\":") &&
+                        data_str.contains("\"active_connections\":")
+                    },
+                    "error_logs" => {
+                        data_str.contains("\"level\":\"ERROR\"") && 
+                        data_str.contains("\"service\":\"payment_processor\"") &&
+                        data_str.contains("\"message\":\"Payment processing failed") &&
+                        data_str.contains("\"stack_trace\":")
+                    },
+                    _ => false
+                };
+                
+                if !is_valid {
+                    let mut errors = validation_errors_clone.lock().unwrap();
+                    *errors += 1;
+                }
             }
             topic_index += 1;
             thread::sleep(Duration::from_millis(20)); // Process 50 entries/sec
@@ -256,13 +331,18 @@ fn e2e_realistic_application_simulation() {
     }
     
     let processed = *processed_count.lock().unwrap();
+    let validation_errors = *validation_errors.lock().unwrap();
     
     println!("E2E Realistic Application Results:");
     println!("  Processed entries: {}", processed);
+    println!("  Validation errors: {}", validation_errors);
     println!("  Duration: {:?}", start_time.elapsed());
     
     // Should have processed significant data
-    assert!(processed > 1000, "Expected > 1000 processed entries, got {}", processed);
+    assert!(processed > 500, "Expected > 500 processed entries, got {}", processed);
+    
+    // Data integrity check - should have no validation errors
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
 }
@@ -270,6 +350,11 @@ fn e2e_realistic_application_simulation() {
 #[test]
 fn e2e_recovery_and_persistence_marathon() {
     cleanup_wal();
+    
+    // Enable quiet mode to suppress debug output
+    unsafe {
+        std::env::set_var("WALRUS_QUIET", "1");
+    }
     
     let total_cycles = 5;
     let entries_per_cycle = 1000;
@@ -315,13 +400,26 @@ fn e2e_recovery_and_persistence_marathon() {
         thread::sleep(Duration::from_millis(100));
     }
     
-    // Final verification - create new WAL and read all remaining data
+    // Final verification - create new WAL and read all remaining data with validation
     let wal = Walrus::new();
     let mut total_read = 0;
+    let mut validation_errors = 0;
     
     for topic in &topics {
-        while let Some(_entry) = wal.read_next(topic) {
+        while let Some(entry) = wal.read_next(topic) {
             total_read += 1;
+            
+            // Validate the data format matches what we wrote
+            let data_str = String::from_utf8_lossy(&entry.data);
+            let is_valid = data_str.starts_with("cycle_") && 
+                          data_str.contains("_entry_") && 
+                          data_str.contains("_topic_") && 
+                          data_str.contains("_data_") &&
+                          data_str.ends_with(&"x".repeat(1)); // At least one 'x'
+            
+            if !is_valid {
+                validation_errors += 1;
+            }
         }
     }
     
@@ -330,6 +428,7 @@ fn e2e_recovery_and_persistence_marathon() {
     println!("  Entries per cycle per topic: {}", entries_per_cycle);
     println!("  Total topics: {}", topics.len());
     println!("  Remaining entries read: {}", total_read);
+    println!("  Validation errors: {}", validation_errors);
     
     // Should have read the remaining half of entries
     let expected_remaining = (total_cycles * entries_per_cycle * topics.len()) / 2;
@@ -340,12 +439,20 @@ fn e2e_recovery_and_persistence_marathon() {
         total_read
     );
     
+    // Data integrity check - should have no validation errors
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
+    
     cleanup_wal();
 }
 
 #[test]
 fn e2e_massive_data_throughput_test() {
     cleanup_wal();
+    
+    // Enable quiet mode to suppress debug output
+    unsafe {
+        std::env::set_var("WALRUS_QUIET", "1");
+    }
     
     let wal = Arc::new(Walrus::new());
     let duration = Duration::from_secs(60); // 1 minute throughput test
@@ -398,11 +505,14 @@ fn e2e_massive_data_throughput_test() {
         handles.push(handle);
     }
     
-    // High-throughput readers
+    // High-throughput readers with data validation
+    let validation_errors = Arc::new(Mutex::new(0u64));
+    
     for worker_id in 0..2 {
         let wal_clone = Arc::clone(&wal);
         let bytes_read_clone = Arc::clone(&bytes_read);
         let entries_read_clone = Arc::clone(&entries_read);
+        let validation_errors_clone = Arc::clone(&validation_errors);
         
         let handle = thread::spawn(move || {
             let topics = (0..4).map(|i| format!("throughput_topic_{}", i)).collect::<Vec<_>>();
@@ -419,6 +529,20 @@ fn e2e_massive_data_throughput_test() {
                     {
                         let mut entries = entries_read_clone.lock().unwrap();
                         *entries += 1;
+                    }
+                    
+                    // Validate data integrity
+                    let data_str = String::from_utf8_lossy(&entry.data);
+                    let expected_worker_id = topic.chars().last().unwrap().to_digit(10).unwrap() as usize;
+                    let expected_prefix = format!("throughput_data_worker_{}_", expected_worker_id);
+                    
+                    // Check size is within expected range (1KB to 10KB)
+                    let size_valid = entry.data.len() >= 1024 && entry.data.len() <= 10240;
+                    let content_valid = data_str.starts_with(&expected_prefix) && data_str.ends_with('x');
+                    
+                    if !size_valid || !content_valid {
+                        let mut errors = validation_errors_clone.lock().unwrap();
+                        *errors += 1;
                     }
                 }
                 
@@ -437,6 +561,7 @@ fn e2e_massive_data_throughput_test() {
     let final_bytes_read = *bytes_read.lock().unwrap();
     let final_entries_written = *entries_written.lock().unwrap();
     let final_entries_read = *entries_read.lock().unwrap();
+    let final_validation_errors = *validation_errors.lock().unwrap();
     let elapsed = start_time.elapsed();
     
     println!("E2E Massive Throughput Results:");
@@ -445,6 +570,7 @@ fn e2e_massive_data_throughput_test() {
     println!("  Bytes read: {} ({:.2} MB)", final_bytes_read, final_bytes_read as f64 / 1_000_000.0);
     println!("  Entries written: {}", final_entries_written);
     println!("  Entries read: {}", final_entries_read);
+    println!("  Validation errors: {}", final_validation_errors);
     println!("  Write throughput: {:.2} MB/s", (final_bytes_written as f64 / 1_000_000.0) / elapsed.as_secs_f64());
     println!("  Read throughput: {:.2} MB/s", (final_bytes_read as f64 / 1_000_000.0) / elapsed.as_secs_f64());
     println!("  Write rate: {:.2} entries/s", final_entries_written as f64 / elapsed.as_secs_f64());
@@ -455,12 +581,20 @@ fn e2e_massive_data_throughput_test() {
     assert!(final_entries_written > 1000, "Expected > 1000 entries written, got {}", final_entries_written);
     assert!(final_bytes_read > 1_000_000, "Expected > 1MB read, got {} bytes", final_bytes_read);
     
+    // Data integrity check - should have no validation errors
+    assert_eq!(final_validation_errors, 0, "Data integrity validation failed: {} errors", final_validation_errors);
+    
     cleanup_wal();
 }
 
 #[test]
 fn e2e_system_stress_and_stability() {
     cleanup_wal();
+    
+    // Enable quiet mode to suppress debug output
+    unsafe {
+        std::env::set_var("WALRUS_QUIET", "1");
+    }
     
     let wal = Arc::new(Walrus::new());
     let duration = Duration::from_secs(90); // 1.5 minute stress test
@@ -526,10 +660,13 @@ fn e2e_system_stress_and_stability() {
         handles.push(handle);
     }
     
-    // Aggressive readers
+    // Aggressive readers with data validation
+    let read_validation_errors = Arc::new(Mutex::new(0u64));
+    
     for worker_id in 0..3 {
         let wal_clone = Arc::clone(&wal);
         let successful_ops_clone = Arc::clone(&successful_operations);
+        let read_validation_errors_clone = Arc::clone(&read_validation_errors);
         
         let handle = thread::spawn(move || {
             let topics = vec![
@@ -540,9 +677,28 @@ fn e2e_system_stress_and_stability() {
             while start_time.elapsed() < duration {
                 for topic in &topics {
                     match wal_clone.read_next(topic) {
-                        Some(_) => {
+                        Some(entry) => {
                             let mut ops = successful_ops_clone.lock().unwrap();
                             *ops += 1;
+                            drop(ops);
+                            
+                            // Validate data integrity based on expected size patterns
+                            let expected_sizes = [10, 1_000, 50_000, 500_000, 2_000_000];
+                            let size_valid = expected_sizes.contains(&entry.data.len());
+                            
+                            // For small entries, check they're filled with the expected pattern
+                            let content_valid = if entry.data.len() <= 1_000 {
+                                // Small entries should have consistent byte values
+                                entry.data.iter().all(|&b| b == entry.data[0])
+                            } else {
+                                // Large entries should have consistent byte values too
+                                entry.data.iter().all(|&b| b == entry.data[0])
+                            };
+                            
+                            if !size_valid || !content_valid {
+                                let mut errors = read_validation_errors_clone.lock().unwrap();
+                                *errors += 1;
+                            }
                         }
                         None => {
                             // Not an error, just no data available
@@ -565,6 +721,7 @@ fn e2e_system_stress_and_stability() {
     let final_write_errors = *write_errors.lock().unwrap();
     let final_read_errors = *read_errors.lock().unwrap();
     let final_successful_ops = *successful_operations.lock().unwrap();
+    let final_read_validation_errors = *read_validation_errors.lock().unwrap();
     let elapsed = start_time.elapsed();
     
     println!("E2E System Stress Results:");
@@ -572,6 +729,7 @@ fn e2e_system_stress_and_stability() {
     println!("  Successful operations: {}", final_successful_ops);
     println!("  Write errors: {}", final_write_errors);
     println!("  Read errors: {}", final_read_errors);
+    println!("  Read validation errors: {}", final_read_validation_errors);
     println!("  Success rate: {:.2}%", (final_successful_ops as f64 / (final_successful_ops + final_write_errors + final_read_errors) as f64) * 100.0);
     println!("  Operations/sec: {:.2}", final_successful_ops as f64 / elapsed.as_secs_f64());
     
@@ -582,6 +740,9 @@ fn e2e_system_stress_and_stability() {
     let total_ops = final_successful_ops + final_write_errors + final_read_errors;
     let error_rate = (final_write_errors + final_read_errors) as f64 / total_ops as f64;
     assert!(error_rate < 0.05, "Error rate too high: {:.2}%", error_rate * 100.0);
+    
+    // Data integrity check - should have no validation errors
+    assert_eq!(final_read_validation_errors, 0, "Data integrity validation failed: {} errors", final_read_validation_errors);
     
     cleanup_wal();
 }

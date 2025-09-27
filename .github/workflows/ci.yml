@@ -56,6 +56,31 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      - name: Run end-to-end long-running tests
-        run: cargo test --test e2e_longrunning e2e_performance_benchmark -- --test-threads=1 --nocapture
-        timeout-minutes: 30  # Allow up to 30 minutes for long-running tests // IOPS is fucked on CI I guess lmao
+      - name: Run end-to-end long-running tests with data integrity validation
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_sustained_mixed_workload e2e_realistic_application_simulation e2e_recovery_and_persistence_marathon e2e_massive_data_throughput_test e2e_system_stress_and_stability -- --test-threads=1 --nocapture
+        timeout-minutes: 15  # Allow up to 15 minutes for comprehensive e2e tests
+
+  e2e-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run performance benchmark shared VM
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_performance_benchmark -- --test-threads=1 --nocapture
+        timeout-minutes: 30  # Allow up to 30 minutes for benchmark // IOPS is fucked on CI I guess lmao
