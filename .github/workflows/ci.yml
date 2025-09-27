@@ -57,5 +57,5 @@ jobs:
         run: cargo build --locked
 
       - name: Run end-to-end long-running tests
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning -- --test-threads=1
-        timeout-minutes: 240  # Allow up to 240 minutes for long-running tests // IOPS is fucked on CI I guess lmao
+        run: cargo test --test e2e_longrunning e2e_performance_benchmark -- --test-threads=1 --nocapture
+        timeout-minutes: 30  # Allow up to 30 minutes for long-running tests // IOPS is fucked on CI I guess lmao
