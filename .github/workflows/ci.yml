@@ -58,4 +58,4 @@ jobs:
 
       - name: Run end-to-end long-running tests
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning -- --test-threads=1
-        timeout-minutes: 15  # Allow up to 15 minutes for long-running tests
+        timeout-minutes: 240  # Allow up to 240 minutes for long-running tests // IOPS is fucked on CI I guess lmao

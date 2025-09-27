@@ -601,7 +601,7 @@ fn e2e_performance_benchmark() {
     
     // Simple write benchmark - just count operations in a short time
     let start = Instant::now();
-    let duration = Duration::from_secs(60);
+    let duration = Duration::from_secs(300);
     let mut write_count = 0u64;
     let mut write_bytes = 0u64;
     
