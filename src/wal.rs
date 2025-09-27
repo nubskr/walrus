@@ -605,7 +605,7 @@ impl Walrus {
             }
         });
         let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))) };
-        // instance.startup_chore();
+        instance.startup_chore();
         instance
     }
 
@@ -628,65 +628,153 @@ impl Walrus {
     }
 
     pub fn read_next(&self, col_name: &str) -> Option<Entry> {
-        let info_arc = {
+        const TAIL_FLAG: u64 = 1u64 << 63;
+        let info_arc = if let Some(arc) = {
             let map = self.reader.data.read().ok()?;
-            map.get(col_name)?.clone()
+            map.get(col_name).cloned()
+        } { arc } else {
+            let mut map = self.reader.data.write().ok()?;
+            map.entry(col_name.to_string())
+                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0 })))
+                .clone()
         };
         let mut info = info_arc.write().ok()?;
         println!(
             "[reader] read_next start: col={}, chain_len={}, idx={}, offset={}",
             col_name, info.chain.len(), info.cur_block_idx, info.cur_block_offset
         );
-
-        // Load current persisted position for this column and clamp to bounds
+ 
+        // Load persisted position (supports tail sentinel)
+        let mut persisted_tail: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
         if let Ok(idx_guard) = self.read_offset_index.read() {
             if let Some(pos) = idx_guard.get(col_name) {
-                let mut ib = pos.cur_block_idx as usize;
-                if ib > info.chain.len() { ib = info.chain.len(); }
-                info.cur_block_idx = ib;
-                if ib < info.chain.len() {
-                    let used = info.chain[ib].used;
-                    info.cur_block_offset = pos.cur_block_offset.min(used);
-                } else {
+                if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+                    let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
+                    persisted_tail = Some((tail_block_id, pos.cur_block_offset));
+                    // sealed state is considered caught up
+                    info.cur_block_idx = info.chain.len();
                     info.cur_block_offset = 0;
+                } else {
+                    let mut ib = pos.cur_block_idx as usize;
+                    if ib > info.chain.len() { ib = info.chain.len(); }
+                    info.cur_block_idx = ib;
+                    if ib < info.chain.len() {
+                        let used = info.chain[ib].used;
+                        info.cur_block_offset = pos.cur_block_offset.min(used);
+                    } else {
+                        info.cur_block_offset = 0;
+                    }
                 }
             }
         }
 
-        loop {
-            if info.cur_block_idx >= info.chain.len() {
-                println!("[reader] read_next: None (idx>=len) col={}, idx={}, len={}", col_name, info.cur_block_idx, info.chain.len());
-                return None;
-            }
-            let idx = info.cur_block_idx;
-            let off = info.cur_block_offset;
-            let block = info.chain[idx].clone();
-
-            if off >= block.used {
-                println!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
-                // we have fully read this block, now mark it as read in the BlockStateTracker
-                // so we need to 
-                BlockStateTracker::set_checkpointed_true(block.id as usize);
-                info.cur_block_idx += 1;
-                info.cur_block_offset = 0;
-                continue;
-            }
-
-            match block.read(off) {
-                Ok((entry, consumed)) => {
-                    info.cur_block_offset = off + consumed as u64;
-                    // Persist updated position
-                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
-                    }
-                    println!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
-                    return Some(entry);
+        // If we have a persisted tail and some sealed blocks were recovered, fold into the last block
+        if let Some((_, tail_off)) = persisted_tail {
+            if !info.chain.is_empty() {
+                let ib = info.chain.len() - 1;
+                info.cur_block_idx = ib;
+                info.cur_block_offset = tail_off.min(info.chain[ib].used);
+                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                    idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
                 }
-                Err(_) => {
-                    println!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
+                persisted_tail = None;
+            }
+        }
+
+        loop {
+            // Sealed chain path
+            if info.cur_block_idx < info.chain.len() {
+                let idx = info.cur_block_idx;
+                let off = info.cur_block_offset;
+                let block = info.chain[idx].clone();
+
+                if off >= block.used {
+                    println!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
+                    BlockStateTracker::set_checkpointed_true(block.id as usize);
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
+                    continue;
                 }
+
+                match block.read(off) {
+                    Ok((entry, consumed)) => {
+                        info.cur_block_offset = off + consumed as u64;
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                        }
+                        println!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
+                        return Some(entry);
+                    }
+                    Err(_) => {
+                        println!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
+                        info.cur_block_idx += 1;
+                        info.cur_block_offset = 0;
+                        continue;
+                    }
+                }
+            }
+
+            // Tail path
+            let writer_arc = {
+                let map = self.writers.read().ok()?;
+                map.get(col_name)?.clone()
+            };
+            let (active_block, written) = {
+                let blk = writer_arc.current_block.lock().ok()?;
+                let off = writer_arc.current_offset.lock().ok()?;
+                (blk.clone(), *off)
+            };
+
+            // If persisted tail points to a different block and that block is now sealed in chain, fold it
+            if let Some((tail_block_id, tail_off)) = persisted_tail {
+                if tail_block_id != active_block.id {
+                    if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
+                        info.cur_block_idx = idx;
+                        info.cur_block_offset = tail_off.min(info.chain[idx].used);
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                        }
+                        persisted_tail = None; // sealed now
+                        continue;
+                    } else {
+                        // rebase tail to current active block at 0
+                        persisted_tail = Some((active_block.id, 0));
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                        }
+                    }
+                }
+            } else {
+                // No persisted tail; initialize at current active block start
+                persisted_tail = Some((active_block.id, 0));
+                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                    idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                }
+            }
+
+            let (tail_block_id, tail_off) = persisted_tail.unwrap();
+            // If writer rotated after we set persisted_tail, loop to fold/rebase
+            if tail_block_id != active_block.id { continue; }
+
+            if tail_off < written {
+                match active_block.read(tail_off) {
+                    Ok((entry, consumed)) => {
+                        let new_off = tail_off + consumed as u64;
+                        persisted_tail = Some((tail_block_id, new_off));
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            idx_guard.set(col_name.to_string(), (tail_block_id | TAIL_FLAG), new_off);
+                        }
+                        println!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
+                        return Some(entry);
+                    }
+                    Err(_) => {
+                        println!("[reader] read_next: tail read error col={}, block_id={}, offset={}", col_name, active_block.id, tail_off);
+                        return None;
+                    }
+                }
+            } else {
+                println!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
+                return None;
             }
         }
     }
@@ -727,7 +815,7 @@ impl Walrus {
             while block_offset + DEFAULT_BLOCK_SIZE <= MAX_FILE_SIZE {
                 // heuristic: if first bytes are zero, assume no more blocks
                 let mut probe = [0u8; 8];
-                mmap.read((block_offset as usize), &mut probe);
+                mmap.read(block_offset as usize, &mut probe);
                 if probe.iter().all(|&b| b == 0) {
                     break;
                 }
@@ -735,18 +823,18 @@ impl Walrus {
                 let mut used: u64 = 0;
                 let mut col_name: Option<String> = None;
 
-                // try to read first metadata to get column name
+                // try to read first metadata to get column name (with 2-byte length prefix)
                 let mut meta_buf = vec![0u8; PREFIX_META_SIZE];
-                mmap.read((block_offset as usize), &mut meta_buf);
-                let col_opt = (|| {
-                    let archived = unsafe { rkyv::archived_root::<Metadata>(&meta_buf[..]) };
-                    let md: Metadata = archived.deserialize(&mut rkyv::Infallible).ok()?;
-                    Some(md.owned_by)
-                })();
-                if col_opt.is_none() {
+                mmap.read(block_offset as usize, &mut meta_buf);
+                let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
+                if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
                     break;
                 }
-                col_name = col_opt;
+                let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
+                aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+                let md: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
+                col_name = Some(md.owned_by);
 
                 // scan entries to compute used
                 let block_stub = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used: 0 };
@@ -763,7 +851,7 @@ impl Walrus {
                 }
                 if used == 0 { break; }
 
-                let mut block = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
+                let block = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
                 // register and append
                 BlockStateTracker::register_block(next_block_id, file_path);
                 FileStateTracker::add_block_to_file_state(file_path);

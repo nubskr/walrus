@@ -54,47 +54,47 @@ fn large_entry_forces_block_seal() {
 
     assert_eq!(wal.read_next("t").unwrap().data, large_data_1);
     assert_eq!(wal.read_next("t").unwrap().data, large_data_2);
-    // assert_eq!(wal.read_next("t").unwrap().data, large_data_3); // it will fail because it's in the write block still :))
+    assert_eq!(wal.read_next("t").unwrap().data, large_data_3); // it will fail because it's in the write block still :))
     
     cleanup_wal();
 }
 
-// #[test]
-// fn basic_roundtrip_single_topic() {
-//     cleanup_wal();
-//     let wal = Walrus::new();
-//     wal.append_for_topic("t", b"x").unwrap();
-//     wal.append_for_topic("t", b"y").unwrap();
-//     assert_eq!(wal.read_next("t").unwrap().data, b"x");
-//     assert_eq!(wal.read_next("t").unwrap().data, b"y");
-//     assert!(wal.read_next("t").is_none());
-//     cleanup_wal();
-// }
+#[test]
+fn basic_roundtrip_single_topic() {
+    cleanup_wal();
+    let wal = Walrus::new();
+    wal.append_for_topic("t", b"x").unwrap();
+    wal.append_for_topic("t", b"y").unwrap();
+    assert_eq!(wal.read_next("t").unwrap().data, b"x");
+    assert_eq!(wal.read_next("t").unwrap().data, b"y");
+    assert!(wal.read_next("t").is_none());
+    cleanup_wal();
+}
 
-// #[test]
-// fn basic_roundtrip_multi_topic() {
-//     cleanup_wal();
-//     let wal = Walrus::new();
-//     wal.append_for_topic("a", b"1").unwrap();
-//     wal.append_for_topic("b", b"2").unwrap();
-//     assert_eq!(wal.read_next("a").unwrap().data, b"1");
-//     assert_eq!(wal.read_next("b").unwrap().data, b"2");
-//     cleanup_wal();
-// }
+#[test]
+fn basic_roundtrip_multi_topic() {
+    cleanup_wal();
+    let wal = Walrus::new();
+    wal.append_for_topic("a", b"1").unwrap();
+    wal.append_for_topic("b", b"2").unwrap();
+    assert_eq!(wal.read_next("a").unwrap().data, b"1");
+    assert_eq!(wal.read_next("b").unwrap().data, b"2");
+    cleanup_wal();
+}
 
-// #[test]
-// fn persists_read_offsets_across_restart() {
-//     cleanup_wal();
-//     let wal = Walrus::new();
-//     wal.append_for_topic("t", b"a").unwrap();
-//     wal.append_for_topic("t", b"b").unwrap();
-//     assert_eq!(wal.read_next("t").unwrap().data, b"a");
-//     // restart
-//     let wal2 = Walrus::new();
-//     assert_eq!(wal2.read_next("t").unwrap().data, b"b");
-//     assert!(wal2.read_next("t").is_none());
-//     cleanup_wal();
-// }
+#[test]
+fn persists_read_offsets_across_restart() {
+    cleanup_wal();
+    let wal = Walrus::new();
+    wal.append_for_topic("t", b"a").unwrap();
+    wal.append_for_topic("t", b"b").unwrap();
+    assert_eq!(wal.read_next("t").unwrap().data, b"a");
+    // restart
+    let wal2 = Walrus::new();
+    assert_eq!(wal2.read_next("t").unwrap().data, b"b");
+    assert!(wal2.read_next("t").is_none());
+    cleanup_wal();
+}
 
 #[test]
 fn checksum_corruption_is_detected_via_public_api() {
