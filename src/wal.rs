@@ -19,6 +19,15 @@ use rkyv::ser::{Serializer, serializers::AllocSerializer};
 use std::fs;
 use std::path::Path;
 
+// Macro to conditionally print debug messages
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        if std::env::var("WALRUS_QUIET").is_err() {
+            println!($($arg)*);
+        }
+    };
+}
+
 const DEFAULT_BLOCK_SIZE:u64 = 10 * 1024 * 1024; // 10mb
 const BLOCKS_PER_FILE:u64 = 100;
 const MAX_ALLOC:u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
@@ -167,7 +176,7 @@ impl BlockAllocator {
         std::fs::create_dir_all("wal_files").ok();
         let file1 = make_new_file();
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1);
-        println!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
+        debug_print!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
         Ok(BlockAllocator {
             next_block: UnsafeCell::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }),
             lock: AtomicBool::new(false),
@@ -186,7 +195,7 @@ impl BlockAllocator {
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path);
             data.offset = 0;
             data.used = 0;
-            println!("[alloc] rolled over to new file: {}", data.file_path);
+            debug_print!("[alloc] rolled over to new file: {}", data.file_path);
         }
 
         // set the cur block as locked
@@ -198,7 +207,7 @@ impl BlockAllocator {
         data.offset += DEFAULT_BLOCK_SIZE;
         data.id += 1;
         self.unlock();
-        println!(
+        debug_print!(
             "[alloc] handout: block_id={}, file={}, offset={}, limit={}",
             ret.id, ret.file_path, ret.offset, ret.limit
         );
@@ -211,7 +220,7 @@ impl BlockAllocator {
         }
         let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
-        println!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
+        debug_print!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
 
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };
@@ -222,7 +231,7 @@ impl BlockAllocator {
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
-            println!("[alloc] file rollover for sized alloc -> {}", data.file_path);
+            debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
         }
         let ret = Block {
             id: data.id,
@@ -240,7 +249,7 @@ impl BlockAllocator {
         data.offset += alloc_size;
         data.id += 1;
         self.unlock();
-        println!(
+        debug_print!(
             "[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}",
             ret.id, ret.file_path, ret.offset, ret.limit
         );
@@ -283,7 +292,7 @@ impl Writer {
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
-            println!(
+            debug_print!(
                 "[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}",
                 self.col, block.id, *cur, need, block.limit
             );
@@ -292,16 +301,16 @@ impl Writer {
             sealed.used = *cur;
             sealed.mmap.flush()?;
             self.reader.append_block_to_chain(&self.col, sealed);
-            println!("[writer] appended sealed block to chain: col={}", self.col);
+            debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
             let new_block = unsafe { self.allocator.alloc_block(need) }?;
-            println!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
+            debug_print!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
             *block = new_block;
             *cur = 0;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
         block.write(*cur, data, &self.col, next_block_start)?;
-        println!(
+        debug_print!(
             "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
             self.col, block.id, *cur, need, *cur + need
         );
@@ -450,7 +459,7 @@ impl Reader {
             let mut info = info_arc.write().unwrap();
             let before = info.chain.len();
             info.chain.push(block.clone());
-            println!(
+            debug_print!(
                 "[reader] chain append(fast): col={}, block_id={}, chain_len {}->{}",
                 col, block.id, before, before + 1
             );
@@ -466,7 +475,7 @@ impl Reader {
         };
         let mut info = info_arc.write().unwrap();
         info.chain.push(block.clone());
-        println!(
+        debug_print!(
             "[reader] chain append(slow/new): col={}, block_id={}, chain_len {}->{}",
             col, block.id, 0, 1
         );
@@ -553,7 +562,7 @@ pub struct Walrus {
 
 impl Walrus {
     pub fn new() -> Self {
-        println!("[walrus] new");
+        debug_print!("[walrus] new");
         let allocator = Arc::new(BlockAllocator::new().unwrap());
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
@@ -575,17 +584,17 @@ impl Walrus {
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
                 }
-                if !unique.is_empty() { println!("[flush] scheduling {} paths", unique.len()); }
+                if !unique.is_empty() { debug_print!("[flush] scheduling {} paths", unique.len()); }
                 for path in unique.into_iter() {
                     let mmap = pool.entry(path.clone()).or_insert_with(|| {
                         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
                         unsafe { MmapMut::map_mut(&file).unwrap() }
                     });
-                    if let Err(e) = mmap.flush() { println!("[flush] flush error for {}: {}", path, e); }
+                    if let Err(e) = mmap.flush() { debug_print!("[flush] flush error for {}: {}", path, e); }
                 }
                 // collect deletion requests
                 while let Ok(path) = del_rx.try_recv() {
-                    println!("[reclaim] deletion requested: {}", path);
+                    debug_print!("[reclaim] deletion requested: {}", path);
                     delete_pending.insert(path);
                 }
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -596,8 +605,8 @@ impl Walrus {
                         // perform batched deletions now that mmaps are dropped
                         for path in delete_pending.drain() {
                             match fs::remove_file(&path) {
-                                Ok(_) => println!("[reclaim] deleted file {}", path),
-                                Err(e) => println!("[reclaim] delete failed for {}: {}", path, e),
+                                Ok(_) => debug_print!("[reclaim] deleted file {}", path),
+                                Err(e) => debug_print!("[reclaim] delete failed for {}: {}", path, e),
                             }
                         }
                     }
@@ -639,7 +648,7 @@ impl Walrus {
                 .clone()
         };
         let mut info = info_arc.write().ok()?;
-        println!(
+        debug_print!(
             "[reader] read_next start: col={}, chain_len={}, idx={}, offset={}",
             col_name, info.chain.len(), info.cur_block_idx, info.cur_block_offset
         );
@@ -689,7 +698,7 @@ impl Walrus {
                 let block = info.chain[idx].clone();
 
                 if off >= block.used {
-                    println!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
+                    debug_print!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
                     BlockStateTracker::set_checkpointed_true(block.id as usize);
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
@@ -702,11 +711,11 @@ impl Walrus {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
                             idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
                         }
-                        println!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
+                        debug_print!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
                         return Some(entry);
                     }
                     Err(_) => {
-                        println!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
+                        debug_print!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
                         info.cur_block_idx += 1;
                         info.cur_block_offset = 0;
                         continue;
@@ -764,16 +773,16 @@ impl Walrus {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
                             idx_guard.set(col_name.to_string(), (tail_block_id | TAIL_FLAG), new_off);
                         }
-                        println!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
+                        debug_print!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
                         return Some(entry);
                     }
                     Err(_) => {
-                        println!("[reader] read_next: tail read error col={}, block_id={}, offset={}", col_name, active_block.id, tail_off);
+                        debug_print!("[reader] read_next: tail read error col={}, block_id={}, offset={}", col_name, active_block.id, tail_off);
                         return None;
                     }
                 }
             } else {
-                println!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
+                debug_print!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
                 return None;
             }
         }
@@ -799,7 +808,7 @@ impl Walrus {
             }
         }
         files.sort();
-        if !files.is_empty() { println!("[recovery] scanning files: {}", files.len()); }
+        if !files.is_empty() { debug_print!("[recovery] scanning files: {}", files.len()); }
 
         // assign synthetic block ids
         let mut next_block_id: usize = 1;
@@ -809,7 +818,7 @@ impl Walrus {
             let mmap = SharedMmapKeeper::get_mmap_arc(file_path);
             seen_files.insert(file_path.clone());
             FileStateTracker::register_file_if_absent(file_path);
-            println!("[recovery] file {}", file_path);
+            debug_print!("[recovery] file {}", file_path);
 
             let mut block_offset: u64 = 0;
             while block_offset + DEFAULT_BLOCK_SIZE <= MAX_FILE_SIZE {
@@ -857,7 +866,7 @@ impl Walrus {
                 FileStateTracker::add_block_to_file_state(file_path);
                 if let Some(col) = col_name {
                     self.reader.append_block_to_chain(&col, block.clone());
-                    println!("[recovery] appended block: file={}, block_id={}, used={}, col={}", file_path, block.id, block.used, col);
+                    debug_print!("[recovery] appended block: file={}, block_id={}, used={}, col={}", file_path, block.id, block.used, col);
                 }
                 next_block_id += 1;
                 block_offset += DEFAULT_BLOCK_SIZE;
