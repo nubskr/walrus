@@ -34,8 +34,9 @@ jobs:
       - name: Run integration tests
         run: RUSTFLAGS=-Awarnings cargo test --test integration -- --test-threads=1
 
-  e2e-longrunning:
+  e2e-sustained-mixed-workload:
     runs-on: ubuntu-latest
+    timeout-minutes: 300
     # needs: test  # Only run after main tests pass
     steps:
       - name: Checkout
@@ -58,23 +59,110 @@ jobs:
 
       - name: Run sustained mixed workload test
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --test-threads=1 --nocapture
-        timeout-minutes: 15
+
+  e2e-realistic-application-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # needs: test  # Only run after main tests pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
 
       - name: Run realistic application simulation test
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --test-threads=1 --nocapture
-        timeout-minutes: 15
+
+  e2e-recovery-and-persistence-marathon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # needs: test  # Only run after main tests pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
 
       - name: Run recovery and persistence marathon test
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --test-threads=1 --nocapture
-        timeout-minutes: 15
 
-      # - name: Run massive data throughput test
-      #   run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --test-threads=1 --nocapture
-      #   timeout-minutes: 15
+  e2e-massive-data-throughput:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # needs: test  # Only run after main tests pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run massive data throughput test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --test-threads=1 --nocapture
+
+  e2e-system-stress-and-stability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # needs: test  # Only run after main tests pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
 
       - name: Run system stress and stability test
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_system_stress_and_stability -- --test-threads=1 --nocapture
-        timeout-minutes: 15
 
   e2e-benchmarks:
     runs-on: ubuntu-latest
