@@ -74,77 +74,77 @@ pub struct Block {
 
 impl Block {
     fn write(&self, in_block_offset: u64, data: &[u8], owned_by: &str, next_block_start: u64) -> std::io::Result<()> {
-    debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
-    
-    let new_meta = Metadata { 
-        read_size: data.len(),
-        owned_by: owned_by.to_string(),
-        next_block_start,
-        checksum: checksum64(data),
-    };
-    
-    let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).unwrap();
-    if meta_bytes.len() > PREFIX_META_SIZE - 2 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large"));
+        debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
+        
+        let new_meta = Metadata { 
+            read_size: data.len(),
+            owned_by: owned_by.to_string(),
+            next_block_start,
+            checksum: checksum64(data),
+        };
+        
+        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).unwrap();
+        if meta_bytes.len() > PREFIX_META_SIZE - 2 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large"));
+        }
+        
+        let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
+        // Store actual length in first 2 bytes (little endian)
+        meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
+        meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
+        // Copy actual metadata starting at byte 2
+        meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
+        
+        // Combine and write
+        let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
+        combined.extend_from_slice(&meta_buffer);
+        combined.extend_from_slice(data);
+        
+        let file_offset = self.offset + in_block_offset;
+        self.mmap.write(file_offset as usize, &combined);
+        Ok(())
     }
-    
-    let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-    // Store actual length in first 2 bytes (little endian)
-    meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
-    meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
-    // Copy actual metadata starting at byte 2
-    meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-    
-    // Combine and write
-    let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-    combined.extend_from_slice(&meta_buffer);
-    combined.extend_from_slice(data);
-    
-    let file_offset = self.offset + in_block_offset;
-    self.mmap.write(file_offset as usize, &combined);
-    Ok(())
-}
 
-fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
-    let mut meta_buffer = vec![0; PREFIX_META_SIZE];
-    let file_offset = self.offset + in_block_offset;
-    self.mmap.read(file_offset as usize, &mut meta_buffer);
-    
-    // Read the actual metadata length from first 2 bytes
-    let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
-    
-    if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData, 
-            format!("invalid metadata length: {}", meta_len)
-        ));
+    fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
+        let mut meta_buffer = vec![0; PREFIX_META_SIZE];
+        let file_offset = self.offset + in_block_offset;
+        self.mmap.read(file_offset as usize, &mut meta_buffer);
+        
+        // Read the actual metadata length from first 2 bytes
+        let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
+        
+        if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData, 
+                format!("invalid metadata length: {}", meta_len)
+            ));
+        }
+        
+        // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
+        let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
+        aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
+        
+        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let actual_entry_size = meta.read_size;
+        
+        // Read the actual data
+        let new_offset = file_offset + PREFIX_META_SIZE as u64;
+        let mut ret_buffer = vec![0; actual_entry_size];
+        self.mmap.read(new_offset as usize, &mut ret_buffer);
+        
+        // Verify checksum
+        let expected = meta.checksum;
+        if checksum64(&ret_buffer) != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData, 
+                "checksum mismatch, data corruption detected"
+            ));
+        }
+        
+        let consumed = PREFIX_META_SIZE + actual_entry_size;
+        Ok((Entry { data: ret_buffer }, consumed))
     }
-    
-    // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
-    let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
-    aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
-    
-    let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-    let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
-    let actual_entry_size = meta.read_size;
-    
-    // Read the actual data
-    let new_offset = file_offset + PREFIX_META_SIZE as u64;
-    let mut ret_buffer = vec![0; actual_entry_size];
-    self.mmap.read(new_offset as usize, &mut ret_buffer);
-    
-    // Verify checksum
-    let expected = meta.checksum;
-    if checksum64(&ret_buffer) != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData, 
-            "checksum mismatch, data corruption detected"
-        ));
-    }
-    
-    let consumed = PREFIX_META_SIZE + actual_entry_size;
-    Ok((Entry { data: ret_buffer }, consumed))
-}
 }
 
 
@@ -294,7 +294,7 @@ impl Writer {
             self.reader.append_block_to_chain(&self.col, sealed);
             println!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
-            let new_block = unsafe { self.allocator.alloc_block(data.len() as u64) }?;
+            let new_block = unsafe { self.allocator.alloc_block(need) }?;
             println!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
             *block = new_block;
             *cur = 0;
