@@ -62,7 +62,7 @@ struct Metadata {
 }
 
 // todo: add checksum and mmap object here too
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Block {
     id: u64,
     file_path: String,
@@ -74,65 +74,77 @@ pub struct Block {
 
 impl Block {
     fn write(&self, in_block_offset: u64, data: &[u8], owned_by: &str, next_block_start: u64) -> std::io::Result<()> {
-        debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
-        // write via the shared mmap at this block's file offset
-        // Create metadata
-        let new_meta = Metadata { 
-            read_size: data.len(),
-            owned_by: owned_by.to_string(),
-            next_block_start,
-            checksum: checksum64(data),
-        };
-        
-        // Serialize metadata with rkyv - MUCH faster than JSON
-        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).unwrap();
-        if meta_bytes.len() > PREFIX_META_SIZE {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large for prefix"));
-        }
-        
-        // Pad to exact size
-        let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-        meta_buffer[..meta_bytes.len()].copy_from_slice(&meta_bytes);
-        
-        // Combine and write in one syscall
-        let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-        combined.extend_from_slice(&meta_buffer);
-        combined.extend_from_slice(&data);
-        
-        let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &combined); // btw, we can also do write asynq here, 
-        Ok(())
+    debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
+    
+    let new_meta = Metadata { 
+        read_size: data.len(),
+        owned_by: owned_by.to_string(),
+        next_block_start,
+        checksum: checksum64(data),
+    };
+    
+    let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).unwrap();
+    if meta_bytes.len() > PREFIX_META_SIZE - 2 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large"));
     }
+    
+    let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
+    // Store actual length in first 2 bytes (little endian)
+    meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
+    meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
+    // Copy actual metadata starting at byte 2
+    meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
+    
+    // Combine and write
+    let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
+    combined.extend_from_slice(&meta_buffer);
+    combined.extend_from_slice(data);
+    
+    let file_offset = self.offset + in_block_offset;
+    self.mmap.write(file_offset as usize, &combined);
+    Ok(())
+}
 
-    fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)>{
-        let mut meta_buffer = vec![0; PREFIX_META_SIZE];
-        let file_offset = self.offset + in_block_offset;
-        self.mmap.read(file_offset as usize, &mut meta_buffer);
-
-        // Ensure alignment for rkyv archived access
-        let mut aligned = rkyv::AlignedVec::with_capacity(PREFIX_META_SIZE);
-        aligned.extend_from_slice(&meta_buffer);
-
-        // Zero-copy access to metadata - NO DESERIALIZATION
-        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        let actual_entry_size = meta.read_size;
-
-        // Now read the actual data
-        let new_offset = file_offset + PREFIX_META_SIZE as u64;
-        let mut ret_buffer = vec![0; actual_entry_size as usize];
-        self.mmap.read(new_offset as usize, &mut ret_buffer);
-
-        // Verify checksum; error on mismatch
-        let expected = meta.checksum;
-        if checksum64(&ret_buffer) != expected {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch, data corruption detected"));
-        }
-
-        let consumed = (PREFIX_META_SIZE as usize) + (actual_entry_size as usize);
-        Ok((Entry { data: ret_buffer }, consumed))
+fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
+    let mut meta_buffer = vec![0; PREFIX_META_SIZE];
+    let file_offset = self.offset + in_block_offset;
+    self.mmap.read(file_offset as usize, &mut meta_buffer);
+    
+    // Read the actual metadata length from first 2 bytes
+    let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
+    
+    if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData, 
+            format!("invalid metadata length: {}", meta_len)
+        ));
     }
-
+    
+    // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
+    let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
+    aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
+    
+    let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+    let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).unwrap();
+    let actual_entry_size = meta.read_size;
+    
+    // Read the actual data
+    let new_offset = file_offset + PREFIX_META_SIZE as u64;
+    let mut ret_buffer = vec![0; actual_entry_size];
+    self.mmap.read(new_offset as usize, &mut ret_buffer);
+    
+    // Verify checksum
+    let expected = meta.checksum;
+    if checksum64(&ret_buffer) != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData, 
+            "checksum mismatch, data corruption detected"
+        ));
+    }
+    
+    let consumed = PREFIX_META_SIZE + actual_entry_size;
+    Ok((Entry { data: ret_buffer }, consumed))
+}
 }
 
 
@@ -155,6 +167,7 @@ impl BlockAllocator {
         std::fs::create_dir_all("wal_files").ok();
         let file1 = make_new_file();
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1);
+        println!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
         Ok(BlockAllocator {
             next_block: UnsafeCell::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }),
             lock: AtomicBool::new(false),
@@ -173,6 +186,7 @@ impl BlockAllocator {
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path);
             data.offset = 0;
             data.used = 0;
+            println!("[alloc] rolled over to new file: {}", data.file_path);
         }
 
         // set the cur block as locked
@@ -184,6 +198,10 @@ impl BlockAllocator {
         data.offset += DEFAULT_BLOCK_SIZE;
         data.id += 1;
         self.unlock();
+        println!(
+            "[alloc] handout: block_id={}, file={}, offset={}, limit={}",
+            ret.id, ret.file_path, ret.offset, ret.limit
+        );
         ret
     }
 
@@ -193,6 +211,7 @@ impl BlockAllocator {
         }
         let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
+        println!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
 
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };
@@ -203,6 +222,7 @@ impl BlockAllocator {
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
+            println!("[alloc] file rollover for sized alloc -> {}", data.file_path);
         }
         let ret = Block {
             id: data.id,
@@ -220,6 +240,10 @@ impl BlockAllocator {
         data.offset += alloc_size;
         data.id += 1;
         self.unlock();
+        println!(
+            "[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}",
+            ret.id, ret.file_path, ret.offset, ret.limit
+        );
         Ok(ret)
     }
 
@@ -259,18 +283,28 @@ impl Writer {
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
+            println!(
+                "[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}",
+                self.col, block.id, *cur, need, block.limit
+            );
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
+            sealed.mmap.flush()?;
             self.reader.append_block_to_chain(&self.col, sealed);
-            // okay, so I think we can umm.. release the lock on this block now
-            // atomically -1 on the 
+            println!("[writer] appended sealed block to chain: col={}", self.col);
+            // switch to new block
             let new_block = unsafe { self.allocator.alloc_block(data.len() as u64) }?;
+            println!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
             *block = new_block;
             *cur = 0;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
         block.write(*cur, data, &self.col, next_block_start)?;
+        println!(
+            "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
+            self.col, block.id, *cur, need, *cur + need
+        );
         *cur += need;
         let _ = self.publisher.send(block.file_path.clone());
         Ok(())
@@ -280,6 +314,7 @@ impl Writer {
 
 // this is gonna slappp, f1 level stuff
 
+#[derive(Debug)]
 struct SharedMmap {
     mmap: MmapMut,
     last_touched_at: AtomicU64,
@@ -379,10 +414,11 @@ impl SharedMmapKeeper {
         mmap_arc
     }
 }
-
+    
+#[derive(Debug)]
 struct ColReaderInfo {
     chain: Vec<Block>,
-    cur_block_idx: usize, // this is just block id my man
+    cur_block_idx: usize,
     cur_block_offset: u64
 }
 
@@ -412,7 +448,12 @@ impl Reader {
             map.get(col).cloned()
         } {
             let mut info = info_arc.write().unwrap();
-            info.chain.push(block);
+            let before = info.chain.len();
+            info.chain.push(block.clone());
+            println!(
+                "[reader] chain append(fast): col={}, block_id={}, chain_len {}->{}",
+                col, block.id, before, before + 1
+            );
             return;
         }
 
@@ -424,7 +465,11 @@ impl Reader {
                 .clone()
         };
         let mut info = info_arc.write().unwrap();
-        info.chain.push(block);
+        info.chain.push(block.clone());
+        println!(
+            "[reader] chain append(slow/new): col={}, block_id={}, chain_len {}->{}",
+            col, block.id, 0, 1
+        );
     }
 }
 
@@ -508,6 +553,7 @@ pub struct Walrus {
 
 impl Walrus {
     pub fn new() -> Self {
+        println!("[walrus] new");
         let allocator = Arc::new(BlockAllocator::new().unwrap());
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
@@ -529,15 +575,17 @@ impl Walrus {
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
                 }
+                if !unique.is_empty() { println!("[flush] scheduling {} paths", unique.len()); }
                 for path in unique.into_iter() {
                     let mmap = pool.entry(path.clone()).or_insert_with(|| {
                         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
                         unsafe { MmapMut::map_mut(&file).unwrap() }
                     });
-                    let _ = mmap.flush();
+                    if let Err(e) = mmap.flush() { println!("[flush] flush error for {}: {}", path, e); }
                 }
                 // collect deletion requests
                 while let Ok(path) = del_rx.try_recv() {
+                    println!("[reclaim] deletion requested: {}", path);
                     delete_pending.insert(path);
                 }
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -547,14 +595,17 @@ impl Walrus {
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
                         // perform batched deletions now that mmaps are dropped
                         for path in delete_pending.drain() {
-                            let _ = fs::remove_file(&path);
+                            match fs::remove_file(&path) {
+                                Ok(_) => println!("[reclaim] deleted file {}", path),
+                                Err(e) => println!("[reclaim] delete failed for {}: {}", path, e),
+                            }
                         }
                     }
                 }
             }
         });
         let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(WalIndex::new("read_offset_idx"))) };
-        instance.startup_chore();
+        // instance.startup_chore();
         instance
     }
 
@@ -582,6 +633,10 @@ impl Walrus {
             map.get(col_name)?.clone()
         };
         let mut info = info_arc.write().ok()?;
+        println!(
+            "[reader] read_next start: col={}, chain_len={}, idx={}, offset={}",
+            col_name, info.chain.len(), info.cur_block_idx, info.cur_block_offset
+        );
 
         // Load current persisted position for this column and clamp to bounds
         if let Ok(idx_guard) = self.read_offset_index.read() {
@@ -600,11 +655,15 @@ impl Walrus {
 
         loop {
             if info.cur_block_idx >= info.chain.len() {
+                println!("[reader] read_next: None (idx>=len) col={}, idx={}, len={}", col_name, info.cur_block_idx, info.chain.len());
                 return None;
             }
-            let block = &info.chain[info.cur_block_idx];
+            let idx = info.cur_block_idx;
+            let off = info.cur_block_offset;
+            let block = info.chain[idx].clone();
 
-            if info.cur_block_offset >= block.used {
+            if off >= block.used {
+                println!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
                 // we have fully read this block, now mark it as read in the BlockStateTracker
                 // so we need to 
                 BlockStateTracker::set_checkpointed_true(block.id as usize);
@@ -613,16 +672,18 @@ impl Walrus {
                 continue;
             }
 
-            match block.read(info.cur_block_offset) {
+            match block.read(off) {
                 Ok((entry, consumed)) => {
-                    info.cur_block_offset += consumed as u64;
+                    info.cur_block_offset = off + consumed as u64;
                     // Persist updated position
                     if let Ok(mut idx_guard) = self.read_offset_index.write() {
                         idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
                     }
+                    println!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
                     return Some(entry);
                 }
                 Err(_) => {
+                    println!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
                 }
@@ -650,6 +711,7 @@ impl Walrus {
             }
         }
         files.sort();
+        if !files.is_empty() { println!("[recovery] scanning files: {}", files.len()); }
 
         // assign synthetic block ids
         let mut next_block_id: usize = 1;
@@ -659,6 +721,7 @@ impl Walrus {
             let mmap = SharedMmapKeeper::get_mmap_arc(file_path);
             seen_files.insert(file_path.clone());
             FileStateTracker::register_file_if_absent(file_path);
+            println!("[recovery] file {}", file_path);
 
             let mut block_offset: u64 = 0;
             while block_offset + DEFAULT_BLOCK_SIZE <= MAX_FILE_SIZE {
@@ -706,6 +769,7 @@ impl Walrus {
                 FileStateTracker::add_block_to_file_state(file_path);
                 if let Some(col) = col_name {
                     self.reader.append_block_to_chain(&col, block.clone());
+                    println!("[recovery] appended block: file={}, block_id={}, used={}, col={}", file_path, block.id, block.used, col);
                 }
                 next_block_id += 1;
                 block_offset += DEFAULT_BLOCK_SIZE;

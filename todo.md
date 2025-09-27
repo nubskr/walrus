@@ -1,0 +1,1 @@
+[] add configurable fsync modes: 1. Immediate(every write is fsynced syncronously)

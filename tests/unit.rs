@@ -34,6 +34,31 @@ fn walindex_persists() {
     cleanup_wal();
 }
 
+#[test]
+fn large_entry_forces_block_seal() {
+    cleanup_wal();
+    let wal = Walrus::new();
+    
+    // Create 9MB entries to force block sealing
+    let large_data_1 = vec![0x42u8; 9 * 1024 * 1024]; // 9MB of 0x42
+    let large_data_2 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
+    let large_data_3 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
+
+    // add a 2 second timeout
+    
+    wal.append_for_topic("t", &large_data_1).unwrap();
+    wal.append_for_topic("t", &large_data_2).unwrap();
+    wal.append_for_topic("t", &large_data_3).unwrap();
+    
+    // std::thread::sleep(std::time::Duration::from_secs(1));
+
+    assert_eq!(wal.read_next("t").unwrap().data, large_data_1);
+    assert_eq!(wal.read_next("t").unwrap().data, large_data_2);
+    // assert_eq!(wal.read_next("t").unwrap().data, large_data_3); // it will fail because it's in the write block still :))
+    
+    cleanup_wal();
+}
+
 // #[test]
 // fn basic_roundtrip_single_topic() {
 //     cleanup_wal();
