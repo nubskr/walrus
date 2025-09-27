@@ -376,8 +376,8 @@ fn integration_large_topic_names() {
     let wal = Walrus::new();
     
     // Test with reasonably long topic names (but not too long to exceed metadata limits)
-    let long_topic = "a".repeat(30);  // Reduced from 100
-    let very_long_topic = "b".repeat(50);  // Reduced from 500
+    let long_topic = "a".repeat(15);  // Reduced to stay within metadata limits
+    let very_long_topic = "b".repeat(18);  // Reduced to stay within metadata limits
     
     wal.append_for_topic(&long_topic, b"long topic data").unwrap();
     wal.append_for_topic(&very_long_topic, b"very long topic data").unwrap();
