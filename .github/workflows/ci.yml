@@ -56,9 +56,25 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      - name: Run end-to-end long-running tests with data integrity validation
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_sustained_mixed_workload e2e_realistic_application_simulation e2e_recovery_and_persistence_marathon e2e_massive_data_throughput_test e2e_system_stress_and_stability -- --test-threads=1 --nocapture
-        timeout-minutes: 15  # Allow up to 15 minutes for comprehensive e2e tests
+      - name: Run sustained mixed workload test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --test-threads=1 --nocapture
+        timeout-minutes: 3
+
+      - name: Run realistic application simulation test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --test-threads=1 --nocapture
+        timeout-minutes: 3
+
+      - name: Run recovery and persistence marathon test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --test-threads=1 --nocapture
+        timeout-minutes: 5
+
+      - name: Run massive data throughput test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --test-threads=1 --nocapture
+        timeout-minutes: 3
+
+      - name: Run system stress and stability test
+        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_system_stress_and_stability -- --test-threads=1 --nocapture
+        timeout-minutes: 4
 
   e2e-benchmarks:
     runs-on: ubuntu-latest
