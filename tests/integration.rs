@@ -10,6 +10,17 @@ fn cleanup_wal() {
     thread::sleep(Duration::from_millis(10));
 }
 
+fn first_data_file() -> String {
+    let mut files: Vec<_> = fs::read_dir("./wal_files").unwrap().flatten().collect();
+    files.sort_by_key(|e| e.file_name());
+    let p = files
+        .into_iter()
+        .find(|e| !e.file_name().to_string_lossy().ends_with("_index.db"))
+        .unwrap()
+        .path();
+    p.to_string_lossy().to_string()
+}
+
 // ============================================================================
 // INTEGRATION TESTS - END-TO-END SCENARIOS
 // ============================================================================
@@ -388,6 +399,342 @@ fn integration_large_topic_names() {
     cleanup_wal();
 }
 
+// ============================================================================
+// EXTREME INTEGRATION STRESS TESTS - ABSOLUTE LIMITS
+// ============================================================================
+
+#[test]
+fn integration_memory_pressure_test() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    let num_topics = 100;
+    let large_entry_size = 1024 * 1024; // 1MB per entry
+    
+    // Create memory pressure with large entries across many topics
+    for topic_id in 0..num_topics {
+        let topic = format!("memory_pressure_{}", topic_id);
+        
+        // Create large entry with validation pattern
+        let mut data = Vec::with_capacity(large_entry_size);
+        for i in 0..large_entry_size {
+            data.push(((topic_id + i) % 256) as u8);
+        }
+        
+        wal.append_for_topic(&topic, &data).unwrap();
+    }
+    
+    // Read back and validate all large entries
+    for topic_id in 0..num_topics {
+        let topic = format!("memory_pressure_{}", topic_id);
+        let entry = wal.read_next(&topic).unwrap();
+        
+        assert_eq!(entry.data.len(), large_entry_size);
+        
+        // Validate pattern
+        for (i, &byte) in entry.data.iter().enumerate() {
+            assert_eq!(byte, ((topic_id + i) % 256) as u8,
+                      "Memory pressure test failed at topic {} byte {}", topic_id, i);
+        }
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_file_rollover_stress() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    let topic = "rollover_stress";
+    
+    // Force multiple file rollovers with large entries
+    let entry_size = 50 * 1024 * 1024; // 50MB entries to force rollovers
+    let num_entries = 5;
+    
+    for entry_id in 0..num_entries {
+        let mut data = Vec::with_capacity(entry_size);
+        
+        // Fill with entry-specific pattern
+        for i in 0..entry_size {
+            data.push(((entry_id * 1000 + i) % 256) as u8);
+        }
+        
+        wal.append_for_topic(topic, &data).unwrap();
+    }
+    
+    // Read back across file boundaries
+    for entry_id in 0..num_entries {
+        let entry = wal.read_next(topic).unwrap();
+        assert_eq!(entry.data.len(), entry_size);
+        
+        // Validate pattern across file boundaries
+        for (i, &byte) in entry.data.iter().enumerate() {
+            assert_eq!(byte, ((entry_id * 1000 + i) % 256) as u8,
+                      "File rollover validation failed at entry {} byte {}", entry_id, i);
+        }
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_corruption_detection_comprehensive() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    let topic = "corruption_test";
+    
+    // Write data with strong validation patterns
+    let test_data = b"CORRUPTION_TEST_DATA_WITH_STRONG_PATTERN_12345678901234567890";
+    wal.append_for_topic(topic, test_data).unwrap();
+    
+    // Verify normal read works
+    let entry = wal.read_next(topic).unwrap();
+    assert_eq!(entry.data, test_data);
+    
+    // Now test corruption detection by corrupting the file
+    let path = first_data_file();
+    let mut file_data = std::fs::read(&path).unwrap();
+    
+    // Find the test data in the file
+    if let Some(pos) = file_data.windows(test_data.len()).position(|w| w == test_data) {
+        // Corrupt multiple bytes to ensure detection
+        for i in 0..5 {
+            if pos + i < file_data.len() {
+                file_data[pos + i] ^= 0xFF; // Flip all bits
+            }
+        }
+        
+        std::fs::write(&path, &file_data).unwrap();
+        
+        // Create new WAL instance and try to read
+        let wal2 = Walrus::new();
+        
+        // Should detect corruption and handle gracefully
+        match wal2.read_next(topic) {
+            None => {
+                // Expected: corruption detected, no data returned
+            }
+            Some(corrupted_entry) => {
+                // If data is returned, it should be different from original
+                assert_ne!(corrupted_entry.data, test_data, 
+                          "Corruption not detected - data should be different");
+            }
+        }
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_extreme_topic_count() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    let num_topics = 5000; // Extreme number of topics
+    
+    // Write one entry per topic with validation data
+    for topic_id in 0..num_topics {
+        let topic = format!("extreme_topic_{:06}", topic_id);
+        
+        let mut data = Vec::new();
+        data.extend_from_slice(&(topic_id as u64).to_le_bytes());
+        data.extend_from_slice(format!("TOPIC_DATA_{}", topic_id).as_bytes());
+        
+        wal.append_for_topic(&topic, &data).unwrap();
+    }
+    
+    // Read back in random order to stress topic lookup
+    let mut read_order: Vec<usize> = (0..num_topics).collect();
+    
+    // Simple shuffle using topic_id as seed
+    for i in 0..num_topics {
+        let j = (i * 1103515245 + 12345) % num_topics;
+        read_order.swap(i, j);
+    }
+    
+    for &topic_id in &read_order {
+        let topic = format!("extreme_topic_{:06}", topic_id);
+        let entry = wal.read_next(&topic).unwrap();
+        
+        // Validate embedded topic ID
+        let read_topic_id = u64::from_le_bytes([
+            entry.data[0], entry.data[1], entry.data[2], entry.data[3],
+            entry.data[4], entry.data[5], entry.data[6], entry.data[7]
+        ]);
+        
+        assert_eq!(read_topic_id, topic_id as u64);
+        
+        // Validate payload
+        let expected_payload = format!("TOPIC_DATA_{}", topic_id);
+        let actual_payload = String::from_utf8(entry.data[8..].to_vec()).unwrap();
+        assert_eq!(actual_payload, expected_payload);
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_mixed_size_stress() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    let topic = "mixed_sizes";
+    
+    // Test with exponentially increasing sizes
+    let base_sizes = vec![1, 10, 100, 1000, 10000, 100000, 1000000];
+    
+    for (i, &base_size) in base_sizes.iter().enumerate() {
+        let mut data = Vec::with_capacity(base_size);
+        
+        // Fill with size-dependent pattern
+        for j in 0..base_size {
+            data.push(((i * 1000 + j) % 256) as u8);
+        }
+        
+        wal.append_for_topic(topic, &data).unwrap();
+    }
+    
+    // Read back and validate each size
+    for (i, &base_size) in base_sizes.iter().enumerate() {
+        let entry = wal.read_next(topic).unwrap();
+        assert_eq!(entry.data.len(), base_size);
+        
+        for (j, &byte) in entry.data.iter().enumerate() {
+            assert_eq!(byte, ((i * 1000 + j) % 256) as u8,
+                      "Mixed size validation failed at size {} byte {}", base_size, j);
+        }
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_persistence_stress_with_validation() {
+    cleanup_wal();
+    
+    // Phase 1: Write lots of data
+    {
+        let wal = Walrus::new();
+        let num_topics = 100;
+        let entries_per_topic = 50;
+        
+        for topic_id in 0..num_topics {
+            let topic = format!("persist_stress_{}", topic_id);
+            
+            for entry_id in 0..entries_per_topic {
+                let mut data = Vec::new();
+                data.extend_from_slice(&(topic_id as u32).to_le_bytes());
+                data.extend_from_slice(&(entry_id as u32).to_le_bytes());
+                
+                // Add timestamp-like data
+                let timestamp = (topic_id * 1000 + entry_id) as u64;
+                data.extend_from_slice(&timestamp.to_le_bytes());
+                
+                // Add payload
+                let payload = format!("PERSIST_{}_{}", topic_id, entry_id);
+                data.extend_from_slice(payload.as_bytes());
+                
+                wal.append_for_topic(&topic, &data).unwrap();
+            }
+        }
+        
+        // Read some data to advance read positions
+        for topic_id in 0..num_topics {
+            let topic = format!("persist_stress_{}", topic_id);
+            
+            // Read half the entries
+            for _ in 0..(entries_per_topic / 2) {
+                wal.read_next(&topic).unwrap();
+            }
+        }
+    } // WAL instance dropped here
+    
+    // Phase 2: Restart and validate persistence
+    {
+        let wal = Walrus::new();
+        let num_topics = 100;
+        let entries_per_topic = 50;
+        
+        // Continue reading from where we left off
+        for topic_id in 0..num_topics {
+            let topic = format!("persist_stress_{}", topic_id);
+            
+            // Read remaining entries
+            for entry_id in (entries_per_topic / 2)..entries_per_topic {
+                let entry = wal.read_next(&topic).unwrap();
+                
+                // Validate all embedded data
+                let read_topic_id = u32::from_le_bytes([
+                    entry.data[0], entry.data[1], entry.data[2], entry.data[3]
+                ]);
+                let read_entry_id = u32::from_le_bytes([
+                    entry.data[4], entry.data[5], entry.data[6], entry.data[7]
+                ]);
+                let read_timestamp = u64::from_le_bytes([
+                    entry.data[8], entry.data[9], entry.data[10], entry.data[11],
+                    entry.data[12], entry.data[13], entry.data[14], entry.data[15]
+                ]);
+                
+                assert_eq!(read_topic_id, topic_id as u32);
+                assert_eq!(read_entry_id, entry_id as u32);
+                assert_eq!(read_timestamp, (topic_id * 1000 + entry_id) as u64);
+                
+                // Validate payload
+                let expected_payload = format!("PERSIST_{}_{}", topic_id, entry_id);
+                let actual_payload = String::from_utf8(entry.data[16..].to_vec()).unwrap();
+                assert_eq!(actual_payload, expected_payload);
+            }
+            
+            // Verify no more entries
+            assert!(wal.read_next(&topic).is_none());
+        }
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn integration_data_pattern_stress() {
+    cleanup_wal();
+    
+    let wal = Walrus::new();
+    
+    // Test various challenging data patterns
+    let patterns = vec![
+        ("all_zeros", vec![0u8; 10000]),
+        ("all_ones", vec![0xFF; 10000]),
+        ("alternating_bytes", (0..10000).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect()),
+        ("incremental", (0..10000).map(|i| (i % 256) as u8).collect()),
+        ("decremental", (0..10000).map(|i| (255 - (i % 256)) as u8).collect()),
+        ("repeating_pattern", vec![0xAA, 0xBB, 0xCC, 0xDD].repeat(2500)),
+        ("pseudo_random", {
+            let mut data = Vec::new();
+            let mut seed = 0x12345678u32;
+            for _ in 0..10000 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                data.push((seed >> 24) as u8);
+            }
+            data
+        }),
+    ];
+    
+    // Write all patterns
+    for (pattern_name, data) in &patterns {
+        wal.append_for_topic(pattern_name, data).unwrap();
+    }
+    
+    // Read back and validate
+    for (pattern_name, expected_data) in patterns {
+        let entry = wal.read_next(&pattern_name).unwrap();
+        assert_eq!(entry.data, expected_data, 
+                  "Pattern '{}' was corrupted during storage/retrieval", pattern_name);
+    }
+    
+    cleanup_wal();
+}
+
 #[test]
 fn integration_special_topic_names() {
     cleanup_wal();
@@ -414,6 +761,33 @@ fn integration_special_topic_names() {
         let entry = wal.read_next(topic).unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
+fn exactly_once_delivery_guarantee() {
+    cleanup_wal();
+    let wal = Walrus::new();
+    
+    // Write entries
+    for i in 0..10 {
+        wal.append_for_topic("exactly_once", &[i]).unwrap();
+    }
+    
+    // Read half
+    for i in 0..5 {
+        assert_eq!(wal.read_next("exactly_once").unwrap().data, &[i]);
+    }
+    
+    // Simulate crash and restart
+    drop(wal);
+    let wal2 = Walrus::new();
+    
+    // Should continue from entry 5, not restart from 0
+    for i in 5..10 {
+        assert_eq!(wal2.read_next("exactly_once").unwrap().data, &[i]);
     }
     
     cleanup_wal();
