@@ -1,3 +1,4 @@
 /target
 /wal_files
 digest.txt
+*.csv
