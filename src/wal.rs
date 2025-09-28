@@ -586,9 +586,27 @@ impl Walrus {
                 }
                 if !unique.is_empty() { debug_print!("[flush] scheduling {} paths", unique.len()); }
                 for path in unique.into_iter() {
+                    // Skip if file doesn't exist
+                    if !std::path::Path::new(&path).exists() {
+                        debug_print!("[flush] file does not exist, skipping: {}", path);
+                        continue;
+                    }
+                    
                     let mmap = pool.entry(path.clone()).or_insert_with(|| {
-                        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-                        unsafe { MmapMut::map_mut(&file).unwrap() }
+                        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                debug_print!("[flush] failed to open file for flushing {}: {}", path, e);
+                                panic!("File open failed after existence check");
+                            }
+                        };
+                        match unsafe { MmapMut::map_mut(&file) } {
+                            Ok(mmap) => mmap,
+                            Err(e) => {
+                                debug_print!("[flush] failed to create memory map for {}: {}", path, e);
+                                panic!("Memory map creation failed");
+                            }
+                        }
                     });
                     if let Err(e) = mmap.flush() { debug_print!("[flush] flush error for {}: {}", path, e); }
                 }

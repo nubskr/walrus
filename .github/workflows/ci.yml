@@ -188,3 +188,7 @@ jobs:
       - name: Run performance benchmark shared VM
         run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_performance_benchmark -- --test-threads=1 --nocapture
         timeout-minutes: 30  # Allow up to 30 minutes for benchmark // IOPS is fucked on CI I guess lmao
+
+      - name: Run multithreaded benchmark
+        run: RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark -- --test-threads=1 --nocapture
+        timeout-minutes: 10  # 2 min write + 2 min read + overhead

@@ -6,3 +6,12 @@ edition = "2024"
 [dependencies]
 memmap2 = "0.9.8"
 rkyv = { version = "0.7", features = ["validation", "strict"] }
+rand = "0.8"
+
+[[test]]
+name = "multithreaded_benchmark"
+path = "benchmarks/multithreaded_benchmark.rs"
+
+[[test]]
+name = "scaling_benchmark"
+path = "benchmarks/scaling_benchmark.rs"
