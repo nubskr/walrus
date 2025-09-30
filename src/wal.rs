@@ -572,7 +572,7 @@ pub enum ReadConsistency {
 
 #[derive(Clone, Copy, Debug)]
 pub enum FsyncSchedule {
-    Seconds(u64),
+    Milliseconds(u64),
 }
 
 pub struct Walrus {
@@ -591,7 +591,7 @@ impl Walrus {
     }
 
     pub fn with_consistency(mode: ReadConsistency) -> std::io::Result<Self> {
-        Self::with_consistency_and_schedule(mode, FsyncSchedule::Seconds(1))
+        Self::with_consistency_and_schedule(mode, FsyncSchedule::Milliseconds(1000))
     }
 
     pub fn with_consistency_and_schedule(mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
@@ -605,7 +605,7 @@ impl Walrus {
         let _ = DELETION_TX.set(del_tx_arc.clone());
         let pool: HashMap<String, MmapMut> = HashMap::new();
         let tick = Arc::new(AtomicU64::new(0));
-        let sleep_secs = match fsync_schedule { FsyncSchedule::Seconds(s) => s.max(1) };
+        let sleep_millis = match fsync_schedule { FsyncSchedule::Milliseconds(ms) => ms.max(1) };
         // background flusher
         thread::spawn(move || {
             let mut pool = pool;
@@ -613,7 +613,7 @@ impl Walrus {
             let del_rx = del_rx;
             let mut delete_pending = std::collections::HashSet::new();
             loop {
-                thread::sleep(Duration::from_secs(sleep_secs));
+                thread::sleep(Duration::from_millis(sleep_millis));
                 let mut unique = std::collections::HashSet::new();
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);

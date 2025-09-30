@@ -2,24 +2,18 @@ use walrus::wal::Walrus;
 use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
-// Removed Arc and Mutex imports - now using single-threaded tests
 use std::collections::HashMap;
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
-    // Give filesystem time to clean up
     thread::sleep(Duration::from_millis(50));
 }
 
-// ============================================================================
-// END-TO-END LONG-RUNNING TESTS - COMPLETE SYSTEM FUNCTIONALITY
-// ============================================================================
 
 #[test]
 fn e2e_sustained_mixed_workload() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -32,9 +26,7 @@ fn e2e_sustained_mixed_workload() {
     let mut read_counts = HashMap::<String, u64>::new();
     let mut validation_errors = 0u64;
     
-    // Sequential mixed workload simulation
     while start_time.elapsed() < duration {
-        // High-frequency small writes (simulate 3 workers)
         for worker_id in 0..3 {
             let topic = format!("high_freq_{}", worker_id);
             let counter = write_counts.get(&topic).unwrap_or(&0);
@@ -44,7 +36,6 @@ fn e2e_sustained_mixed_workload() {
             }
         }
         
-        // Medium-frequency medium writes (simulate 2 workers)
         for worker_id in 0..2 {
             let topic = format!("med_freq_{}", worker_id);
             let counter = write_counts.get(&topic).unwrap_or(&0);
@@ -54,7 +45,6 @@ fn e2e_sustained_mixed_workload() {
             }
         }
         
-        // Low-frequency large writes (every 10th iteration)
         if write_counts.values().sum::<u64>() % 10 == 0 {
             let topic = "low_freq_large".to_string();
             let counter = write_counts.get(&topic).unwrap_or(&0);
@@ -64,7 +54,6 @@ fn e2e_sustained_mixed_workload() {
             }
         }
         
-        // Read and validate data
         let topics = vec![
             "high_freq_0".to_string(), "high_freq_1".to_string(), "high_freq_2".to_string(),
             "med_freq_0".to_string(), "med_freq_1".to_string(),
@@ -75,7 +64,6 @@ fn e2e_sustained_mixed_workload() {
             if let Some(entry) = wal.read_next(topic).unwrap() {
                 *read_counts.entry(topic.clone()).or_insert(0) += 1;
                 
-                // Validate data integrity
                 let data_str = String::from_utf8_lossy(&entry.data);
                 let is_valid = if topic.starts_with("high_freq_") {
                     data_str.starts_with("high_freq_data_")
@@ -105,11 +93,9 @@ fn e2e_sustained_mixed_workload() {
     println!("  Validation errors: {}", validation_errors);
     println!("  Duration: {:?}", start_time.elapsed());
     
-    // Reduced expectations for single-threaded version
     assert!(total_writes > 100, "Expected > 100 writes, got {}", total_writes);
     assert!(total_reads > 50, "Expected > 50 reads, got {}", total_reads);
     
-    // Data integrity check - should have no validation errors
     assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
@@ -119,7 +105,6 @@ fn e2e_sustained_mixed_workload() {
 fn e2e_realistic_application_simulation() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -136,9 +121,7 @@ fn e2e_realistic_application_simulation() {
     let mut error_id = 1u64;
     let mut iteration = 0u64;
     
-    // Sequential realistic application simulation
     while start_time.elapsed() < duration {
-        // User activity logs (high frequency - every iteration)
         let log_entry = format!(
             "{{\"timestamp\":{},\"user_id\":{},\"action\":\"page_view\",\"page\":\"/dashboard\"}}",
             start_time.elapsed().as_millis(),
@@ -147,7 +130,6 @@ fn e2e_realistic_application_simulation() {
         let _ = wal.append_for_topic("user_activity", log_entry.as_bytes());
         user_id = (user_id + 1) % 10000;
         
-        // Transaction records (medium frequency - every 10th iteration)
         if iteration % 10 == 0 {
             let transaction = format!(
                 "{{\"tx_id\":{},\"timestamp\":{},\"from_account\":\"acc_{}\",\"to_account\":\"acc_{}\",\"amount\":{:.2},\"currency\":\"USD\",\"status\":\"completed\"}}",
@@ -161,7 +143,6 @@ fn e2e_realistic_application_simulation() {
             tx_id += 1;
         }
         
-        // System metrics (low frequency - every 100th iteration)
         if iteration % 100 == 0 {
             let metrics = format!(
                 "{{\"timestamp\":{},\"cpu_usage\":{:.1},\"memory_usage\":{:.1},\"disk_io\":{},\"network_rx\":{},\"network_tx\":{},\"active_connections\":{}}}",
@@ -177,7 +158,6 @@ fn e2e_realistic_application_simulation() {
             metric_counter += 1;
         }
         
-        // Error logs (sporadic - every 200th iteration)
         if iteration % 200 == 0 {
             let error_log = format!(
                 "{{\"error_id\":{},\"timestamp\":{},\"level\":\"ERROR\",\"service\":\"payment_processor\",\"message\":\"Payment processing failed for transaction {}\",\"stack_trace\":\"{}\"}}",
@@ -190,13 +170,11 @@ fn e2e_realistic_application_simulation() {
             error_id += 1;
         }
         
-        // Analytics processor - read from all topics
         let topics = vec!["user_activity", "transactions", "system_metrics", "error_logs"];
         for topic in &topics {
             if let Some(entry) = wal.read_next(topic).unwrap() {
                 processed_count += 1;
                 
-                // Validate data integrity based on topic
                 let data_str = String::from_utf8_lossy(&entry.data);
                 let is_valid = match *topic {
                     "user_activity" => {
@@ -242,10 +220,8 @@ fn e2e_realistic_application_simulation() {
     println!("  Validation errors: {}", validation_errors);
     println!("  Duration: {:?}", start_time.elapsed());
     
-    // Reduced expectations for single-threaded version
     assert!(processed_count > 100, "Expected > 100 processed entries, got {}", processed_count);
     
-    // Data integrity check - should have no validation errors
     assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
@@ -255,7 +231,6 @@ fn e2e_realistic_application_simulation() {
 fn e2e_recovery_and_persistence_marathon() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -264,7 +239,6 @@ fn e2e_recovery_and_persistence_marathon() {
     let entries_per_cycle = 1000;
     let topics = vec!["persistent_topic_1", "persistent_topic_2", "persistent_topic_3"];
     
-    // Track what we write across all cycles
     let mut expected_data: HashMap<String, Vec<String>> = HashMap::new();
     for topic in &topics {
         expected_data.insert(topic.to_string(), Vec::new());
@@ -273,10 +247,8 @@ fn e2e_recovery_and_persistence_marathon() {
     for cycle in 0..total_cycles {
         println!("E2E Recovery Cycle {}/{}", cycle + 1, total_cycles);
         
-        // Create new WAL instance (simulates restart)
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Write data for this cycle
         for entry_id in 0..entries_per_cycle {
             for (topic_idx, topic) in topics.iter().enumerate() {
                 let data = format!(
@@ -290,7 +262,6 @@ fn e2e_recovery_and_persistence_marathon() {
             }
         }
         
-        // Read some data (but not all) to advance read positions
         for topic in &topics {
             let read_count = (entries_per_cycle * (cycle + 1)) / 2; // Read half
             for _ in 0..read_count {
@@ -300,11 +271,9 @@ fn e2e_recovery_and_persistence_marathon() {
             }
         }
         
-        // Simulate some processing time
         thread::sleep(Duration::from_millis(100));
     }
     
-    // Final verification - create new WAL and read all remaining data with validation
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     let mut total_read = 0;
     let mut validation_errors = 0;
@@ -313,7 +282,6 @@ fn e2e_recovery_and_persistence_marathon() {
         while let Some(entry) = wal.read_next(topic).unwrap() {
             total_read += 1;
             
-            // Validate the data format matches what we wrote
             let data_str = String::from_utf8_lossy(&entry.data);
             let is_valid = data_str.starts_with("cycle_") && 
                           data_str.contains("_entry_") && 
@@ -334,7 +302,6 @@ fn e2e_recovery_and_persistence_marathon() {
     println!("  Remaining entries read: {}", total_read);
     println!("  Validation errors: {}", validation_errors);
     
-    // Should have read the remaining half of entries
     let expected_remaining = (total_cycles * entries_per_cycle * topics.len()) / 2;
     assert!(
         total_read >= expected_remaining / 2, // Allow some tolerance
@@ -343,7 +310,6 @@ fn e2e_recovery_and_persistence_marathon() {
         total_read
     );
     
-    // Data integrity check - should have no validation errors
     assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
@@ -353,7 +319,6 @@ fn e2e_recovery_and_persistence_marathon() {
 fn e2e_massive_data_throughput_test() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -362,7 +327,6 @@ fn e2e_massive_data_throughput_test() {
     let duration = Duration::from_secs(25); // Reduced duration for CI
     let start_time = Instant::now();
     
-    // Metrics tracking
     let mut bytes_written = 0u64;
     let mut bytes_read = 0u64;
     let mut entries_written = 0u64;
@@ -373,14 +337,11 @@ fn e2e_massive_data_throughput_test() {
     let mut counter = 0u64;
     let mut topic_index = 0;
     
-    // Sequential high-throughput simulation
     while start_time.elapsed() < duration {
-        // Write phase - simulate multiple workers
         for worker_id in 0..4 {
             let topic = &topics[worker_id];
             let base_data = format!("throughput_data_worker_{}_", worker_id);
             
-            // Variable size entries (1KB to 5KB, reduced for CI)
             let size = 1024 + (counter % 4) * 1024;
             let mut data = base_data.clone();
             data.push_str(&"x".repeat(size as usize - base_data.len()));
@@ -391,7 +352,6 @@ fn e2e_massive_data_throughput_test() {
             }
         }
         
-        // Read phase - simulate multiple readers
         for _ in 0..2 {
             let topic = &topics[topic_index % topics.len()];
             
@@ -399,12 +359,10 @@ fn e2e_massive_data_throughput_test() {
                 bytes_read += entry.data.len() as u64;
                 entries_read += 1;
                 
-                // Validate data integrity
                 let data_str = String::from_utf8_lossy(&entry.data);
                 let expected_worker_id = topic.chars().last().unwrap().to_digit(10).unwrap() as usize;
                 let expected_prefix = format!("throughput_data_worker_{}_", expected_worker_id);
                 
-                // Check size is within expected range (1KB to 5KB)
                 let size_valid = entry.data.len() >= 1024 && entry.data.len() <= 5120;
                 let content_valid = data_str.starts_with(&expected_prefix) && data_str.ends_with('x');
                 
@@ -418,7 +376,6 @@ fn e2e_massive_data_throughput_test() {
         
         counter += 1;
         
-        // Small delay to prevent overwhelming the system
         if counter % 50 == 0 {
             thread::sleep(Duration::from_millis(1));
         }
@@ -438,12 +395,10 @@ fn e2e_massive_data_throughput_test() {
     println!("  Write rate: {:.2} entries/s", entries_written as f64 / elapsed.as_secs_f64());
     println!("  Read rate: {:.2} entries/s", entries_read as f64 / elapsed.as_secs_f64());
     
-    // Reduced expectations for single-threaded version
     assert!(bytes_written > 1_000_000, "Expected > 1MB written, got {} bytes", bytes_written);
     assert!(entries_written > 100, "Expected > 100 entries written, got {}", entries_written);
     assert!(bytes_read > 100_000, "Expected > 100KB read, got {} bytes", bytes_read);
     
-    // Data integrity check - should have no validation errors
     assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
     
     cleanup_wal();
@@ -453,7 +408,6 @@ fn e2e_massive_data_throughput_test() {
 fn e2e_system_stress_and_stability() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -462,7 +416,6 @@ fn e2e_system_stress_and_stability() {
     let duration = Duration::from_secs(30); // Reduced duration for CI
     let start_time = Instant::now();
     
-    // Error tracking
     let mut write_errors = 0u64;
     let read_errors = 0u64;
     let mut successful_operations = 0u64;
@@ -472,13 +425,10 @@ fn e2e_system_stress_and_stability() {
     let mut counter = 0u64;
     let mut topic_index = 0;
     
-    // Sequential stress simulation
     while start_time.elapsed() < duration {
-        // Write phase - simulate 6 workers across 3 topics
         for worker_id in 0..6 {
             let topic = &topics[worker_id % 3];
             
-            // Vary entry sizes dramatically (reduced for CI)
             let size = match counter % 5 {
                 0 => 10,           // Tiny
                 1 => 1_000,        // Small
@@ -500,7 +450,6 @@ fn e2e_system_stress_and_stability() {
             }
         }
         
-        // Read phase - simulate 3 aggressive readers
         for _ in 0..3 {
             let topic = &topics[topic_index % topics.len()];
             
@@ -508,16 +457,12 @@ fn e2e_system_stress_and_stability() {
                 Some(entry) => {
                     successful_operations += 1;
                     
-                    // Validate data integrity based on expected size patterns
                     let expected_sizes = [10, 1_000, 25_000, 100_000, 500_000];
                     let size_valid = expected_sizes.contains(&entry.data.len());
                     
-                    // Check they're filled with the expected pattern
                     let content_valid = if entry.data.len() <= 1_000 {
-                        // Small entries should have consistent byte values
                         entry.data.iter().all(|&b| b == entry.data[0])
                     } else {
-                        // Large entries should have consistent byte values too
                         entry.data.iter().all(|&b| b == entry.data[0])
                     };
                     
@@ -526,7 +471,6 @@ fn e2e_system_stress_and_stability() {
                     }
                 }
                 None => {
-                    // Not an error, just no data available
                 }
             }
             
@@ -535,7 +479,6 @@ fn e2e_system_stress_and_stability() {
         
         counter += 1;
         
-        // Variable delays to create bursty traffic (reduced for CI)
         let delay = match counter % 7 {
             0 => 0,      // No delay
             1..=3 => 1,  // Short delay
@@ -560,17 +503,14 @@ fn e2e_system_stress_and_stability() {
     println!("  Success rate: {:.2}%", (successful_operations as f64 / (successful_operations + write_errors + read_errors) as f64) * 100.0);
     println!("  Operations/sec: {:.2}", successful_operations as f64 / elapsed.as_secs_f64());
     
-    // Reduced expectations for single-threaded version
     assert!(successful_operations > 200, "Expected > 200 successful operations, got {}", successful_operations);
     
-    // Error rate should be reasonable (< 10% for CI tolerance)
     let total_ops = successful_operations + write_errors + read_errors;
     if total_ops > 0 {
         let error_rate = (write_errors + read_errors) as f64 / total_ops as f64;
         assert!(error_rate < 0.10, "Error rate too high: {:.2}%", error_rate * 100.0);
     }
     
-    // Data integrity check - should have no validation errors
     assert_eq!(read_validation_errors, 0, "Data integrity validation failed: {} errors", read_validation_errors);
     
     cleanup_wal();
@@ -580,7 +520,6 @@ fn e2e_system_stress_and_stability() {
 fn e2e_performance_benchmark() {
     cleanup_wal();
     
-    // Enable quiet mode to suppress debug output
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
     }
@@ -589,7 +528,6 @@ fn e2e_performance_benchmark() {
     
     println!("=== WAL Performance Benchmark ===");
     
-    // Simple write benchmark - just count operations in a short time
     let start = Instant::now();
     let duration = Duration::from_secs(10); // Reduced duration for CI
     let mut write_count = 0u64;
@@ -611,7 +549,6 @@ fn e2e_performance_benchmark() {
     println!("  Bytes: {} KB", write_bytes / 1024);
     println!("  Throughput: {:.0} ops/sec", write_count as f64 / write_elapsed.as_secs_f64());
     
-    // Simple read benchmark
     let start = Instant::now();
     let mut read_count = 0u64;
     let mut read_bytes = 0u64;
@@ -631,11 +568,10 @@ fn e2e_performance_benchmark() {
     println!("  Bytes: {} KB", read_bytes / 1024);
     println!("  Throughput: {:.0} ops/sec", read_count as f64 / read_elapsed.as_secs_f64());
     
-    // Basic performance assertions
     assert!(write_count > 10, "Write throughput too low: {} ops", write_count);
     assert!(read_count > 5, "Read throughput too low: {} ops", read_count);
     
-    println!("✅ Performance benchmark completed!");
+    println!("Performance benchmark completed!");
     
     cleanup_wal();
 }

@@ -195,9 +195,9 @@ class LiveScalingPlot:
             print(f"Error updating plot: {e}")
     
     def start_monitoring(self):
-        print("🚀 Starting live scaling visualization...")
-        print("📊 Graph will update as each test completes")
-        print("💡 Close the plot window to stop monitoring")
+        print("Starting live scaling visualization...")
+        print("Graph will update as each test completes")
+        print("Close the plot window to stop monitoring")
         
         ani = animation.FuncAnimation(self.fig, self.update_plot, 
                                     interval=1000, blit=False, cache_frame_data=False)
@@ -205,7 +205,7 @@ class LiveScalingPlot:
         try:
             plt.show()
         except KeyboardInterrupt:
-            print("\n⏹️  Monitoring stopped by user")
+            print("\nMonitoring stopped by user")
 
 if __name__ == '__main__':
     plotter = LiveScalingPlot()
@@ -248,7 +248,7 @@ fn scaling_benchmark() {
         }
     });
     
-    println!("📊 Live graph available! Run in another terminal:");
+    println!("Live graph available! Run in another terminal:");
     println!("   python live_scaling_plot.py");
     println!();
     
@@ -263,7 +263,7 @@ fn scaling_benchmark() {
         // Send to CSV writer thread (non-blocking)
         let _ = csv_tx.send((num_threads, throughput));
         
-        println!("✅ {} threads: {:.0} ops/sec (added to live graph)", num_threads, throughput);
+        println!("{} threads: {:.0} ops/sec (added to live graph)", num_threads, throughput);
         
         // Longer delay between tests to ensure complete cleanup
         thread::sleep(Duration::from_millis(1000));
@@ -327,8 +327,8 @@ print("Data saved to: scaling_results.csv")
     
     fs::write("show_scaling_graph.py", plot_script).expect("Failed to write plot script");
     
-    println!("\n📊 Results saved to: scaling_results.csv");
-    println!("📈 Run 'python show_scaling_graph.py' to see the scaling graph");
+    println!("\nResults saved to: scaling_results.csv");
+    println!("Run 'python show_scaling_graph.py' to see the scaling graph");
     
     // Basic performance assertions
     let max_throughput = results.iter().map(|(_, t)| *t).fold(0.0, f64::max);
@@ -339,7 +339,7 @@ print("Data saved to: scaling_results.csv")
     assert!(single_thread_throughput > 1000.0, 
         "Single thread throughput too low: {:.0} ops/sec", single_thread_throughput);
     
-    println!("\n✅ Scaling benchmark completed successfully!");
-    println!("📈 Best throughput: {:.0} ops/sec", max_throughput);
-    println!("🚀 Scaling factor: {:.1}x", max_throughput / single_thread_throughput);
+    println!("\nScaling benchmark completed successfully!");
+    println!("Best throughput: {:.0} ops/sec", max_throughput);
+    println!("Scaling factor: {:.1}x", max_throughput / single_thread_throughput);
 }

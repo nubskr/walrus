@@ -256,11 +256,11 @@ fn multithreaded_benchmark() {
     assert!(final_writes > 1000, "Write throughput too low: {} ops", final_writes);
     assert!(final_errors < final_writes / 10, "Too many write errors: {} out of {}", final_errors, final_writes);
     
-    println!("✅ Multi-threaded benchmark completed successfully!");
+    println!("Multi-threaded benchmark completed successfully!");
     
     // Wait for monitoring thread to finish
     let _ = monitor_handle.join();
-    println!("📊 Throughput data saved to: {}", csv_path);
+    println!("Throughput data saved to: {}", csv_path);
     
     cleanup_wal();
 }

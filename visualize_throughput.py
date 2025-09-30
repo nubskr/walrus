@@ -140,9 +140,9 @@ Total: {latest['total_writes']:,} writes"""
     
     def start_monitoring(self, interval=1000):
         """Start real-time monitoring"""
-        print(f"🚀 Starting real-time monitoring of {self.csv_file}")
-        print("📊 Waiting for benchmark data...")
-        print("💡 Close the plot window to stop monitoring")
+        print(f"Starting real-time monitoring of {self.csv_file}")
+        print("Waiting for benchmark data...")
+        print("Close the plot window to stop monitoring")
         
         # Animation
         ani = animation.FuncAnimation(self.fig, self.update_plot, 
@@ -151,7 +151,7 @@ Total: {latest['total_writes']:,} writes"""
         try:
             plt.show()
         except KeyboardInterrupt:
-            print("\n⏹️  Monitoring stopped by user")
+            print("\nMonitoring stopped by user")
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize WAL benchmark throughput in real-time')
@@ -162,12 +162,12 @@ def main():
     
     args = parser.parse_args()
     
-    print("🎯 WAL Benchmark Throughput Visualizer")
+    print("WAL Benchmark Throughput Visualizer")
     print("=" * 40)
     
     if not os.path.exists(args.file):
-        print(f"⚠️  CSV file '{args.file}' not found.")
-        print("💡 Run the benchmark first to generate data:")
+        print(f"CSV file '{args.file}' not found.")
+        print("Run the benchmark first to generate data:")
         print("   cargo test --test multithreaded_benchmark_writes -- --nocapture")
         return
     

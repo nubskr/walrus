@@ -39,18 +39,15 @@ fn large_entry_forces_block_seal() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     
-    // Create 9MB entries to force block sealing
     let large_data_1 = vec![0x42u8; 9 * 1024 * 1024]; // 9MB of 0x42
     let large_data_2 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
     let large_data_3 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
 
-    // add a 2 second timeout
     
     wal.append_for_topic("t", &large_data_1).unwrap();
     wal.append_for_topic("t", &large_data_2).unwrap();
     wal.append_for_topic("t", &large_data_3).unwrap();
     
-    // std::thread::sleep(std::time::Duration::from_secs(1));
 
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, large_data_1);
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, large_data_2);
@@ -89,7 +86,6 @@ fn persists_read_offsets_across_restart() {
     wal.append_for_topic("t", b"a").unwrap();
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"a");
-    // restart
     let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t").unwrap().unwrap().data, b"b");
     assert!(wal2.read_next("t").unwrap().is_none());
@@ -101,7 +97,6 @@ fn checksum_corruption_is_detected_via_public_api() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"abcdef").unwrap();
-    // corrupt by finding the data pattern in the file and flipping a byte
     let path = first_data_file();
     let mut bytes = Vec::new();
     {
@@ -109,7 +104,6 @@ fn checksum_corruption_is_detected_via_public_api() {
         f.read_to_end(&mut bytes).unwrap();
     }
     if let Some(pos) = bytes.windows(6).position(|w| w == b"abcdef") {
-        // flip one byte in the middle of the payload
         let flip_pos = pos + 2;
         let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(flip_pos as u64)).unwrap();
@@ -117,35 +111,27 @@ fn checksum_corruption_is_detected_via_public_api() {
     } else {
         panic!("payload not found to corrupt");
     }
-    // restart and try reading
     let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     let res = wal2.read_next("t").unwrap();
     assert!(res.is_none());
     cleanup_wal();
 }
 
-// ============================================================================
-// EXTREME STRESS TESTS - PUSHING WAL TO ABSOLUTE LIMITS
-// ============================================================================
 
 #[test]
 fn stress_massive_single_entry() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     
-    // Create a massive entry (close to 1GB limit)
     let size = 100 * 1024 * 1024; // 100MB
     let mut massive_data = Vec::with_capacity(size);
     
-    // Fill with pattern that's easy to validate
     for i in 0..size {
         massive_data.push((i % 256) as u8);
     }
     
-    // Write the massive entry
     wal.append_for_topic("massive", &massive_data).unwrap();
     
-    // Read it back and validate every byte
     let entry = wal.read_next("massive").unwrap().unwrap();
     assert_eq!(entry.data.len(), size);
     
@@ -164,17 +150,14 @@ fn stress_many_topics_with_validation() {
     let num_topics = 1000;
     let entries_per_topic = 100;
     
-    // Write data with predictable patterns
     for topic_id in 0..num_topics {
         let topic = format!("topic_{:04}", topic_id);
         
         for entry_id in 0..entries_per_topic {
-            // Create data with topic_id and entry_id embedded
             let mut data = Vec::new();
             data.extend_from_slice(&(topic_id as u32).to_le_bytes());
             data.extend_from_slice(&(entry_id as u32).to_le_bytes());
             
-            // Add some payload with checksum
             let payload = format!("data_{}_{}_", topic_id, entry_id).repeat(10);
             data.extend_from_slice(payload.as_bytes());
             
@@ -182,14 +165,12 @@ fn stress_many_topics_with_validation() {
         }
     }
     
-    // Read back and validate all data
     for topic_id in 0..num_topics {
         let topic = format!("topic_{:04}", topic_id);
         
         for entry_id in 0..entries_per_topic {
             let entry = wal.read_next(&topic).unwrap().unwrap();
             
-            // Validate embedded IDs
             let read_topic_id = u32::from_le_bytes([
                 entry.data[0], entry.data[1], entry.data[2], entry.data[3]
             ]);
@@ -200,13 +181,11 @@ fn stress_many_topics_with_validation() {
             assert_eq!(read_topic_id, topic_id as u32);
             assert_eq!(read_entry_id, entry_id as u32);
             
-            // Validate payload
             let expected_payload = format!("data_{}_{}_", topic_id, entry_id).repeat(10);
             let actual_payload = String::from_utf8(entry.data[8..].to_vec()).unwrap();
             assert_eq!(actual_payload, expected_payload);
         }
         
-        // Verify no more entries
         assert!(wal.read_next(&topic).unwrap().is_none());
     }
     
@@ -222,12 +201,10 @@ fn stress_rapid_write_read_cycles() {
     let topic = "rapid_cycles";
     
     for cycle in 0..cycles {
-        // Write with cycle number and timestamp-like data
         let mut data = Vec::new();
         data.extend_from_slice(&(cycle as u64).to_le_bytes());
         data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // Magic bytes
         
-        // Add variable-length payload
         let payload_size = (cycle % 100) + 1;
         for i in 0..payload_size {
             data.push((cycle + i) as u8);
@@ -235,20 +212,16 @@ fn stress_rapid_write_read_cycles() {
         
         wal.append_for_topic(topic, &data).unwrap();
         
-        // Immediately read back and validate
         let entry = wal.read_next(topic).unwrap().unwrap();
         
-        // Validate cycle number
         let read_cycle = u64::from_le_bytes([
             entry.data[0], entry.data[1], entry.data[2], entry.data[3],
             entry.data[4], entry.data[5], entry.data[6], entry.data[7]
         ]);
         assert_eq!(read_cycle, cycle as u64);
         
-        // Validate magic bytes
         assert_eq!(&entry.data[8..12], &[0xAA, 0xBB, 0xCC, 0xDD]);
         
-        // Validate payload
         let expected_payload_size = (cycle % 100) + 1;
         assert_eq!(entry.data.len(), 8 + 4 + expected_payload_size);
         
@@ -265,7 +238,6 @@ fn stress_boundary_conditions() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     
-    // Test various boundary sizes
     let test_sizes = vec![
         0,                    // Empty
         1,                    // Single byte
@@ -286,7 +258,6 @@ fn stress_boundary_conditions() {
     for (i, &size) in test_sizes.iter().enumerate() {
         let topic = format!("boundary_{}", i);
         
-        // Create data with size-specific pattern
         let mut data = Vec::with_capacity(size);
         for j in 0..size {
             data.push(((i + j) % 256) as u8);
@@ -294,7 +265,6 @@ fn stress_boundary_conditions() {
         
         wal.append_for_topic(&topic, &data).unwrap();
         
-        // Read back and validate
         let entry = wal.read_next(&topic).unwrap().unwrap();
         assert_eq!(entry.data.len(), size);
         
@@ -312,7 +282,6 @@ fn stress_data_integrity_patterns() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     
-    // Test various data patterns that might expose corruption
     let patterns = vec![
         ("zeros", vec![0u8; 1000]),
         ("ones", vec![0xFF; 1000]),
@@ -348,21 +317,17 @@ fn stress_concurrent_topic_validation() {
     let num_topics = 50;
     let entries_per_topic = 200;
     
-    // Write interleaved data
     for round in 0..entries_per_topic {
         for topic_id in 0..num_topics {
             let topic = format!("concurrent_{}", topic_id);
             
-            // Create data with round and topic embedded
             let mut data = Vec::new();
             data.extend_from_slice(&(topic_id as u32).to_le_bytes());
             data.extend_from_slice(&(round as u32).to_le_bytes());
             
-            // Add checksum-like data
             let checksum = (topic_id + round) % 256;
             data.push(checksum as u8);
             
-            // Add payload
             let payload = format!("T{}R{}", topic_id, round);
             data.extend_from_slice(payload.as_bytes());
             
@@ -370,14 +335,12 @@ fn stress_concurrent_topic_validation() {
         }
     }
     
-    // Read back in topic order and validate
     for topic_id in 0..num_topics {
         let topic = format!("concurrent_{}", topic_id);
         
         for round in 0..entries_per_topic {
             let entry = wal.read_next(&topic).unwrap().unwrap();
             
-            // Validate embedded data
             let read_topic_id = u32::from_le_bytes([
                 entry.data[0], entry.data[1], entry.data[2], entry.data[3]
             ]);
@@ -390,7 +353,6 @@ fn stress_concurrent_topic_validation() {
             assert_eq!(read_round, round as u32);
             assert_eq!(read_checksum, ((topic_id + round) % 256) as u8);
             
-            // Validate payload
             let expected_payload = format!("T{}R{}", topic_id, round);
             let actual_payload = String::from_utf8(entry.data[9..].to_vec()).unwrap();
             assert_eq!(actual_payload, expected_payload);
@@ -405,7 +367,6 @@ fn stress_extreme_topic_names() {
     cleanup_wal();
     let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
     
-    // Test various extreme topic names
     let extreme_topics = vec![
         "a".to_string(),                                    // Single char
         "a".repeat(10),                                     // Short
@@ -427,7 +388,6 @@ fn stress_extreme_topic_names() {
                 assert_eq!(entry.data, data);
             }
             Err(_) => {
-                // Some topic names might be invalid, that's okay
                 println!("Topic '{}' rejected (expected for some cases)", topic);
             }
         }
@@ -436,29 +396,21 @@ fn stress_extreme_topic_names() {
     cleanup_wal();
 }
 
-// ============================================================================
-// UNIT TESTS FOR INDIVIDUAL COMPONENTS
-// ============================================================================
 
 mod checksum_tests {
     use super::*;
     
-    // We need to access the internal checksum function, so we'll test it indirectly
-    // through the public API by verifying data integrity
     #[test]
     fn checksum_detects_corruption() {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Write some data
         let test_data = b"test_checksum_data_12345";
         wal.append_for_topic("checksum_test", test_data).unwrap();
         
-        // First verify we can read the data normally
         let entry = wal.read_next("checksum_test").unwrap().unwrap();
         assert_eq!(entry.data, test_data);
         
-        // Corrupt the file and verify checksum detection
         let path = first_data_file();
         let mut bytes = Vec::new();
         {
@@ -466,11 +418,9 @@ mod checksum_tests {
             f.read_to_end(&mut bytes).unwrap();
         }
         
-        // Find and corrupt the data - corrupt multiple bytes to ensure detection
         if let Some(pos) = bytes.windows(test_data.len()).position(|w| w == test_data) {
             let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(pos as u64)).unwrap();
-            // Corrupt the first few bytes of the data
             let corrupted = [test_data[0] ^ 0xFF, test_data[1] ^ 0xFF, test_data[2] ^ 0xFF];
             f.write_all(&corrupted).unwrap();
             f.sync_all().unwrap(); // Ensure the corruption is written to disk
@@ -478,17 +428,13 @@ mod checksum_tests {
             panic!("Test data not found in file for corruption");
         }
         
-        // Restart and verify corruption is detected
         let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         let result = wal2.read_next("checksum_test").unwrap();
         
-        // The corrupted data should either return None or the corrupted data should be different
         match result {
             None => {
-                // Corruption detected - this is what we expect
             }
             Some(entry) => {
-                // If we get data back, it should be different from the original
                 assert_ne!(entry.data, test_data, "Corruption was not detected - got original data back");
             }
         }
@@ -533,13 +479,11 @@ mod wal_index_tests {
         cleanup_wal();
         let mut idx = WalIndex::new("test_basic").unwrap();
         
-        // Test set and get
         idx.set("key1".to_string(), 10, 20).unwrap();
         let pos = idx.get("key1").unwrap();
         assert_eq!(pos.cur_block_idx, 10);
         assert_eq!(pos.cur_block_offset, 20);
         
-        // Test non-existent key
         assert!(idx.get("nonexistent").is_none());
         
         cleanup_wal();
@@ -581,13 +525,11 @@ mod wal_index_tests {
         cleanup_wal();
         let index_name = "test_persistence";
         
-        // Create and populate index
         {
             let mut idx = WalIndex::new(index_name).unwrap();
             idx.set("persistent_key".to_string(), 100, 200).unwrap();
         }
         
-        // Create new instance and verify data persists
         {
             let idx = WalIndex::new(index_name).unwrap();
             let pos = idx.get("persistent_key").unwrap();
@@ -623,7 +565,6 @@ mod walrus_integration_tests {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Reading from non-existent topic should return None
         assert!(wal.read_next("empty_topic").unwrap().is_none());
         
         cleanup_wal();
@@ -640,7 +581,6 @@ mod walrus_integration_tests {
         assert_eq!(wal.read_next("topic1").unwrap().unwrap().data, b"data1");
         assert_eq!(wal.read_next("topic2").unwrap().unwrap().data, b"data2");
         
-        // Should be empty after reading
         assert!(wal.read_next("topic1").unwrap().is_none());
         assert!(wal.read_next("topic2").unwrap().is_none());
         
@@ -689,7 +629,6 @@ mod walrus_integration_tests {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Test with various sizes
         let sizes = vec![1024, 64 * 1024, 512 * 1024, 1024 * 1024]; // 1KB to 1MB
         
         for (i, size) in sizes.iter().enumerate() {
@@ -725,23 +664,19 @@ mod walrus_integration_tests {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Write to multiple topics
         for i in 0..10 {
             wal.append_for_topic("topic_a", &[i]).unwrap();
             wal.append_for_topic("topic_b", &[i + 100]).unwrap();
         }
         
-        // Read from topic_a only
         for i in 0..5 {
             assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, &[i]);
         }
         
-        // Read from topic_b - should be independent
         for i in 0..10 {
             assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, &[i + 100]);
         }
         
-        // Continue reading topic_a from where we left off
         for i in 5..10 {
             assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, &[i]);
         }
@@ -753,20 +688,16 @@ mod walrus_integration_tests {
     fn walrus_recovery_after_restart() {
         cleanup_wal();
         
-        // First instance - write data
         {
             let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
             wal.append_for_topic("recovery_test", b"before_restart").unwrap();
             wal.append_for_topic("recovery_test", b"also_before").unwrap();
             
-            // Read one entry
             assert_eq!(wal.read_next("recovery_test").unwrap().unwrap().data, b"before_restart");
         }
         
-        // Second instance - should recover state
         {
             let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
-            // Should continue from where we left off
             assert_eq!(wal.read_next("recovery_test").unwrap().unwrap().data, b"also_before");
             assert!(wal.read_next("recovery_test").unwrap().is_none());
         }
@@ -783,7 +714,6 @@ mod walrus_integration_tests {
         assert_eq!(wal.read_next("test").unwrap().unwrap().data, b"first");
         assert!(wal.read_next("test").unwrap().is_none());
         
-        // Write more data after exhausting reads
         wal.append_for_topic("test", b"second").unwrap();
         assert_eq!(wal.read_next("test").unwrap().unwrap().data, b"second");
         
@@ -795,17 +725,14 @@ mod walrus_integration_tests {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Topic A: few large entries
         let large_data = vec![0xAA; 100 * 1024]; // 100KB
         wal.append_for_topic("topic_large", &large_data).unwrap();
         wal.append_for_topic("topic_large", &large_data).unwrap();
         
-        // Topic B: many small entries
         for i in 0..100 {
             wal.append_for_topic("topic_small", &[i as u8]).unwrap();
         }
         
-        // Verify both topics work correctly
         assert_eq!(wal.read_next("topic_large").unwrap().unwrap().data, large_data);
         assert_eq!(wal.read_next("topic_large").unwrap().unwrap().data, large_data);
         assert!(wal.read_next("topic_large").unwrap().is_none());
@@ -827,10 +754,8 @@ mod error_handling_tests {
         cleanup_wal();
         let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         
-        // Write valid data first
         wal.append_for_topic("test", b"valid_data").unwrap();
         
-        // Corrupt the file
         let path = first_data_file();
         let mut bytes = Vec::new();
         {
@@ -838,18 +763,14 @@ mod error_handling_tests {
             f.read_to_end(&mut bytes).unwrap();
         }
         
-        // Corrupt metadata length bytes (first 2 bytes of each block)
         {
             let mut f = OpenOptions::new().write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(0)).unwrap();
             f.write_all(&[0xFF, 0xFF]).unwrap(); // Invalid metadata length
         }
         
-        // Should handle corruption gracefully
         let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
         let _result = wal2.read_next("test").unwrap();
-        // Should either return None or handle the error gracefully
-        // The exact behavior depends on implementation details
         
         cleanup_wal();
     }
@@ -865,13 +786,11 @@ mod stress_tests {
         
         let num_entries = 1000;
         
-        // Write many small entries
         for i in 0..num_entries {
             let data = format!("entry_{:04}", i);
             wal.append_for_topic("stress_small", data.as_bytes()).unwrap();
         }
         
-        // Read them back
         for i in 0..num_entries {
             let expected = format!("entry_{:04}", i);
             let actual = wal.read_next("stress_small").unwrap().unwrap().data;
@@ -891,7 +810,6 @@ mod stress_tests {
         let num_topics = 10;
         let entries_per_topic = 100;
         
-        // Write to multiple topics
         for topic_id in 0..num_topics {
             for entry_id in 0..entries_per_topic {
                 let data = format!("t{}_e{}", topic_id, entry_id);
@@ -900,7 +818,6 @@ mod stress_tests {
             }
         }
         
-        // Read from all topics
         for topic_id in 0..num_topics {
             let topic_name = format!("stress_topic_{}", topic_id);
             for entry_id in 0..entries_per_topic {

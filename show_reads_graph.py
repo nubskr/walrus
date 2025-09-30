@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 import os
 
 if not os.path.exists('read_benchmark_throughput.csv'):
-    print("❌ read_benchmark_throughput.csv not found")
-    print("💡 Run the read benchmark first:")
+    print("read_benchmark_throughput.csv not found")
+    print("Run the read benchmark first:")
     print("   cargo test --release multithreaded_benchmark_reads -- --nocapture")
     exit(1)
 
@@ -65,7 +65,7 @@ plt.tight_layout()
 plt.show()
 
 # Print summary stats
-print("\n📊 Read Benchmark Summary:")
+print("\nRead Benchmark Summary:")
 if not write_data.empty:
     max_writes = write_data['writes_per_second'].max()
     avg_writes = write_data['writes_per_second'].mean()

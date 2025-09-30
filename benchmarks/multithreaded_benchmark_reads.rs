@@ -377,11 +377,11 @@ fn multithreaded_read_benchmark() {
     assert!(write_errors_after_write_phase < writes_after_write_phase / 10, "Too many write errors: {} out of {}", write_errors_after_write_phase, writes_after_write_phase);
     assert!(final_read_errors < final_reads / 10, "Too many read errors: {} out of {}", final_read_errors, final_reads);
     
-    println!("✅ Multi-threaded read benchmark completed successfully!");
+    println!("Multi-threaded read benchmark completed successfully!");
     
     // Wait for monitoring thread to finish
     let _ = monitor_handle.join();
-    println!("📊 Throughput data saved to: {}", csv_path);
+    println!("Throughput data saved to: {}", csv_path);
     
     cleanup_wal();
 }

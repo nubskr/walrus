@@ -56,9 +56,9 @@ class LiveScalingPlot:
             print(f"Error updating plot: {e}")
     
     def start_monitoring(self):
-        print("🚀 Starting live scaling visualization...")
-        print("📊 Graph will update as each test completes")
-        print("💡 Close the plot window to stop monitoring")
+        print("Starting live scaling visualization...")
+        print("Graph will update as each test completes")
+        print("Close the plot window to stop monitoring")
         
         ani = animation.FuncAnimation(self.fig, self.update_plot, 
                                     interval=1000, blit=False, cache_frame_data=False)
@@ -66,7 +66,7 @@ class LiveScalingPlot:
         try:
             plt.show()
         except KeyboardInterrupt:
-            print("\n⏹️  Monitoring stopped by user")
+            print("\nMonitoring stopped by user")
 
 if __name__ == '__main__':
     plotter = LiveScalingPlot()
