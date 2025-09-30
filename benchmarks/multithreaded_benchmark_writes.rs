@@ -26,7 +26,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, 2 minutes write phase only");
     
-    let wal = Arc::new(Walrus::new().expect("Failed to create Walrus"));
+    let wal = Arc::new(Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).expect("Failed to create Walrus"));
     let num_threads = 10;
     let write_duration = Duration::from_secs(120); // 2 minutes
     
@@ -75,39 +75,48 @@ fn multithreaded_benchmark() {
             .open("benchmark_throughput.csv")
             .expect("Failed to open CSV file");
             
-        let start_time = Instant::now();
+        let mut start_time = Instant::now();
         let mut last_writes = 0u64;
         let mut last_bytes = 0u64;
         let mut last_time = start_time;
+        let mut tick_index: u64 = 0;
         
         // Wait for benchmark to start
         let _ = throughput_rx.recv();
         
+        // Log initial state at time 0
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        writeln!(csv_file, "{},{:.2},{:.0},{:.0},{},{}", 
+            timestamp, 0.0, 0.0, 0.0, 0, 0)
+            .expect("Failed to write initial CSV entry");
+        csv_file.flush().expect("Failed to flush CSV");
+        
+        // Reset timing and wait before first measurement
+        start_time = Instant::now();
+        last_time = start_time;
+        thread::sleep(Duration::from_millis(500));
+        
         loop {
             thread::sleep(Duration::from_millis(500)); // Sample every 500ms for better granularity
-            
+
+            // Deterministic time base to avoid duplicate/rounded times
+            tick_index += 1;
+            let interval_s = 0.5f64;
+            let elapsed_total = tick_index as f64 * interval_s;
+
             let current_time = Instant::now();
             let current_writes = total_writes_monitor.load(Ordering::Relaxed);
             let current_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
+
+            // Calculate rates over fixed interval
+            let writes_per_second = (current_writes - last_writes) as f64 / interval_s;
+            let bytes_per_second = (current_bytes - last_bytes) as f64 / interval_s;
             
-            let elapsed_total = current_time.duration_since(start_time).as_secs_f64();
-            let elapsed_interval = current_time.duration_since(last_time).as_secs_f64();
-            
-            // Only calculate rates if we have a meaningful interval
-            let writes_per_second = if elapsed_interval > 0.1 {
-                (current_writes - last_writes) as f64 / elapsed_interval
-            } else {
-                0.0
-            };
-            
-            let bytes_per_second = if elapsed_interval > 0.1 {
-                (current_bytes - last_bytes) as f64 / elapsed_interval
-            } else {
-                0.0
-            };
-            
-            // Only log if there's been some change or every 2 seconds
-            let should_log = (current_writes != last_writes) || (elapsed_total as u64 % 2 == 0);
+            // Only log if there's been some change or every 2 seconds (4 ticks of 0.5s)
+            let should_log = (current_writes != last_writes) || (tick_index % 4 == 0);
             
             if should_log {
                 // Write to CSV

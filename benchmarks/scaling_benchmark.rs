@@ -36,7 +36,7 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
     // Small delay to ensure complete cleanup
     thread::sleep(Duration::from_millis(100));
     
-    let wal = Arc::new(Walrus::new().expect("Failed to create Walrus"));
+    let wal = Arc::new(Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).expect("Failed to create Walrus"));
     let test_duration = Duration::from_secs(30); // 30 seconds per test
     
     // Shared counters for statistics

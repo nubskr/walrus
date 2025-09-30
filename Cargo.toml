@@ -9,8 +9,12 @@ rkyv = { version = "0.7", features = ["validation", "strict"] }
 rand = "0.8"
 
 [[test]]
-name = "multithreaded_benchmark"
-path = "benchmarks/multithreaded_benchmark.rs"
+name = "multithreaded_benchmark_writes"
+path = "benchmarks/multithreaded_benchmark_writes.rs"
+
+[[test]]
+name = "multithreaded_benchmark_reads"
+path = "benchmarks/multithreaded_benchmark_reads.rs"
 
 [[test]]
 name = "scaling_benchmark"

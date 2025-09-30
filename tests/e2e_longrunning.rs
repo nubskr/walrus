@@ -24,7 +24,7 @@ fn e2e_sustained_mixed_workload() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     let duration = Duration::from_secs(15); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -124,7 +124,7 @@ fn e2e_realistic_application_simulation() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     let duration = Duration::from_secs(20); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -274,7 +274,7 @@ fn e2e_recovery_and_persistence_marathon() {
         println!("E2E Recovery Cycle {}/{}", cycle + 1, total_cycles);
         
         // Create new WAL instance (simulates restart)
-        let wal = Walrus::new().unwrap();
+        let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
         
         // Write data for this cycle
         for entry_id in 0..entries_per_cycle {
@@ -305,7 +305,7 @@ fn e2e_recovery_and_persistence_marathon() {
     }
     
     // Final verification - create new WAL and read all remaining data with validation
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     let mut total_read = 0;
     let mut validation_errors = 0;
     
@@ -358,7 +358,7 @@ fn e2e_massive_data_throughput_test() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     let duration = Duration::from_secs(25); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -458,7 +458,7 @@ fn e2e_system_stress_and_stability() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     let duration = Duration::from_secs(30); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -585,7 +585,7 @@ fn e2e_performance_benchmark() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new().unwrap();
+    let wal = Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 }).unwrap();
     
     println!("=== WAL Performance Benchmark ===");
     

@@ -30,7 +30,6 @@ macro_rules! debug_print {
 const DEFAULT_BLOCK_SIZE:u64 = 10 * 1024 * 1024; // 10mb
 const BLOCKS_PER_FILE:u64 = 100;
 const MAX_ALLOC:u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
-const FSYNC_SCHEDULE:u64 = 1; // seconds btw
 const PREFIX_META_SIZE: usize = 64; 
 const MAX_FILE_SIZE:u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
 
@@ -437,7 +436,8 @@ impl SharedMmapKeeper {
 struct ColReaderInfo {
     chain: Vec<Block>,
     cur_block_idx: usize,
-    cur_block_offset: u64
+    cur_block_offset: u64,
+    reads_since_persist: u32,
 }
 
 struct Reader {
@@ -479,7 +479,7 @@ impl Reader {
         let info_arc = {
             let mut map = self.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0 })))
+                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0, reads_since_persist: 0 })))
                 .clone()
         };
         let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
@@ -564,16 +564,37 @@ impl WalIndex {
 // -------------------
 
 // public APIs
+#[derive(Clone, Copy, Debug)]
+pub enum ReadConsistency {
+    StrictlyAtOnce,
+    AtLeastOnce { persist_every: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FsyncSchedule {
+    Seconds(u64),
+}
+
 pub struct Walrus {
     allocator: Arc<BlockAllocator>,
     reader: Arc<Reader>,
     writers: RwLock<HashMap<String, Arc<Writer>>>,
     fsync_tx: Arc<mpsc::Sender<String>>,
     read_offset_index: Arc<RwLock<WalIndex>>,
+    read_consistency: ReadConsistency,
+    fsync_schedule: FsyncSchedule,
 }
 
 impl Walrus {
     pub fn new() -> std::io::Result<Self> {
+        Self::with_consistency(ReadConsistency::StrictlyAtOnce)
+    }
+
+    pub fn with_consistency(mode: ReadConsistency) -> std::io::Result<Self> {
+        Self::with_consistency_and_schedule(mode, FsyncSchedule::Seconds(1))
+    }
+
+    pub fn with_consistency_and_schedule(mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
         let allocator = Arc::new(BlockAllocator::new()?);
         let reader = Arc::new(Reader::new());
@@ -584,6 +605,7 @@ impl Walrus {
         let _ = DELETION_TX.set(del_tx_arc.clone());
         let pool: HashMap<String, MmapMut> = HashMap::new();
         let tick = Arc::new(AtomicU64::new(0));
+        let sleep_secs = match fsync_schedule { FsyncSchedule::Seconds(s) => s.max(1) };
         // background flusher
         thread::spawn(move || {
             let mut pool = pool;
@@ -591,7 +613,7 @@ impl Walrus {
             let del_rx = del_rx;
             let mut delete_pending = std::collections::HashSet::new();
             loop {
-                thread::sleep(Duration::from_secs(FSYNC_SCHEDULE));
+                thread::sleep(Duration::from_secs(sleep_secs));
                 let mut unique = std::collections::HashSet::new();
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
@@ -623,7 +645,7 @@ impl Walrus {
                     delete_pending.insert(path);
                 }
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
-                if n >= 3600 { // WARN: this currently assumes the FSYNC runs every second
+                if n >= 1000 { // WARN: we clean up once every 1000 times the fsync runs
                     if tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                         let mut empty: HashMap<String, MmapMut> = HashMap::new();
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
@@ -639,7 +661,7 @@ impl Walrus {
             }
         });
         let idx = WalIndex::new("read_offset_idx")?;
-        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(idx)) };
+        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(idx)), read_consistency: mode, fsync_schedule };
         instance.startup_chore()?;
         Ok(instance)
     }
@@ -672,7 +694,7 @@ impl Walrus {
         } { arc } else {
             let mut map = self.reader.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col_name.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0 })))
+                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0, reads_since_persist: 0 })))
                 .clone()
         };
         let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
@@ -711,8 +733,10 @@ impl Walrus {
                 let ib = info.chain.len() - 1;
                 info.cur_block_idx = ib;
                 info.cur_block_offset = tail_off.min(info.chain[ib].used);
-                if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                    let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                if self.should_persist(&mut info, true) {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                    }
                 }
                 persisted_tail = None;
             }
@@ -736,8 +760,10 @@ impl Walrus {
                 match block.read(off) {
                     Ok((entry, consumed)) => {
                         info.cur_block_offset = off + consumed as u64;
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                        if self.should_persist(&mut info, false) {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                            }
                         }
                         debug_print!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
                         return Ok(Some(entry));
@@ -768,24 +794,30 @@ impl Walrus {
                     if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
                         info.cur_block_idx = idx;
                         info.cur_block_offset = tail_off.min(info.chain[idx].used);
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                        if self.should_persist(&mut info, true) {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                            }
                         }
                         persisted_tail = None; // sealed now
                         continue;
                     } else {
                         // rebase tail to current active block at 0
                         persisted_tail = Some((active_block.id, 0));
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                        if self.should_persist(&mut info, true) {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                            }
                         }
                     }
                 }
             } else {
                 // No persisted tail; initialize at current active block start
                 persisted_tail = Some((active_block.id, 0));
-                if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                    let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                if self.should_persist(&mut info, true) {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                    }
                 }
             }
 
@@ -801,8 +833,10 @@ impl Walrus {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
                         persisted_tail = Some((tail_block_id, new_off));
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), (tail_block_id | TAIL_FLAG), new_off);
+                        if self.should_persist(&mut info, false) {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), (tail_block_id | TAIL_FLAG), new_off);
+                            }
                         }
                         debug_print!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
                         return Ok(Some(entry));
@@ -815,6 +849,27 @@ impl Walrus {
             } else {
                 debug_print!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
                 return Ok(None);
+            }
+        }
+    }
+
+    fn should_persist(&self, info: &mut ColReaderInfo, force: bool) -> bool {
+        match self.read_consistency {
+            ReadConsistency::StrictlyAtOnce => true,
+            ReadConsistency::AtLeastOnce { persist_every } => {
+                let every = persist_every.max(1);
+                if force {
+                    info.reads_since_persist = 0;
+                    return true;
+                }
+                let next = info.reads_since_persist.saturating_add(1);
+                if next >= every {
+                    info.reads_since_persist = 0;
+                    true
+                } else {
+                    info.reads_since_persist = next;
+                    false
+                }
             }
         }
     }

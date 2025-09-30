@@ -168,7 +168,7 @@ def main():
     if not os.path.exists(args.file):
         print(f"⚠️  CSV file '{args.file}' not found.")
         print("💡 Run the benchmark first to generate data:")
-        print("   cargo test --test multithreaded_benchmark -- --nocapture")
+        print("   cargo test --test multithreaded_benchmark_writes -- --nocapture")
         return
     
     visualizer = ThroughputVisualizer(args.file)
