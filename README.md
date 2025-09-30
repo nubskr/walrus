@@ -1,1 +1,3 @@
-a high performance Write Ahead Log
+Walrus: a high performance Write Ahead Log
+
+
