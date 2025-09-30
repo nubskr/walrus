@@ -24,7 +24,7 @@ fn e2e_sustained_mixed_workload() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let duration = Duration::from_secs(15); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -72,7 +72,7 @@ fn e2e_sustained_mixed_workload() {
         ];
         
         for topic in &topics {
-            if let Some(entry) = wal.read_next(topic) {
+            if let Some(entry) = wal.read_next(topic).unwrap() {
                 *read_counts.entry(topic.clone()).or_insert(0) += 1;
                 
                 // Validate data integrity
@@ -124,7 +124,7 @@ fn e2e_realistic_application_simulation() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let duration = Duration::from_secs(20); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -193,7 +193,7 @@ fn e2e_realistic_application_simulation() {
         // Analytics processor - read from all topics
         let topics = vec!["user_activity", "transactions", "system_metrics", "error_logs"];
         for topic in &topics {
-            if let Some(entry) = wal.read_next(topic) {
+            if let Some(entry) = wal.read_next(topic).unwrap() {
                 processed_count += 1;
                 
                 // Validate data integrity based on topic
@@ -274,7 +274,7 @@ fn e2e_recovery_and_persistence_marathon() {
         println!("E2E Recovery Cycle {}/{}", cycle + 1, total_cycles);
         
         // Create new WAL instance (simulates restart)
-        let wal = Walrus::new();
+        let wal = Walrus::new().unwrap();
         
         // Write data for this cycle
         for entry_id in 0..entries_per_cycle {
@@ -294,7 +294,7 @@ fn e2e_recovery_and_persistence_marathon() {
         for topic in &topics {
             let read_count = (entries_per_cycle * (cycle + 1)) / 2; // Read half
             for _ in 0..read_count {
-                if wal.read_next(topic).is_none() {
+                if wal.read_next(topic).unwrap().is_none() {
                     break;
                 }
             }
@@ -305,12 +305,12 @@ fn e2e_recovery_and_persistence_marathon() {
     }
     
     // Final verification - create new WAL and read all remaining data with validation
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let mut total_read = 0;
     let mut validation_errors = 0;
     
     for topic in &topics {
-        while let Some(entry) = wal.read_next(topic) {
+        while let Some(entry) = wal.read_next(topic).unwrap() {
             total_read += 1;
             
             // Validate the data format matches what we wrote
@@ -358,7 +358,7 @@ fn e2e_massive_data_throughput_test() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let duration = Duration::from_secs(25); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -395,7 +395,7 @@ fn e2e_massive_data_throughput_test() {
         for _ in 0..2 {
             let topic = &topics[topic_index % topics.len()];
             
-            if let Some(entry) = wal.read_next(topic) {
+            if let Some(entry) = wal.read_next(topic).unwrap() {
                 bytes_read += entry.data.len() as u64;
                 entries_read += 1;
                 
@@ -458,7 +458,7 @@ fn e2e_system_stress_and_stability() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let duration = Duration::from_secs(30); // Reduced duration for CI
     let start_time = Instant::now();
     
@@ -504,7 +504,7 @@ fn e2e_system_stress_and_stability() {
         for _ in 0..3 {
             let topic = &topics[topic_index % topics.len()];
             
-            match wal.read_next(topic) {
+            match wal.read_next(topic).unwrap() {
                 Some(entry) => {
                     successful_operations += 1;
                     
@@ -585,7 +585,7 @@ fn e2e_performance_benchmark() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     println!("=== WAL Performance Benchmark ===");
     
@@ -619,7 +619,7 @@ fn e2e_performance_benchmark() {
     println!("Running read benchmark for {:?}...", duration);
     
     while start.elapsed() < duration {
-        if let Some(entry) = wal.read_next("bench") {
+        if let Some(entry) = wal.read_next("bench").unwrap() {
             read_count += 1;
             read_bytes += entry.data.len() as u64;
         }

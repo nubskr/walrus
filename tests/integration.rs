@@ -29,21 +29,21 @@ fn first_data_file() -> String {
 fn integration_basic_write_read_cycle() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Write some data
     wal.append_for_topic("test_topic", b"Hello, World!").unwrap();
     wal.append_for_topic("test_topic", b"Second message").unwrap();
     
     // Read it back
-    let entry1 = wal.read_next("test_topic").unwrap();
+    let entry1 = wal.read_next("test_topic").unwrap().unwrap();
     assert_eq!(entry1.data, b"Hello, World!");
     
-    let entry2 = wal.read_next("test_topic").unwrap();
+    let entry2 = wal.read_next("test_topic").unwrap().unwrap();
     assert_eq!(entry2.data, b"Second message");
     
     // Should be empty now
-    assert!(wal.read_next("test_topic").is_none());
+    assert!(wal.read_next("test_topic").unwrap().is_none());
     
     cleanup_wal();
 }
@@ -52,7 +52,7 @@ fn integration_basic_write_read_cycle() {
 fn integration_multiple_topics() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Write to different topics
     wal.append_for_topic("logs", b"Error occurred").unwrap();
@@ -61,22 +61,22 @@ fn integration_multiple_topics() {
     wal.append_for_topic("events", b"User login").unwrap();
     
     // Read from each topic independently
-    let log1 = wal.read_next("logs").unwrap();
+    let log1 = wal.read_next("logs").unwrap().unwrap();
     assert_eq!(log1.data, b"Error occurred");
     
-    let metric1 = wal.read_next("metrics").unwrap();
+    let metric1 = wal.read_next("metrics").unwrap().unwrap();
     assert_eq!(metric1.data, b"CPU: 80%");
     
-    let log2 = wal.read_next("logs").unwrap();
+    let log2 = wal.read_next("logs").unwrap().unwrap();
     assert_eq!(log2.data, b"Warning issued");
     
-    let event1 = wal.read_next("events").unwrap();
+    let event1 = wal.read_next("events").unwrap().unwrap();
     assert_eq!(event1.data, b"User login");
     
     // All topics should be empty now
-    assert!(wal.read_next("logs").is_none());
-    assert!(wal.read_next("metrics").is_none());
-    assert!(wal.read_next("events").is_none());
+    assert!(wal.read_next("logs").unwrap().is_none());
+    assert!(wal.read_next("metrics").unwrap().is_none());
+    assert!(wal.read_next("events").unwrap().is_none());
     
     cleanup_wal();
 }
@@ -85,16 +85,16 @@ fn integration_multiple_topics() {
 fn integration_empty_data_handling() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test empty data
     wal.append_for_topic("empty_test", b"").unwrap();
-    let empty_entry = wal.read_next("empty_test").unwrap();
+    let empty_entry = wal.read_next("empty_test").unwrap().unwrap();
     assert!(empty_entry.data.is_empty());
     
     // Test single byte
     wal.append_for_topic("single_byte", &[42]).unwrap();
-    let single_entry = wal.read_next("single_byte").unwrap();
+    let single_entry = wal.read_next("single_byte").unwrap().unwrap();
     assert_eq!(single_entry.data, &[42]);
     
     cleanup_wal();
@@ -104,13 +104,13 @@ fn integration_empty_data_handling() {
 fn integration_binary_data() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test binary data with various byte values
     let binary_data = vec![0, 1, 127, 128, 255, 0, 42];
     wal.append_for_topic("binary", &binary_data).unwrap();
     
-    let entry = wal.read_next("binary").unwrap();
+    let entry = wal.read_next("binary").unwrap().unwrap();
     assert_eq!(entry.data, binary_data);
     
     cleanup_wal();
@@ -120,7 +120,7 @@ fn integration_binary_data() {
 fn integration_utf8_strings() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test UTF-8 strings with special characters
     let utf8_strings = vec![
@@ -138,7 +138,7 @@ fn integration_utf8_strings() {
     
     for (i, expected) in utf8_strings.iter().enumerate() {
         let topic = format!("utf8_{}", i);
-        let entry = wal.read_next(&topic).unwrap();
+        let entry = wal.read_next(&topic).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, *expected);
     }
@@ -150,7 +150,7 @@ fn integration_utf8_strings() {
 fn integration_medium_sized_data() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test with medium-sized data (1KB, 10KB, 100KB)
     let sizes = vec![1024, 10 * 1024, 100 * 1024];
@@ -164,7 +164,7 @@ fn integration_medium_sized_data() {
     for (i, size) in sizes.iter().enumerate() {
         let expected = vec![i as u8; *size];
         let topic = format!("medium_{}", i);
-        let entry = wal.read_next(&topic).unwrap();
+        let entry = wal.read_next(&topic).unwrap().unwrap();
         assert_eq!(entry.data, expected);
     }
     
@@ -175,7 +175,7 @@ fn integration_medium_sized_data() {
 fn integration_sequential_writes_and_reads() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "sequential";
     
     // Write a sequence of messages
@@ -187,12 +187,12 @@ fn integration_sequential_writes_and_reads() {
     // Read them back in order
     for i in 0..20 {
         let expected = format!("Message number {}", i);
-        let entry = wal.read_next(topic).unwrap();
+        let entry = wal.read_next(topic).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
     }
     
-    assert!(wal.read_next(topic).is_none());
+    assert!(wal.read_next(topic).unwrap().is_none());
     
     cleanup_wal();
 }
@@ -201,7 +201,7 @@ fn integration_sequential_writes_and_reads() {
 fn integration_interleaved_write_read() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "interleaved";
     
     // Write some messages
@@ -209,7 +209,7 @@ fn integration_interleaved_write_read() {
     wal.append_for_topic(topic, b"Message 2").unwrap();
     
     // Read one
-    let entry1 = wal.read_next(topic).unwrap();
+    let entry1 = wal.read_next(topic).unwrap().unwrap();
     assert_eq!(entry1.data, b"Message 1");
     
     // Write more
@@ -217,16 +217,16 @@ fn integration_interleaved_write_read() {
     wal.append_for_topic(topic, b"Message 4").unwrap();
     
     // Read the rest
-    let entry2 = wal.read_next(topic).unwrap();
+    let entry2 = wal.read_next(topic).unwrap().unwrap();
     assert_eq!(entry2.data, b"Message 2");
     
-    let entry3 = wal.read_next(topic).unwrap();
+    let entry3 = wal.read_next(topic).unwrap().unwrap();
     assert_eq!(entry3.data, b"Message 3");
     
-    let entry4 = wal.read_next(topic).unwrap();
+    let entry4 = wal.read_next(topic).unwrap().unwrap();
     assert_eq!(entry4.data, b"Message 4");
     
-    assert!(wal.read_next(topic).is_none());
+    assert!(wal.read_next(topic).unwrap().is_none());
     
     cleanup_wal();
 }
@@ -235,7 +235,7 @@ fn integration_interleaved_write_read() {
 fn integration_multiple_topics_stress() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let num_topics = 5;
     let messages_per_topic = 10;
     
@@ -253,11 +253,11 @@ fn integration_multiple_topics_stress() {
         let topic = format!("stress_topic_{}", topic_id);
         for msg_id in 0..messages_per_topic {
             let expected = format!("Topic {} Message {}", topic_id, msg_id);
-            let entry = wal.read_next(&topic).unwrap();
+            let entry = wal.read_next(&topic).unwrap().unwrap();
             let actual = String::from_utf8(entry.data).unwrap();
             assert_eq!(actual, expected);
         }
-        assert!(wal.read_next(&topic).is_none());
+        assert!(wal.read_next(&topic).unwrap().is_none());
     }
     
     cleanup_wal();
@@ -267,7 +267,7 @@ fn integration_multiple_topics_stress() {
 fn integration_concurrent_writes() {
     cleanup_wal();
     
-    let wal = Arc::new(Walrus::new());
+    let wal = Arc::new(Walrus::new().unwrap());
     let num_threads = 3;
     let messages_per_thread = 5;
     
@@ -298,11 +298,11 @@ fn integration_concurrent_writes() {
         let topic = format!("concurrent_{}", thread_id);
         for msg_id in 0..messages_per_thread {
             let expected = format!("Thread {} Message {}", thread_id, msg_id);
-            let entry = wal.read_next(&topic).unwrap();
+            let entry = wal.read_next(&topic).unwrap().unwrap();
             let actual = String::from_utf8(entry.data).unwrap();
             assert_eq!(actual, expected);
         }
-        assert!(wal.read_next(&topic).is_none());
+        assert!(wal.read_next(&topic).unwrap().is_none());
     }
     
     cleanup_wal();
@@ -312,7 +312,7 @@ fn integration_concurrent_writes() {
 fn integration_topic_isolation() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Write to multiple topics
     wal.append_for_topic("topic_a", b"A1").unwrap();
@@ -322,17 +322,17 @@ fn integration_topic_isolation() {
     wal.append_for_topic("topic_b", b"B2").unwrap();
     
     // Read from topic_a only
-    assert_eq!(wal.read_next("topic_a").unwrap().data, b"A1");
-    assert_eq!(wal.read_next("topic_a").unwrap().data, b"A2");
-    assert!(wal.read_next("topic_a").is_none());
+    assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, b"A1");
+    assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, b"A2");
+    assert!(wal.read_next("topic_a").unwrap().is_none());
     
     // Other topics should still have their data
-    assert_eq!(wal.read_next("topic_b").unwrap().data, b"B1");
-    assert_eq!(wal.read_next("topic_b").unwrap().data, b"B2");
-    assert!(wal.read_next("topic_b").is_none());
+    assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"B1");
+    assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"B2");
+    assert!(wal.read_next("topic_b").unwrap().is_none());
     
-    assert_eq!(wal.read_next("topic_c").unwrap().data, b"C1");
-    assert!(wal.read_next("topic_c").is_none());
+    assert_eq!(wal.read_next("topic_c").unwrap().unwrap().data, b"C1");
+    assert!(wal.read_next("topic_c").unwrap().is_none());
     
     cleanup_wal();
 }
@@ -341,17 +341,17 @@ fn integration_topic_isolation() {
 fn integration_nonexistent_topic() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Reading from a topic that doesn't exist should return None
-    assert!(wal.read_next("nonexistent").is_none());
+    assert!(wal.read_next("nonexistent").unwrap().is_none());
     
     // Write to a topic, then read from a different one
     wal.append_for_topic("existing", b"data").unwrap();
-    assert!(wal.read_next("different").is_none());
+    assert!(wal.read_next("different").unwrap().is_none());
     
     // The original topic should still have data
-    assert_eq!(wal.read_next("existing").unwrap().data, b"data");
+    assert_eq!(wal.read_next("existing").unwrap().unwrap().data, b"data");
     
     cleanup_wal();
 }
@@ -360,22 +360,22 @@ fn integration_nonexistent_topic() {
 fn integration_write_after_exhaustion() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "exhaustion_test";
     
     // Write and read all data
     wal.append_for_topic(topic, b"first").unwrap();
-    assert_eq!(wal.read_next(topic).unwrap().data, b"first");
-    assert!(wal.read_next(topic).is_none());
+    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"first");
+    assert!(wal.read_next(topic).unwrap().is_none());
     
     // Write more data after exhaustion
     wal.append_for_topic(topic, b"second").unwrap();
     wal.append_for_topic(topic, b"third").unwrap();
     
     // Should be able to read new data
-    assert_eq!(wal.read_next(topic).unwrap().data, b"second");
-    assert_eq!(wal.read_next(topic).unwrap().data, b"third");
-    assert!(wal.read_next(topic).is_none());
+    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"second");
+    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"third");
+    assert!(wal.read_next(topic).unwrap().is_none());
     
     cleanup_wal();
 }
@@ -384,7 +384,7 @@ fn integration_write_after_exhaustion() {
 fn integration_large_topic_names() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test with reasonably long topic names (but not too long to exceed metadata limits)
     let long_topic = "a".repeat(15);  // Reduced to stay within metadata limits
@@ -393,8 +393,8 @@ fn integration_large_topic_names() {
     wal.append_for_topic(&long_topic, b"long topic data").unwrap();
     wal.append_for_topic(&very_long_topic, b"very long topic data").unwrap();
     
-    assert_eq!(wal.read_next(&long_topic).unwrap().data, b"long topic data");
-    assert_eq!(wal.read_next(&very_long_topic).unwrap().data, b"very long topic data");
+    assert_eq!(wal.read_next(&long_topic).unwrap().unwrap().data, b"long topic data");
+    assert_eq!(wal.read_next(&very_long_topic).unwrap().unwrap().data, b"very long topic data");
     
     cleanup_wal();
 }
@@ -407,7 +407,7 @@ fn integration_large_topic_names() {
 fn integration_memory_pressure_test() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let num_topics = 100;
     let large_entry_size = 1024 * 1024; // 1MB per entry
     
@@ -427,7 +427,7 @@ fn integration_memory_pressure_test() {
     // Read back and validate all large entries
     for topic_id in 0..num_topics {
         let topic = format!("memory_pressure_{}", topic_id);
-        let entry = wal.read_next(&topic).unwrap();
+        let entry = wal.read_next(&topic).unwrap().unwrap();
         
         assert_eq!(entry.data.len(), large_entry_size);
         
@@ -445,7 +445,7 @@ fn integration_memory_pressure_test() {
 fn integration_file_rollover_stress() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "rollover_stress";
     
     // Force multiple file rollovers with large entries
@@ -465,7 +465,7 @@ fn integration_file_rollover_stress() {
     
     // Read back across file boundaries
     for entry_id in 0..num_entries {
-        let entry = wal.read_next(topic).unwrap();
+        let entry = wal.read_next(topic).unwrap().unwrap();
         assert_eq!(entry.data.len(), entry_size);
         
         // Validate pattern across file boundaries
@@ -482,7 +482,7 @@ fn integration_file_rollover_stress() {
 fn integration_corruption_detection_comprehensive() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "corruption_test";
     
     // Write data with strong validation patterns
@@ -490,7 +490,7 @@ fn integration_corruption_detection_comprehensive() {
     wal.append_for_topic(topic, test_data).unwrap();
     
     // Verify normal read works
-    let entry = wal.read_next(topic).unwrap();
+    let entry = wal.read_next(topic).unwrap().unwrap();
     assert_eq!(entry.data, test_data);
     
     // Now test corruption detection by corrupting the file
@@ -509,10 +509,10 @@ fn integration_corruption_detection_comprehensive() {
         std::fs::write(&path, &file_data).unwrap();
         
         // Create new WAL instance and try to read
-        let wal2 = Walrus::new();
+        let wal2 = Walrus::new().unwrap();
         
         // Should detect corruption and handle gracefully
-        match wal2.read_next(topic) {
+        match wal2.read_next(topic).unwrap() {
             None => {
                 // Expected: corruption detected, no data returned
             }
@@ -531,7 +531,7 @@ fn integration_corruption_detection_comprehensive() {
 fn integration_extreme_topic_count() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let num_topics = 5000; // Extreme number of topics
     
     // Write one entry per topic with validation data
@@ -556,7 +556,7 @@ fn integration_extreme_topic_count() {
     
     for &topic_id in &read_order {
         let topic = format!("extreme_topic_{:06}", topic_id);
-        let entry = wal.read_next(&topic).unwrap();
+        let entry = wal.read_next(&topic).unwrap().unwrap();
         
         // Validate embedded topic ID
         let read_topic_id = u64::from_le_bytes([
@@ -579,7 +579,7 @@ fn integration_extreme_topic_count() {
 fn integration_mixed_size_stress() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     let topic = "mixed_sizes";
     
     // Test with exponentially increasing sizes
@@ -598,7 +598,7 @@ fn integration_mixed_size_stress() {
     
     // Read back and validate each size
     for (i, &base_size) in base_sizes.iter().enumerate() {
-        let entry = wal.read_next(topic).unwrap();
+        let entry = wal.read_next(topic).unwrap().unwrap();
         assert_eq!(entry.data.len(), base_size);
         
         for (j, &byte) in entry.data.iter().enumerate() {
@@ -616,7 +616,7 @@ fn integration_persistence_stress_with_validation() {
     
     // Phase 1: Write lots of data
     {
-        let wal = Walrus::new();
+        let wal = Walrus::new().unwrap();
         let num_topics = 100;
         let entries_per_topic = 50;
         
@@ -646,14 +646,14 @@ fn integration_persistence_stress_with_validation() {
             
             // Read half the entries
             for _ in 0..(entries_per_topic / 2) {
-                wal.read_next(&topic).unwrap();
+                wal.read_next(&topic).unwrap().unwrap();
             }
         }
     } // WAL instance dropped here
     
     // Phase 2: Restart and validate persistence
     {
-        let wal = Walrus::new();
+        let wal = Walrus::new().unwrap();
         let num_topics = 100;
         let entries_per_topic = 50;
         
@@ -663,7 +663,7 @@ fn integration_persistence_stress_with_validation() {
             
             // Read remaining entries
             for entry_id in (entries_per_topic / 2)..entries_per_topic {
-                let entry = wal.read_next(&topic).unwrap();
+                let entry = wal.read_next(&topic).unwrap().unwrap();
                 
                 // Validate all embedded data
                 let read_topic_id = u32::from_le_bytes([
@@ -688,7 +688,7 @@ fn integration_persistence_stress_with_validation() {
             }
             
             // Verify no more entries
-            assert!(wal.read_next(&topic).is_none());
+            assert!(wal.read_next(&topic).unwrap().is_none());
         }
     }
     
@@ -699,7 +699,7 @@ fn integration_persistence_stress_with_validation() {
 fn integration_data_pattern_stress() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test various challenging data patterns
     let patterns = vec![
@@ -727,7 +727,7 @@ fn integration_data_pattern_stress() {
     
     // Read back and validate
     for (pattern_name, expected_data) in patterns {
-        let entry = wal.read_next(&pattern_name).unwrap();
+        let entry = wal.read_next(&pattern_name).unwrap().unwrap();
         assert_eq!(entry.data, expected_data, 
                   "Pattern '{}' was corrupted during storage/retrieval", pattern_name);
     }
@@ -739,7 +739,7 @@ fn integration_data_pattern_stress() {
 fn integration_special_topic_names() {
     cleanup_wal();
     
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Test with special characters in topic names
     let topics = vec![
@@ -758,7 +758,7 @@ fn integration_special_topic_names() {
     
     for (i, topic) in topics.iter().enumerate() {
         let expected = format!("Data for topic {}", i);
-        let entry = wal.read_next(topic).unwrap();
+        let entry = wal.read_next(topic).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
     }
@@ -769,7 +769,7 @@ fn integration_special_topic_names() {
 #[test]
 fn exactly_once_delivery_guarantee() {
     cleanup_wal();
-    let wal = Walrus::new();
+    let wal = Walrus::new().unwrap();
     
     // Write entries
     for i in 0..10 {
@@ -778,16 +778,16 @@ fn exactly_once_delivery_guarantee() {
     
     // Read half
     for i in 0..5 {
-        assert_eq!(wal.read_next("exactly_once").unwrap().data, &[i]);
+        assert_eq!(wal.read_next("exactly_once").unwrap().unwrap().data, &[i]);
     }
     
     // Simulate crash and restart
     drop(wal);
-    let wal2 = Walrus::new();
+    let wal2 = Walrus::new().unwrap();
     
     // Should continue from entry 5, not restart from 0
     for i in 5..10 {
-        assert_eq!(wal2.read_next("exactly_once").unwrap().data, &[i]);
+        assert_eq!(wal2.read_next("exactly_once").unwrap().unwrap().data, &[i]);
     }
     
     cleanup_wal();

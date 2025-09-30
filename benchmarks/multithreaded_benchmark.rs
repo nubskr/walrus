@@ -26,7 +26,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, 2 minutes write phase only");
     
-    let wal = Arc::new(Walrus::new());
+    let wal = Arc::new(Walrus::new().expect("Failed to create Walrus"));
     let num_threads = 10;
     let write_duration = Duration::from_secs(120); // 2 minutes
     
