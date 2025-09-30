@@ -438,6 +438,12 @@ struct ColReaderInfo {
     cur_block_idx: usize,
     cur_block_offset: u64,
     reads_since_persist: u32,
+    // In-memory progress for tail (active writer block). This allows AtLeastOnce
+    // to advance between reads within a single process without persisting every time.
+    tail_block_id: u64,
+    tail_offset: u64,
+    // Ensure we only hydrate from persisted index once per process per column
+    hydrated_from_index: bool,
 }
 
 struct Reader {
@@ -479,7 +485,15 @@ impl Reader {
         let info_arc = {
             let mut map = self.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0, reads_since_persist: 0 })))
+                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo {
+                    chain: Vec::new(),
+                    cur_block_idx: 0,
+                    cur_block_offset: 0,
+                    reads_since_persist: 0,
+                    tail_block_id: 0,
+                    tail_offset: 0,
+                    hydrated_from_index: false,
+                })))
                 .clone()
         };
         let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
@@ -694,7 +708,15 @@ impl Walrus {
         } { arc } else {
             let mut map = self.reader.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col_name.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo { chain: Vec::new(), cur_block_idx: 0, cur_block_offset: 0, reads_since_persist: 0 })))
+                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo {
+                    chain: Vec::new(),
+                    cur_block_idx: 0,
+                    cur_block_offset: 0,
+                    reads_since_persist: 0,
+                    tail_block_id: 0,
+                    tail_offset: 0,
+                    hydrated_from_index: false,
+                })))
                 .clone()
         };
         let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
@@ -705,8 +727,9 @@ impl Walrus {
  
         // Load persisted position (supports tail sentinel)
         let mut persisted_tail: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
-        if let Ok(idx_guard) = self.read_offset_index.read() {
-            if let Some(pos) = idx_guard.get(col_name) {
+        if !info.hydrated_from_index {
+            if let Ok(idx_guard) = self.read_offset_index.read() {
+                if let Some(pos) = idx_guard.get(col_name) {
                 if (pos.cur_block_idx & TAIL_FLAG) != 0 {
                     let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
                     persisted_tail = Some((tail_block_id, pos.cur_block_offset));
@@ -723,6 +746,11 @@ impl Walrus {
                     } else {
                         info.cur_block_offset = 0;
                     }
+                }
+                    info.hydrated_from_index = true;
+                } else {
+                    // No persisted state present; mark hydrated to avoid re-checking every call
+                    info.hydrated_from_index = true;
                 }
             }
         }
@@ -821,10 +849,16 @@ impl Walrus {
                 }
             }
 
-            let (tail_block_id, tail_off) = match persisted_tail {
-                Some(v) => v,
-                None => return Ok(None),
-            };
+            // Choose the best known tail offset: prefer in-memory progress for current active block
+            let (tail_block_id, mut tail_off) = match persisted_tail { Some(v) => v, None => return Ok(None) };
+            if tail_block_id == active_block.id {
+                // Use the max of persisted offset and in-memory offset for this process
+                if info.tail_block_id == active_block.id {
+                    tail_off = tail_off.max(info.tail_offset);
+                }
+            } else {
+                // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
+            }
             // If writer rotated after we set persisted_tail, loop to fold/rebase
             if tail_block_id != active_block.id { continue; }
 
@@ -832,6 +866,9 @@ impl Walrus {
                 match active_block.read(tail_off) {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
+                        // Update in-memory tail progress immediately for AtLeastOnce
+                        info.tail_block_id = active_block.id;
+                        info.tail_offset = new_off;
                         persisted_tail = Some((tail_block_id, new_off));
                         if self.should_persist(&mut info, false) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
