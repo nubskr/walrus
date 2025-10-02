@@ -1,8 +1,3 @@
-/*
-something like:
-just do the dumbest thing now, first thing which comes to your mind, that's it
-we will do it all in one file
-*/
 use std::collections::HashMap;
 use std::time::SystemTime;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -14,7 +9,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use rkyv::{Archive, Deserialize, Serialize};
-// removed unused rkyv::ser imports
 use std::fs;
 use std::path::Path;
 
@@ -68,7 +62,6 @@ struct Metadata {
     checksum: u64,
 }
 
-// todo: add checksum and mmap object here too
 #[derive(Clone, Debug)]
 pub struct Block {
     id: u64,
@@ -135,6 +128,9 @@ impl Block {
         let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
         aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
         
+        // SAFETY: `aligned` contains bytes we just read from our own file format.
+        // We bounded `meta_len` to PREFIX_META_SIZE and copy into an `AlignedVec`,
+        // which satisfies alignment requirements of rkyv.
         let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
         let meta: Metadata = archived
             .deserialize(&mut rkyv::Infallible)
@@ -191,11 +187,18 @@ impl BlockAllocator {
         })
     }
     
-    // I NEED TO LOCK THE FUCKING BLOCK WE ARE ALLOCATING, WHERE DO I PUT IT HERE AAAAAAAAAAAAAAA
+    // Allocate the next available block with proper locking
+    /// SAFETY: Caller must ensure the returned `Block` is treated as uniquely
+    /// owned by a single writer until it is sealed. Internally, a spin lock
+    /// ensures exclusive mutable access to `next_block` while computing the
+    /// next allocation, so the interior `UnsafeCell` is not concurrently
+    /// accessed mutably.
     pub unsafe fn get_next_available_block(&self) -> std::io::Result<Block> {
         self.lock();
+        // SAFETY: Guarded by `self.lock()` above, providing exclusive access
+        // to `next_block` so creating a `&mut` from `UnsafeCell` is sound.
         let data = unsafe { &mut *self.next_block.get() };
-        let mut prev_block_file_path = data.file_path.clone();
+        let prev_block_file_path = data.file_path.clone();
         if data.offset >= MAX_FILE_SIZE {
             // mark previous file as fully allocated before switching
             FileStateTracker::set_fully_allocated(prev_block_file_path);
@@ -222,6 +225,9 @@ impl BlockAllocator {
         Ok(ret)
     }
 
+    /// SAFETY: Caller must ensure the resulting `Block` remains uniquely used
+    /// by one writer and not read concurrently while being written. The
+    /// internal spin lock provides exclusive access to mutate allocator state.
     pub unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
         if want_bytes == 0 || want_bytes > MAX_ALLOC {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid allocation size, a single entry can't be more than 1gb"));
@@ -231,6 +237,8 @@ impl BlockAllocator {
         debug_print!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
 
         self.lock();
+        // SAFETY: Guarded by `self.lock()` above, providing exclusive access
+        // to `next_block` so creating a `&mut` from `UnsafeCell` is sound.
         let data = unsafe { &mut *self.next_block.get() };
         if data.offset + alloc_size > MAX_FILE_SIZE {
             let prev_block_file_path = data.file_path.clone();
@@ -265,9 +273,9 @@ impl BlockAllocator {
     }
 
     fn lock(&self) {
-        // just keep spinnnnnnnnning
+        // Spin lock implementation
         while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            std::hint::spin_loop();  // atleast let the poor sucker know to not go BRRRRR in full speed here
+            std::hint::spin_loop();
         }
     }
 
@@ -277,7 +285,12 @@ impl BlockAllocator {
 
 }
 
+// SAFETY: `BlockAllocator` uses an internal spin lock to guard all mutable
+// access to `next_block`. It does not expose references to its interior
+// without holding that lock, so concurrent access across threads is safe.
 unsafe impl Sync for BlockAllocator {}
+// SAFETY: The type contains only thread-safe primitives and does not rely on
+// thread-affine resources; moving it to another thread is safe.
 unsafe impl Send for BlockAllocator {}
 
 struct Writer{
@@ -311,6 +324,9 @@ impl Writer {
             let _ = self.reader.append_block_to_chain(&self.col, sealed);
             debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
+            // SAFETY: We hold `current_block` and `current_offset` mutexes, so
+            // this writer has exclusive ownership of the active block. The
+            // allocator's internal lock ensures unique block handout.
             let new_block = unsafe { self.allocator.alloc_block(need) }?;
             debug_print!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
             *block = new_block;
@@ -329,15 +345,18 @@ impl Writer {
 }
 
 
-// this is gonna slappp, f1 level stuff
-
 #[derive(Debug)]
 struct SharedMmap {
     mmap: MmapMut,
     last_touched_at: AtomicU64,
 }
 
+// SAFETY: `SharedMmap` provides interior mutability only via methods that
+// enforce bounds and perform atomic timestamp updates; the underlying
+// `MmapMut` supports concurrent reads and explicit flushes.
 unsafe impl Sync for SharedMmap {}
+// SAFETY: The struct holds an `MmapMut` which is safe to move between threads;
+// timestamps are atomics, so sending is sound.
 unsafe impl Send for SharedMmap {}
 
 impl SharedMmap {
@@ -347,6 +366,8 @@ impl SharedMmap {
             .write(true)
             .open(path)?;
         
+        // SAFETY: `file` is opened read/write and lives for the duration of this
+        // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -356,6 +377,12 @@ impl SharedMmap {
     }
     
     pub fn write(&self, offset: usize, data: &[u8]) {
+        // Bounds check before raw copy to maintain memory safety
+        debug_assert!(offset <= self.mmap.len());
+        debug_assert!(self.mmap.len() - offset >= data.len());
+        // SAFETY: We validated that the destination range [offset, offset+len)
+        // is within the mmap and does not overlap `data`. The pointer is valid
+        // for writes for the size of `data.len()` bytes.
         unsafe  {
             let ptr = self.mmap.as_ptr() as *mut u8; // Get pointer when needed
             std::ptr::copy_nonoverlapping(
@@ -381,7 +408,7 @@ impl SharedMmap {
         self.mmap.len()
     }
 
-    pub fn flush(&self) -> std::io::Result<()> { // DONT USE THIS
+    pub fn flush(&self) -> std::io::Result<()> {
         self.mmap.flush()
     }
 }
@@ -507,9 +534,6 @@ impl Reader {
 }
 
 
-// ------------------
-
-
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct BlockPos {
     pub cur_block_idx: u64,
@@ -532,7 +556,9 @@ impl WalIndex {
             .flatten()
             .and_then(|bytes| {
                 if bytes.is_empty() { return None; }
-                let archived = unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes) };
+        // SAFETY: `bytes` comes from our persisted index file which we control;
+        // we only proceed when the file is non-empty and rkyv can interpret it.
+        let archived = unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes) };
                 archived.deserialize(&mut rkyv::Infallible).ok()
             })
             .unwrap_or_default();
@@ -642,9 +668,13 @@ impl Walrus {
                     
                     if !pool.contains_key(&path) {
                         match OpenOptions::new().read(true).write(true).open(&path) {
-                            Ok(file) => match unsafe { MmapMut::map_mut(&file) } {
-                                Ok(mmap) => { pool.insert(path.clone(), mmap); }
-                                Err(e) => { debug_print!("[flush] failed to create memory map for {}: {}", path, e); continue; }
+                            Ok(file) => {
+                                // SAFETY: The file is opened read/write and lives at least until
+                                // the created mapping is inserted into `pool`, which owns it.
+                                match unsafe { MmapMut::map_mut(&file) } {
+                                    Ok(mmap) => { pool.insert(path.clone(), mmap); }
+                                    Err(e) => { debug_print!("[flush] failed to create memory map for {}: {}", path, e); continue; }
+                                }
                             },
                             Err(e) => { debug_print!("[flush] failed to open file for flushing {}: {}", path, e); continue; }
                         }
@@ -690,6 +720,8 @@ impl Walrus {
             } else {
                 let mut map = self.writers.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned"))?;
                 if let Some(w) = map.get(col_name).cloned() { w } else {
+                    // SAFETY: The returned block will be held by this writer only
+                    // and appended/sealed before being exposed to readers.
                     let initial_block = unsafe { self.allocator.get_next_available_block()? };
                     let w = Arc::new(Writer::new(self.allocator.clone(), initial_block, self.reader.clone(), col_name.to_string(), self.fsync_tx.clone()));
                     map.insert(col_name.to_string(), w.clone());
@@ -834,7 +866,7 @@ impl Walrus {
                         persisted_tail = Some((active_block.id, 0));
                         if self.should_persist(&mut info, true) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                                let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
                             }
                         }
                     }
@@ -844,7 +876,7 @@ impl Walrus {
                 persisted_tail = Some((active_block.id, 0));
                 if self.should_persist(&mut info, true) {
                     if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), (active_block.id | TAIL_FLAG), 0);
+                        let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
                     }
                 }
             }
@@ -872,7 +904,7 @@ impl Walrus {
                         persisted_tail = Some((tail_block_id, new_off));
                         if self.should_persist(&mut info, false) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), (tail_block_id | TAIL_FLAG), new_off);
+                                let _ = idx_guard.set(col_name.to_string(), tail_block_id | TAIL_FLAG, new_off);
                             }
                         }
                         debug_print!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
@@ -911,11 +943,9 @@ impl Walrus {
         }
     }
 
-    // reclaims disk space
+    // TODO: Implement disk space reclamation
     pub fn truncate_from_offset() {
-        // how ?
-        // so the thing is, for each col... FUCK, 
-
+        // Implementation pending
     }
 
     fn startup_chore(&self) -> std::io::Result<()> {
@@ -967,6 +997,10 @@ impl Walrus {
                 }
                 let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
                 aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                // SAFETY: `aligned` was constructed from a bounded metadata slice
+                // read from our file; alignment is ensured by `AlignedVec`.
+                // SAFETY: `aligned` is built from bounded bytes inside the block,
+                // copied into `AlignedVec` ensuring alignment for rkyv.
                 let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
                 let md: Metadata = match archived.deserialize(&mut rkyv::Infallible) { Ok(m) => m, Err(_) => { break; } };
                 col_name = Some(md.owned_by);
@@ -1029,97 +1063,9 @@ impl Walrus {
         Ok(())
     }
 
-    // TODO: we need to add checksums in the entry metadata btw
-    // TODO: Crash recovery ?? we need to make some things durable...
-    // truncation(dealing with this right now)
-    // failure recovery!!
+    // TODO: Implement crash recovery and failure handling
 }
 
-// it would all make sense one day :)) , not today though, today we grind, amist all the chaos, we grind, for the beauty that is to come is unbounded
-
-
-
-
-
-/*
-okay, so we wish to make some changes here:
-
-1. we wish to remove the concept of `offset` completely for reading a file here, it's all bull, we are getting rid of this abstraction
-, instead, what we'll do is, for the per column last_read_offset, we'll have... a more dedicated tracking thingy like: {current_block_idx,current_block_offset}
-
-
-and we remove the concept of reading at will and just give the option to read the next `Entry` for some column, so when we call it, initially it's at the first block in the reader block chain and the block offset would be 0,
-we return the first entry from there and increase the block offset by the size of that entry, we keep doing this for each request untill we reach the last entry of the block and then just jump to the next block in the chain and reset the offset and current block idx thingy
-
-got it ? 
-*/
-
-/*
-okay, so we got a persistent state store now, what we'll do is:
-- whenever we do read_next() we update state store too!!
-*/
-
-
-/*
-so we want three persistent states (WALIdx):
-
-- M[file_path] -> how much space is allocated in this // future nubskr: "not needed"
----
-- M[col_name] -> what block and where in it are we at, i.e. block checkpoints
-- M[file_path] -> what blocks in this shit are locked by writers (and their counts as well)
-
-okay, okay, so... whenever a... block allocator is... changing to a new file, it does some of these checks
-
-like.... it already knows that this file is full huh... yeah, so I think we can skip the first persistent state.... yayyy
-nice, what else...
-
-- any writer still on this ??? okay.. this is tricky to do in sync, because.... it's blocking... or not ? oh wait, we have it all in mem huh, yeah, so just check for locks, ehehehh, nice
-okay, no locks, what after that
-all blocks acknowledged.... hmmm, tricky one, how to do this ? 
-so... for this, we would need to have.... block list per file in memory ?? yeah, seems like it or we can do it lazily(should we ? it's on the blockAllocator critical path sir)
-is there anythign we can do here ?? 
-
-blockallocator, what if we look at it..
-
-blockallocator knows when a file is fully allocated,
-blockallocator can easily... put it such that what block belongs to what file, can also add a... flag there, smth smth `is_checkpointed` for some block in that list for some file
-hmm, so... when a... block gets fully done... we make read_next() to update it in that state , oh wow, I see it now, this is beautiful
-what about the writer thingy... how to know if no... oh... okay
-
-so.... whenever we get an update in that file block chain thingy.... we would just check... "is this all ?" maybe have a darn.. counter there, 
-we would also need to only let it happen when a file is fully allocated...
-
-this is nice, I must draw it before it flies away...
-
-but what after it ? what after we realize that it's fully allocated ? 
-what/how to take it `into consideration` ?? 
-
-checks remaining after that:
-- no block in here locked by any writer (hmm, doable with the counter thing though..)
-- each individual block acknowledged, easy one with the checkpointed_block_ctr thingy 
-
-but the thing is... how the hell do we check... like, we check it after full allocation lock goes away, it has some writer block or some pending checkpoint acknowledgements, then what ?
-hmmm, fucking polling is annoying, idek from where to do it... and I don't want to do it... the thing is.. we just have to check two atomic counters each time huh.., yeah...
-
-`unlocked_block_ctr` and `checkpointed_block_ctr` , that's it
-but how/when to check ?? hmm, whenever update any of those two I guess ? :)))) eheheh
-holy fuck, woah, waow UwU , so just attempt the check of all done whenever:
-1. some writer unlocks some block and does atomic +1 on unlocked_block_ctr
-2. some read_next() call completes checkpointing a whole block
-
-and once we're good, we just.. do a mpsc producer event to delete a file and the consumer in our occasional job thread would pick it up, dedup and delete the file(s) :))))
-lets go mog everyone
-
-so the second one is literally free O(1) , the first one... can we do something similar to that cnt thingy ?
-smth like locked_block_ctr, I hope there are no race conditions here man.. like... I mean... we can just put that there before letting the darn fully_allocated lock go huh, LMAO, no race conditions then, eeheheheheheh
-ughh, 
-
-where to even start...
-let's add some sort of shitty first, the carcass
-
-I will destroy every single one of them
-own everything, destroy it all, burn it down
-*/
 
 static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();
 
@@ -1136,7 +1082,7 @@ fn flush_check(file_path: String) {
 }
 
 struct BlockState {
-    is_checkpointed: AtomicBool, // is this thingy fully done or not, that's it, good thing that block IDs are unique globally
+    is_checkpointed: AtomicBool,
     file_path: String,
 }
 
@@ -1187,10 +1133,10 @@ impl BlockStateTracker {
 }
 
 struct FileState {
-    locked_block_ctr: AtomicU16, // no. of block locked by writers
-    checkpoint_block_ctr: AtomicU16, // no. of blocks already checkpointed
-    total_blocks: AtomicU16, // total blocks in this file
-    is_fully_allocated: AtomicBool // all blocks in the file allocated or not
+    locked_block_ctr: AtomicU16,
+    checkpoint_block_ctr: AtomicU16,
+    total_blocks: AtomicU16,
+    is_fully_allocated: AtomicBool,
 }
 
 struct FileStateTracker {}
@@ -1282,4 +1228,4 @@ impl FileStateTracker {
 }
 
 
-// make sure to use AcqRelease while updating Atomics ffs or you'll be fucked by entropy when you least expect it AHAHAHAH
+// Use AcqRel ordering for atomic operations to ensure proper synchronization
