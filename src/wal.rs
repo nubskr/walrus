@@ -1187,7 +1187,6 @@ impl BlockStateTracker {
 }
 
 struct FileState {
-    // need to fucking keep track of what blocks this shit has too 
     locked_block_ctr: AtomicU16, // no. of block locked by writers
     checkpoint_block_ctr: AtomicU16, // no. of blocks already checkpointed
     total_blocks: AtomicU16, // total blocks in this file

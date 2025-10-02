@@ -43,7 +43,7 @@ show-writes:
 		echo "benchmark_throughput.csv not found. Run 'make bench-writes' first."; \
 		exit 1; \
 	fi
-	python3 visualize_throughput.py --file benchmark_throughput.csv
+	python3 scripts/visualize_throughput.py --file benchmark_throughput.csv
 
 show-reads:
 	@echo "Showing read benchmark results..."
@@ -51,7 +51,7 @@ show-reads:
 		echo "read_benchmark_throughput.csv not found. Run 'make bench-reads' first."; \
 		exit 1; \
 	fi
-	python3 show_reads_graph.py
+	python3 scripts/show_reads_graph.py
 
 show-scaling:
 	@echo "Showing scaling benchmark results..."
@@ -59,18 +59,18 @@ show-scaling:
 		echo "scaling_results.csv not found. Run 'make bench-scaling' first."; \
 		exit 1; \
 	fi
-	python3 show_scaling_graph_writes.py
+	python3 scripts/show_scaling_graph_writes.py
 
 # Live monitoring targets
 live-writes:
 	@echo "Starting live write benchmark monitoring..."
 	@echo "Run 'make bench-writes' in another terminal"
-	python3 visualize_throughput.py --file benchmark_throughput.csv
+	python3 scripts/visualize_throughput.py --file benchmark_throughput.csv
 
 live-scaling:
 	@echo "Starting live scaling benchmark monitoring..."
 	@echo "Run 'make bench-scaling' in another terminal"
-	python3 live_scaling_plot.py
+	python3 scripts/live_scaling_plot.py
 
 # Utility targets
 clean:

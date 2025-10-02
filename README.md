@@ -38,8 +38,18 @@ cargo test --test scaling_benchmark -- --nocapture
 ```
 
 ### Visualization Scripts
-- `visualize_throughput.py` - Write benchmark graphs
-- `show_reads_graph.py` - Read benchmark graphs  
-- `show_scaling_graph_writes.py` - Scaling results
-- `live_scaling_plot.py` - Live scaling monitoring
+All visualization scripts are located in the `scripts/` directory:
+- `scripts/visualize_throughput.py` - Write benchmark graphs
+- `scripts/show_reads_graph.py` - Read benchmark graphs  
+- `scripts/show_scaling_graph_writes.py` - Scaling results
+- `scripts/live_scaling_plot.py` - Live scaling monitoring
 
+
+-------
+
+
+- coordination free file deletion with atomics
+- sharedmmapkeeper stuff,only one mmap for parallel operations
+- configurability
+- SUPER DIRECT COMMENTS ABOUT PERSISTENCE OF READ OFFSETS AND HOW IT'S DECOUPLED FROM LOG OFFSET
+(WRITE THIS IN README, BLOG AND CODE COMMENTS!!!!!!)
