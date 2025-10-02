@@ -50,7 +50,7 @@ fn checksum64(data: &[u8]) -> u64 {
 #[derive(Clone, Debug)]
 
 pub struct Entry {
-    pub data: Vec<u8> // raw bytes
+    pub data: Vec<u8>
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -382,7 +382,9 @@ impl SharedMmap {
         debug_assert!(self.mmap.len() - offset >= data.len());
         // SAFETY: We validated that the destination range [offset, offset+len)
         // is within the mmap and does not overlap `data`. The pointer is valid
-        // for writes for the size of `data.len()` bytes.
+        // for writes for the size of `data.len()` bytes and due to non overlapping 
+        // block segments served by BlockAllocator, we guarantee that no two writers 
+        // would step over each other's toes 
         unsafe  {
             let ptr = self.mmap.as_ptr() as *mut u8; // Get pointer when needed
             std::ptr::copy_nonoverlapping(
@@ -474,7 +476,7 @@ struct ColReaderInfo {
 }
 
 struct Reader {
-    data: RwLock<HashMap<String,Arc<RwLock<ColReaderInfo>>>> // M[col] -> {chain,last_read_offset}
+    data: RwLock<HashMap<String,Arc<RwLock<ColReaderInfo>>>>
 }
 
 impl Reader {
@@ -600,8 +602,6 @@ impl WalIndex {
         Ok(())
     }
 }
-
-// -------------------
 
 // public APIs
 #[derive(Clone, Copy, Debug)]
@@ -837,7 +837,8 @@ impl Walrus {
                 }
             }
 
-            // Tail path
+            // Tail path ---
+
             let writer_arc = {
                 let map = self.writers.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned"))?;
                 match map.get(col_name) { Some(w) => w.clone(), None => return Ok(None) }
@@ -872,7 +873,7 @@ impl Walrus {
                     }
                 }
             } else {
-                // No persisted tail; initialize at current active block start
+                // No persisted tail; init at current active block start
                 persisted_tail = Some((active_block.id, 0));
                 if self.should_persist(&mut info, true) {
                     if let Ok(mut idx_guard) = self.read_offset_index.write() {
@@ -891,7 +892,7 @@ impl Walrus {
             } else {
                 // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
             }
-            // If writer rotated after we set persisted_tail, loop to fold/rebase
+            // If writer rotated after we set persisted_tail, loop to fold/rebaes
             if tail_block_id != active_block.id { continue; }
 
             if tail_off < written {
@@ -943,11 +944,6 @@ impl Walrus {
         }
     }
 
-    // TODO: Implement disk space reclamation
-    pub fn truncate_from_offset() {
-        // Implementation pending
-    }
-
     fn startup_chore(&self) -> std::io::Result<()> {
         // Minimal recovery: scan wal_files, build reader chains, and rebuild trackers
         let dir = match fs::read_dir("./wal_files") { Ok(d) => d, Err(_) => return Ok(()) };
@@ -963,7 +959,7 @@ impl Walrus {
         files.sort();
         if !files.is_empty() { debug_print!("[recovery] scanning files: {}", files.len()); }
 
-        // assign synthetic block ids
+        // synthetic block ids btw
         let mut next_block_id: usize = 1;
         let mut seen_files = std::collections::HashSet::new();
 
@@ -1049,9 +1045,7 @@ impl Walrus {
                         } else {
                             info.cur_block_offset = 0;
                         }
-                        // checkpoint all blocks strictly before ib
                         for i in 0..ib { BlockStateTracker::set_checkpointed_true(info.chain[i].id as usize); }
-                        // and checkpoint current if at end
                         if ib < info.chain.len() && info.cur_block_offset >= info.chain[ib].used { BlockStateTracker::set_checkpointed_true(info.chain[ib].id as usize); }
                     }
                 }
@@ -1062,15 +1056,13 @@ impl Walrus {
         for f in seen_files.into_iter() { flush_check(f); }
         Ok(())
     }
-
-    // TODO: Implement crash recovery and failure handling
 }
 
 
 static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();
 
 fn flush_check(file_path: String) {
-    // Quick readiness check; hook actual reclamation later
+    // readiness check fast path; hook actual reclamation later
     if let Some((locked, checkpointed, total, fully_allocated)) = FileStateTracker::get_state_snapshot(&file_path) {
         let ready_to_delete = fully_allocated && locked == 0 && total > 0 && checkpointed >= total;
         if ready_to_delete {
@@ -1226,6 +1218,3 @@ impl FileStateTracker {
         Some((locked, checkpointed, total, fully))
     }
 }
-
-
-// Use AcqRel ordering for atomic operations to ensure proper synchronization
