@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./figures/walrus.png"
+  <img src="./figures/walrus1.png"
        alt="walrus"
        width="50%">
 </div>
