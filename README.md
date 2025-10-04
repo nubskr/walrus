@@ -3,11 +3,13 @@
        alt="walrus"
        width="35%">
     <div>Walrus: A high performance Write Ahead Log (WAL) in Rust</div>
-</div>
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
 [![License](https://img.shields.io/crates/l/walrus-rust.svg)](LICENSE)
+
+
+</div>
 
 ## Features
 
