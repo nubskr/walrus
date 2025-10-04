@@ -1,4 +1,4 @@
-.PHONY: help bench-writes bench-reads bench-scaling bench-all show-writes show-reads show-scaling live-writes live-scaling clean
+.PHONY: help bench-writes bench-reads bench-scaling show-writes show-reads show-scaling live-writes live-scaling clean
 
 help:
 	@echo "Walrus Benchmarks"
@@ -8,7 +8,6 @@ help:
 	@echo "  bench-writes    Run write-only benchmark (2 min)"
 	@echo "  bench-reads     Run read benchmark (1 min write + 2 min read)"
 	@echo "  bench-scaling   Run scaling benchmark across thread counts"
-	@echo "  bench-all       Run all benchmarks sequentially"
 	@echo ""
 	@echo "Visualization:"
 	@echo "  show-writes     Show write benchmark results"
@@ -32,9 +31,6 @@ bench-reads:
 bench-scaling:
 	@echo "Running scaling benchmark..."
 	cargo test --test scaling_benchmark -- --nocapture
-
-bench-all: bench-writes bench-reads bench-scaling
-	@echo "All benchmarks completed!"
 
 # Visualization targets
 show-writes:

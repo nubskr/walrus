@@ -201,7 +201,6 @@ Walrus includes a comprehensive benchmarking suite to measure performance across
 make bench-writes      # Write benchmark
 make bench-reads       # Read benchmark  
 make bench-scaling     # Scaling benchmark
-make bench-all         # All benchmarks
 
 # Show results
 make show-writes       # Visualize write results
