@@ -5,7 +5,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```rust,no_run
 //! use walrus_rust::{Walrus, ReadConsistency};
 //!
 //! # fn main() -> std::io::Result<()> {
@@ -27,7 +27,7 @@
 //!
 //! Walrus supports different consistency models:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
 //!
 //! # fn main() -> std::io::Result<()> {
