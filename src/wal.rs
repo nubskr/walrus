@@ -1,16 +1,16 @@
-use std::collections::HashMap;
-use std::time::SystemTime;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::cell::UnsafeCell;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use memmap2::MmapMut;
+use rkyv::{Archive, Deserialize, Serialize};
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::fs;
 use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
-use rkyv::{Archive, Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::time::SystemTime;
 
 // Macro to conditionally print debug messages
 macro_rules! debug_print {
@@ -21,11 +21,11 @@ macro_rules! debug_print {
     };
 }
 
-const DEFAULT_BLOCK_SIZE:u64 = 10 * 1024 * 1024; // 10mb
-const BLOCKS_PER_FILE:u64 = 100;
-const MAX_ALLOC:u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
-const PREFIX_META_SIZE: usize = 64; 
-const MAX_FILE_SIZE:u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
+const DEFAULT_BLOCK_SIZE: u64 = 10 * 1024 * 1024; // 10mb
+const BLOCKS_PER_FILE: u64 = 100;
+const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
+const PREFIX_META_SIZE: usize = 64;
+const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
 
 fn now_millis_str() -> String {
     let ms = SystemTime::now()
@@ -50,7 +50,7 @@ fn checksum64(data: &[u8]) -> u64 {
 #[derive(Clone, Debug)]
 
 pub struct Entry {
-    pub data: Vec<u8>
+    pub data: Vec<u8>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -73,37 +73,49 @@ pub struct Block {
 }
 
 impl Block {
-    fn write(&self, in_block_offset: u64, data: &[u8], owned_by: &str, next_block_start: u64) -> std::io::Result<()> {
-        debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
-        
-        let new_meta = Metadata { 
+    fn write(
+        &self,
+        in_block_offset: u64,
+        data: &[u8],
+        owned_by: &str,
+        next_block_start: u64,
+    ) -> std::io::Result<()> {
+        debug_assert!(
+            in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit
+        );
+
+        let new_meta = Metadata {
             read_size: data.len(),
             owned_by: owned_by.to_string(),
             next_block_start,
             checksum: checksum64(data),
         };
-        
-        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta)
-            .map_err(|e| std::io::Error::new(
+
+        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
+            std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("serialize metadata failed: {:?}", e),
-            ))?;
+            )
+        })?;
         if meta_bytes.len() > PREFIX_META_SIZE - 2 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata too large"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata too large",
+            ));
         }
-        
+
         let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
         // Store actual length in first 2 bytes (little endian)
         meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
         meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
         // Copy actual metadata starting at byte 2
         meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-        
+
         // Combine and write
         let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
         combined.extend_from_slice(&meta_buffer);
         combined.extend_from_slice(data);
-        
+
         let file_offset = self.offset + in_block_offset;
         self.mmap.write(file_offset as usize, &combined);
         Ok(())
@@ -113,53 +125,57 @@ impl Block {
         let mut meta_buffer = vec![0; PREFIX_META_SIZE];
         let file_offset = self.offset + in_block_offset;
         self.mmap.read(file_offset as usize, &mut meta_buffer);
-        
+
         // Read the actual metadata length from first 2 bytes
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
-        
+
         if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData, 
-                format!("invalid metadata length: {}", meta_len)
+                std::io::ErrorKind::InvalidData,
+                format!("invalid metadata length: {}", meta_len),
             ));
         }
-        
+
         // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
         let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
         aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
-        
+
         // SAFETY: `aligned` contains bytes we just read from our own file format.
         // We bounded `meta_len` to PREFIX_META_SIZE and copy into an `AlignedVec`,
         // which satisfies alignment requirements of rkyv.
         let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-        let meta: Metadata = archived
-            .deserialize(&mut rkyv::Infallible)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to deserialize metadata"))?;
+        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "failed to deserialize metadata",
+            )
+        })?;
         let actual_entry_size = meta.read_size;
-        
+
         // Read the actual data
         let new_offset = file_offset + PREFIX_META_SIZE as u64;
         let mut ret_buffer = vec![0; actual_entry_size];
         self.mmap.read(new_offset as usize, &mut ret_buffer);
-        
+
         // Verify checksum
         let expected = meta.checksum;
         if checksum64(&ret_buffer) != expected {
             debug_print!(
                 "[reader] checksum mismatch; skipping corrupted entry at offset={} in file={}, block_id={}",
-                in_block_offset, self.file_path, self.id
+                in_block_offset,
+                self.file_path,
+                self.id
             );
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData, 
-                "checksum mismatch, data corruption detected"
+                std::io::ErrorKind::InvalidData,
+                "checksum mismatch, data corruption detected",
             ));
         }
-        
+
         let consumed = PREFIX_META_SIZE + actual_entry_size;
         Ok((Entry { data: ret_buffer }, consumed))
     }
 }
-
 
 fn make_new_file() -> std::io::Result<String> {
     let file_name = now_millis_str();
@@ -172,7 +188,7 @@ fn make_new_file() -> std::io::Result<String> {
 // has block metas to give out
 struct BlockAllocator {
     next_block: UnsafeCell<Block>,
-    lock: AtomicBool
+    lock: AtomicBool,
 }
 
 impl BlockAllocator {
@@ -180,13 +196,25 @@ impl BlockAllocator {
         std::fs::create_dir_all("wal_files").ok();
         let file1 = make_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
-        debug_print!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
+        debug_print!(
+            "[alloc] init: created file={}, max_file_size={}B, block_size={}B",
+            file1,
+            MAX_FILE_SIZE,
+            DEFAULT_BLOCK_SIZE
+        );
         Ok(BlockAllocator {
-            next_block: UnsafeCell::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }),
+            next_block: UnsafeCell::new(Block {
+                id: 1,
+                offset: 0,
+                limit: DEFAULT_BLOCK_SIZE,
+                file_path: file1,
+                mmap,
+                used: 0,
+            }),
             lock: AtomicBool::new(false),
         })
     }
-    
+
     // Allocate the next available block with proper locking
     /// SAFETY: Caller must ensure the returned `Block` is treated as uniquely
     /// owned by a single writer until it is sealed. Internally, a spin lock
@@ -220,7 +248,10 @@ impl BlockAllocator {
         self.unlock();
         debug_print!(
             "[alloc] handout: block_id={}, file={}, offset={}, limit={}",
-            ret.id, ret.file_path, ret.offset, ret.limit
+            ret.id,
+            ret.file_path,
+            ret.offset,
+            ret.limit
         );
         Ok(ret)
     }
@@ -230,11 +261,19 @@ impl BlockAllocator {
     /// internal spin lock provides exclusive access to mutate allocator state.
     pub unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
         if want_bytes == 0 || want_bytes > MAX_ALLOC {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid allocation size, a single entry can't be more than 1gb"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid allocation size, a single entry can't be more than 1gb",
+            ));
         }
         let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
-        debug_print!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
+        debug_print!(
+            "[alloc] alloc_block: want_bytes={}, units={}, size={}",
+            want_bytes,
+            alloc_units,
+            alloc_size
+        );
 
         self.lock();
         // SAFETY: Guarded by `self.lock()` above, providing exclusive access
@@ -247,7 +286,10 @@ impl BlockAllocator {
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
-            debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
+            debug_print!(
+                "[alloc] file rollover for sized alloc -> {}",
+                data.file_path
+            );
         }
         let ret = Block {
             id: data.id,
@@ -267,14 +309,21 @@ impl BlockAllocator {
         self.unlock();
         debug_print!(
             "[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}",
-            ret.id, ret.file_path, ret.offset, ret.limit
+            ret.id,
+            ret.file_path,
+            ret.offset,
+            ret.limit
         );
         Ok(ret)
     }
 
     fn lock(&self) {
         // Spin lock implementation
-        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             std::hint::spin_loop();
         }
     }
@@ -282,7 +331,6 @@ impl BlockAllocator {
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
     }
-
 }
 
 // SAFETY: `BlockAllocator` uses an internal spin lock to guard all mutable
@@ -293,7 +341,7 @@ unsafe impl Sync for BlockAllocator {}
 // thread-affine resources; moving it to another thread is safe.
 unsafe impl Send for BlockAllocator {}
 
-struct Writer{
+struct Writer {
     allocator: Arc<BlockAllocator>,
     current_block: Mutex<Block>,
     reader: Arc<Reader>,
@@ -303,19 +351,40 @@ struct Writer{
 }
 
 impl Writer {
-    pub fn new(allocator: Arc<BlockAllocator>, current_block: Block, reader: Arc<Reader>, col: String, publisher: Arc<mpsc::Sender<String>>) -> Self {
-        Writer { allocator, current_block: Mutex::new(current_block), reader, col: col.clone(), publisher, current_offset: Mutex::new(0) }
+    pub fn new(
+        allocator: Arc<BlockAllocator>,
+        current_block: Block,
+        reader: Arc<Reader>,
+        col: String,
+        publisher: Arc<mpsc::Sender<String>>,
+    ) -> Self {
+        Writer {
+            allocator,
+            current_block: Mutex::new(current_block),
+            reader,
+            col: col.clone(),
+            publisher,
+            current_offset: Mutex::new(0),
+        }
     }
 
     pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
-        let mut block = self.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
-        let mut cur = self.current_offset.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned"))?;
+        let mut block = self.current_block.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+        })?;
+        let mut cur = self.current_offset.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+        })?;
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
             debug_print!(
                 "[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}",
-                self.col, block.id, *cur, need, block.limit
+                self.col,
+                block.id,
+                *cur,
+                need,
+                block.limit
             );
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
@@ -328,7 +397,11 @@ impl Writer {
             // this writer has exclusive ownership of the active block. The
             // allocator's internal lock ensures unique block handout.
             let new_block = unsafe { self.allocator.alloc_block(need) }?;
-            debug_print!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
+            debug_print!(
+                "[writer] switched to new block: col={}, new_block_id={}",
+                self.col,
+                new_block.id
+            );
             *block = new_block;
             *cur = 0;
         }
@@ -336,14 +409,17 @@ impl Writer {
         block.write(*cur, data, &self.col, next_block_start)?;
         debug_print!(
             "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
-            self.col, block.id, *cur, need, *cur + need
+            self.col,
+            block.id,
+            *cur,
+            need,
+            *cur + need
         );
         *cur += need;
         let _ = self.publisher.send(block.file_path.clone());
         Ok(())
     }
 }
-
 
 #[derive(Debug)]
 struct SharedMmap {
@@ -361,11 +437,8 @@ unsafe impl Send for SharedMmap {}
 
 impl SharedMmap {
     pub fn new(path: &str) -> std::io::Result<Arc<Self>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
-        
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+
         // SAFETY: `file` is opened read/write and lives for the duration of this
         // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -373,25 +446,24 @@ impl SharedMmap {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             .as_millis() as u64;
-        Ok(Arc::new(Self { mmap, last_touched_at: AtomicU64::new(now_ms) }))
+        Ok(Arc::new(Self {
+            mmap,
+            last_touched_at: AtomicU64::new(now_ms),
+        }))
     }
-    
+
     pub fn write(&self, offset: usize, data: &[u8]) {
         // Bounds check before raw copy to maintain memory safety
         debug_assert!(offset <= self.mmap.len());
         debug_assert!(self.mmap.len() - offset >= data.len());
         // SAFETY: We validated that the destination range [offset, offset+len)
         // is within the mmap and does not overlap `data`. The pointer is valid
-        // for writes for the size of `data.len()` bytes and due to non overlapping 
-        // block segments served by BlockAllocator, we guarantee that no two writers 
-        // would step over each other's toes 
-        unsafe  {
+        // for writes for the size of `data.len()` bytes and due to non overlapping
+        // block segments served by BlockAllocator, we guarantee that no two writers
+        // would step over each other's toes
+        unsafe {
             let ptr = self.mmap.as_ptr() as *mut u8; // Get pointer when needed
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                ptr.add(offset),
-                data.len()
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
         }
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -399,13 +471,13 @@ impl SharedMmap {
             .as_millis() as u64;
         self.last_touched_at.store(now_ms, Ordering::Relaxed);
     }
-    
+
     pub fn read(&self, offset: usize, dest: &mut [u8]) {
         debug_assert!(offset + dest.len() <= self.mmap.len());
         let src = &self.mmap[offset..offset + dest.len()];
         dest.copy_from_slice(src);
     }
-    
+
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
@@ -416,13 +488,13 @@ impl SharedMmap {
 }
 
 struct SharedMmapKeeper {
-    data: HashMap<String,Arc<SharedMmap>>
+    data: HashMap<String, Arc<SharedMmap>>,
 }
 
 impl SharedMmapKeeper {
     fn new() -> Self {
         Self {
-            data: HashMap::new()
+            data: HashMap::new(),
         }
     }
 
@@ -445,13 +517,17 @@ impl SharedMmapKeeper {
 
         // Double-check with a fresh read lock to avoid unnecessary write lock
         {
-            let keeper = keeper_lock.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned"))?;
+            let keeper = keeper_lock.read().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned")
+            })?;
             if let Some(existing) = keeper.data.get(path) {
                 return Ok(existing.clone());
             }
         }
 
-        let mut keeper = keeper_lock.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned"))?;
+        let mut keeper = keeper_lock.write().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned")
+        })?;
         if let Some(existing) = keeper.data.get(path) {
             return Ok(existing.clone());
         }
@@ -460,7 +536,7 @@ impl SharedMmapKeeper {
         Ok(mmap_arc)
     }
 }
-    
+
 #[derive(Debug)]
 struct ColReaderInfo {
     chain: Vec<Block>,
@@ -476,15 +552,17 @@ struct ColReaderInfo {
 }
 
 struct Reader {
-    data: RwLock<HashMap<String,Arc<RwLock<ColReaderInfo>>>>
+    data: RwLock<HashMap<String, Arc<RwLock<ColReaderInfo>>>>,
 }
 
 impl Reader {
     fn new() -> Self {
-        Self { data: RwLock::new(HashMap::new()) }
+        Self {
+            data: RwLock::new(HashMap::new()),
+        }
     }
 
-    fn get_chain_for_col(&self, col: &str) -> Option<Vec<Block>>{
+    fn get_chain_for_col(&self, col: &str) -> Option<Vec<Block>> {
         let arc_info = {
             let map = self.data.read().ok()?;
             map.get(col)?.clone()
@@ -493,48 +571,63 @@ impl Reader {
         Some(info.chain.clone())
     }
 
-    // internal 
+    // internal
     fn append_block_to_chain(&self, col: &str, block: Block) -> std::io::Result<()> {
         // fast path: try read-lock map and use per-column lock
         if let Some(info_arc) = {
-            let map = self.data.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map read lock poisoned"))?;
+            let map = self.data.read().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map read lock poisoned")
+            })?;
             map.get(col).cloned()
         } {
-            let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
+            let mut info = info_arc.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
             let before = info.chain.len();
             info.chain.push(block.clone());
             debug_print!(
                 "[reader] chain append(fast): col={}, block_id={}, chain_len {}->{}",
-                col, block.id, before, before + 1
+                col,
+                block.id,
+                before,
+                before + 1
             );
             return Ok(());
         }
 
         // slow path
         let info_arc = {
-            let mut map = self.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
+            let mut map = self.data.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned")
+            })?;
             map.entry(col.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo {
-                    chain: Vec::new(),
-                    cur_block_idx: 0,
-                    cur_block_offset: 0,
-                    reads_since_persist: 0,
-                    tail_block_id: 0,
-                    tail_offset: 0,
-                    hydrated_from_index: false,
-                })))
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(ColReaderInfo {
+                        chain: Vec::new(),
+                        cur_block_idx: 0,
+                        cur_block_offset: 0,
+                        reads_since_persist: 0,
+                        tail_block_id: 0,
+                        tail_offset: 0,
+                        hydrated_from_index: false,
+                    }))
+                })
                 .clone()
         };
-        let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
+        let mut info = info_arc.write().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+        })?;
         info.chain.push(block.clone());
         debug_print!(
             "[reader] chain append(slow/new): col={}, block_id={}, chain_len {}->{}",
-            col, block.id, 0, 1
+            col,
+            block.id,
+            0,
+            1
         );
         Ok(())
     }
 }
-
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct BlockPos {
@@ -542,7 +635,7 @@ pub struct BlockPos {
     pub cur_block_offset: u64,
 }
 
-    pub struct WalIndex {
+pub struct WalIndex {
     store: HashMap<String, BlockPos>,
     path: String,
 }
@@ -551,38 +644,44 @@ impl WalIndex {
     pub fn new(file_name: &str) -> std::io::Result<Self> {
         // let tmp_path = format!("{}", );
         fs::create_dir_all("./wal_files").ok();
-        let path = format!("./wal_files/{}_index.db",file_name) ;
+        let path = format!("./wal_files/{}_index.db", file_name);
 
-        let store = Path::new(&path).exists()
+        let store = Path::new(&path)
+            .exists()
             .then(|| fs::read(&path).ok())
             .flatten()
             .and_then(|bytes| {
-                if bytes.is_empty() { return None; }
-        // SAFETY: `bytes` comes from our persisted index file which we control;
-        // we only proceed when the file is non-empty and rkyv can interpret it.
-        let archived = unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes) };
+                if bytes.is_empty() {
+                    return None;
+                }
+                // SAFETY: `bytes` comes from our persisted index file which we control;
+                // we only proceed when the file is non-empty and rkyv can interpret it.
+                let archived = unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes) };
                 archived.deserialize(&mut rkyv::Infallible).ok()
             })
             .unwrap_or_default();
-        
-        Ok(Self { 
-            store, 
-            path: path.to_string() 
+
+        Ok(Self {
+            store,
+            path: path.to_string(),
         })
     }
-    
+
     pub fn set(&mut self, key: String, idx: u64, offset: u64) -> std::io::Result<()> {
-        self.store.insert(key, BlockPos { 
-            cur_block_idx: idx, 
-            cur_block_offset: offset 
-        });
+        self.store.insert(
+            key,
+            BlockPos {
+                cur_block_idx: idx,
+                cur_block_offset: offset,
+            },
+        );
         self.persist()
     }
-    
+
     pub fn get(&self, key: &str) -> Option<&BlockPos> {
         self.store.get(key)
     }
-    
+
     pub fn remove(&mut self, key: &str) -> std::io::Result<Option<BlockPos>> {
         let result = self.store.remove(key);
         if result.is_some() {
@@ -590,12 +689,16 @@ impl WalIndex {
         }
         Ok(result)
     }
-    
+
     fn persist(&self) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", self.path);
-        let bytes = rkyv::to_bytes::<_, 256>(&self.store)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("index serialize failed: {:?}", e)))?;
-        
+        let bytes = rkyv::to_bytes::<_, 256>(&self.store).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("index serialize failed: {:?}", e),
+            )
+        })?;
+
         fs::write(&tmp_path, &bytes)?;
         fs::File::open(&tmp_path)?.sync_all()?;
         fs::rename(&tmp_path, &self.path)?;
@@ -634,7 +737,10 @@ impl Walrus {
         Self::with_consistency_and_schedule(mode, FsyncSchedule::Milliseconds(1000))
     }
 
-    pub fn with_consistency_and_schedule(mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
+    pub fn with_consistency_and_schedule(
+        mode: ReadConsistency,
+        fsync_schedule: FsyncSchedule,
+    ) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
         let allocator = Arc::new(BlockAllocator::new()?);
         let reader = Arc::new(Reader::new());
@@ -645,7 +751,9 @@ impl Walrus {
         let _ = DELETION_TX.set(del_tx_arc.clone());
         let pool: HashMap<String, MmapMut> = HashMap::new();
         let tick = Arc::new(AtomicU64::new(0));
-        let sleep_millis = match fsync_schedule { FsyncSchedule::Milliseconds(ms) => ms.max(1) };
+        let sleep_millis = match fsync_schedule {
+            FsyncSchedule::Milliseconds(ms) => ms.max(1),
+        };
         // background flusher
         thread::spawn(move || {
             let mut pool = pool;
@@ -658,29 +766,49 @@ impl Walrus {
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
                 }
-                if !unique.is_empty() { debug_print!("[flush] scheduling {} paths", unique.len()); }
+                if !unique.is_empty() {
+                    debug_print!("[flush] scheduling {} paths", unique.len());
+                }
                 for path in unique.into_iter() {
                     // Skip if file doesn't exist
                     if !std::path::Path::new(&path).exists() {
                         debug_print!("[flush] file does not exist, skipping: {}", path);
                         continue;
                     }
-                    
+
                     if !pool.contains_key(&path) {
                         match OpenOptions::new().read(true).write(true).open(&path) {
                             Ok(file) => {
                                 // SAFETY: The file is opened read/write and lives at least until
                                 // the created mapping is inserted into `pool`, which owns it.
                                 match unsafe { MmapMut::map_mut(&file) } {
-                                    Ok(mmap) => { pool.insert(path.clone(), mmap); }
-                                    Err(e) => { debug_print!("[flush] failed to create memory map for {}: {}", path, e); continue; }
+                                    Ok(mmap) => {
+                                        pool.insert(path.clone(), mmap);
+                                    }
+                                    Err(e) => {
+                                        debug_print!(
+                                            "[flush] failed to create memory map for {}: {}",
+                                            path,
+                                            e
+                                        );
+                                        continue;
+                                    }
                                 }
-                            },
-                            Err(e) => { debug_print!("[flush] failed to open file for flushing {}: {}", path, e); continue; }
+                            }
+                            Err(e) => {
+                                debug_print!(
+                                    "[flush] failed to open file for flushing {}: {}",
+                                    path,
+                                    e
+                                );
+                                continue;
+                            }
                         }
                     }
                     if let Some(mmap) = pool.get_mut(&path) {
-                        if let Err(e) = mmap.flush() { debug_print!("[flush] flush error for {}: {}", path, e); }
+                        if let Err(e) = mmap.flush() {
+                            debug_print!("[flush] flush error for {}: {}", path, e);
+                        }
                     }
                 }
                 // collect deletion requests
@@ -689,15 +817,21 @@ impl Walrus {
                     delete_pending.insert(path);
                 }
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
-                if n >= 1000 { // WARN: we clean up once every 1000 times the fsync runs
-                    if tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                if n >= 1000 {
+                    // WARN: we clean up once every 1000 times the fsync runs
+                    if tick
+                        .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         let mut empty: HashMap<String, MmapMut> = HashMap::new();
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
                         // perform batched deletions now that mmaps are dropped
                         for path in delete_pending.drain() {
                             match fs::remove_file(&path) {
                                 Ok(_) => debug_print!("[reclaim] deleted file {}", path),
-                                Err(e) => debug_print!("[reclaim] delete failed for {}: {}", path, e),
+                                Err(e) => {
+                                    debug_print!("[reclaim] delete failed for {}: {}", path, e)
+                                }
                             }
                         }
                     }
@@ -705,7 +839,15 @@ impl Walrus {
             }
         });
         let idx = WalIndex::new("read_offset_idx")?;
-        let instance = Walrus { allocator, reader, writers: RwLock::new(HashMap::new()), fsync_tx: tx_arc, read_offset_index: Arc::new(RwLock::new(idx)), read_consistency: mode, fsync_schedule };
+        let instance = Walrus {
+            allocator,
+            reader,
+            writers: RwLock::new(HashMap::new()),
+            fsync_tx: tx_arc,
+            read_offset_index: Arc::new(RwLock::new(idx)),
+            read_consistency: mode,
+            fsync_schedule,
+        };
         instance.startup_chore()?;
         Ok(instance)
     }
@@ -713,17 +855,29 @@ impl Walrus {
     pub fn append_for_topic(&self, col_name: &str, raw_bytes: &[u8]) -> std::io::Result<()> {
         let writer = {
             if let Some(w) = {
-                let map = self.writers.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned"))?;
+                let map = self.writers.read().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+                })?;
                 map.get(col_name).cloned()
             } {
                 w
             } else {
-                let mut map = self.writers.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned"))?;
-                if let Some(w) = map.get(col_name).cloned() { w } else {
+                let mut map = self.writers.write().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
+                })?;
+                if let Some(w) = map.get(col_name).cloned() {
+                    w
+                } else {
                     // SAFETY: The returned block will be held by this writer only
                     // and appended/sealed before being exposed to readers.
                     let initial_block = unsafe { self.allocator.get_next_available_block()? };
-                    let w = Arc::new(Writer::new(self.allocator.clone(), initial_block, self.reader.clone(), col_name.to_string(), self.fsync_tx.clone()));
+                    let w = Arc::new(Writer::new(
+                        self.allocator.clone(),
+                        initial_block,
+                        self.reader.clone(),
+                        col_name.to_string(),
+                        self.fsync_tx.clone(),
+                    ));
                     map.insert(col_name.to_string(), w.clone());
                     w
                 }
@@ -735,50 +889,65 @@ impl Walrus {
     pub fn read_next(&self, col_name: &str) -> std::io::Result<Option<Entry>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
-            let map = self.reader.data.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map read lock poisoned"))?;
+            let map = self.reader.data.read().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map read lock poisoned")
+            })?;
             map.get(col_name).cloned()
-        } { arc } else {
-            let mut map = self.reader.data.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned"))?;
+        } {
+            arc
+        } else {
+            let mut map = self.reader.data.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned")
+            })?;
             map.entry(col_name.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(ColReaderInfo {
-                    chain: Vec::new(),
-                    cur_block_idx: 0,
-                    cur_block_offset: 0,
-                    reads_since_persist: 0,
-                    tail_block_id: 0,
-                    tail_offset: 0,
-                    hydrated_from_index: false,
-                })))
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(ColReaderInfo {
+                        chain: Vec::new(),
+                        cur_block_idx: 0,
+                        cur_block_offset: 0,
+                        reads_since_persist: 0,
+                        tail_block_id: 0,
+                        tail_offset: 0,
+                        hydrated_from_index: false,
+                    }))
+                })
                 .clone()
         };
-        let mut info = info_arc.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned"))?;
+        let mut info = info_arc.write().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+        })?;
         debug_print!(
             "[reader] read_next start: col={}, chain_len={}, idx={}, offset={}",
-            col_name, info.chain.len(), info.cur_block_idx, info.cur_block_offset
+            col_name,
+            info.chain.len(),
+            info.cur_block_idx,
+            info.cur_block_offset
         );
- 
+
         // Load persisted position (supports tail sentinel)
         let mut persisted_tail: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
         if !info.hydrated_from_index {
             if let Ok(idx_guard) = self.read_offset_index.read() {
                 if let Some(pos) = idx_guard.get(col_name) {
-                if (pos.cur_block_idx & TAIL_FLAG) != 0 {
-                    let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
-                    persisted_tail = Some((tail_block_id, pos.cur_block_offset));
-                    // sealed state is considered caught up
-                    info.cur_block_idx = info.chain.len();
-                    info.cur_block_offset = 0;
-                } else {
-                    let mut ib = pos.cur_block_idx as usize;
-                    if ib > info.chain.len() { ib = info.chain.len(); }
-                    info.cur_block_idx = ib;
-                    if ib < info.chain.len() {
-                        let used = info.chain[ib].used;
-                        info.cur_block_offset = pos.cur_block_offset.min(used);
-                    } else {
+                    if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+                        let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
+                        persisted_tail = Some((tail_block_id, pos.cur_block_offset));
+                        // sealed state is considered caught up
+                        info.cur_block_idx = info.chain.len();
                         info.cur_block_offset = 0;
+                    } else {
+                        let mut ib = pos.cur_block_idx as usize;
+                        if ib > info.chain.len() {
+                            ib = info.chain.len();
+                        }
+                        info.cur_block_idx = ib;
+                        if ib < info.chain.len() {
+                            let used = info.chain[ib].used;
+                            info.cur_block_offset = pos.cur_block_offset.min(used);
+                        } else {
+                            info.cur_block_offset = 0;
+                        }
                     }
-                }
                     info.hydrated_from_index = true;
                 } else {
                     // No persisted state present; mark hydrated to avoid re-checking every call
@@ -795,7 +964,11 @@ impl Walrus {
                 info.cur_block_offset = tail_off.min(info.chain[ib].used);
                 if self.should_persist(&mut info, true) {
                     if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                        let _ = idx_guard.set(
+                            col_name.to_string(),
+                            info.cur_block_idx as u64,
+                            info.cur_block_offset,
+                        );
                     }
                 }
                 persisted_tail = None;
@@ -810,7 +983,13 @@ impl Walrus {
                 let block = info.chain[idx].clone();
 
                 if off >= block.used {
-                    debug_print!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
+                    debug_print!(
+                        "[reader] read_next: advance block col={}, block_id={}, offset={}, used={}",
+                        col_name,
+                        block.id,
+                        off,
+                        block.used
+                    );
                     BlockStateTracker::set_checkpointed_true(block.id as usize);
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
@@ -822,14 +1001,29 @@ impl Walrus {
                         info.cur_block_offset = off + consumed as u64;
                         if self.should_persist(&mut info, false) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    info.cur_block_idx as u64,
+                                    info.cur_block_offset,
+                                );
                             }
                         }
-                        debug_print!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, info.cur_block_offset);
+                        debug_print!(
+                            "[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}",
+                            col_name,
+                            block.id,
+                            consumed,
+                            info.cur_block_offset
+                        );
                         return Ok(Some(entry));
                     }
                     Err(_) => {
-                        debug_print!("[reader] read_next: read error; skip block col={}, block_id={}, offset={}", col_name, block.id, off);
+                        debug_print!(
+                            "[reader] read_next: read error; skip block col={}, block_id={}, offset={}",
+                            col_name,
+                            block.id,
+                            off
+                        );
                         info.cur_block_idx += 1;
                         info.cur_block_offset = 0;
                         continue;
@@ -840,24 +1034,42 @@ impl Walrus {
             // Tail path ---
 
             let writer_arc = {
-                let map = self.writers.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned"))?;
-                match map.get(col_name) { Some(w) => w.clone(), None => return Ok(None) }
+                let map = self.writers.read().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+                })?;
+                match map.get(col_name) {
+                    Some(w) => w.clone(),
+                    None => return Ok(None),
+                }
             };
             let (active_block, written) = {
-                let blk = writer_arc.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
-                let off = writer_arc.current_offset.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned"))?;
+                let blk = writer_arc.current_block.lock().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+                })?;
+                let off = writer_arc.current_offset.lock().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+                })?;
                 (blk.clone(), *off)
             };
 
             // If persisted tail points to a different block and that block is now sealed in chain, fold it
             if let Some((tail_block_id, tail_off)) = persisted_tail {
                 if tail_block_id != active_block.id {
-                    if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
+                    if let Some((idx, _)) = info
+                        .chain
+                        .iter()
+                        .enumerate()
+                        .find(|(_, b)| b.id == tail_block_id)
+                    {
                         info.cur_block_idx = idx;
                         info.cur_block_offset = tail_off.min(info.chain[idx].used);
                         if self.should_persist(&mut info, true) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    info.cur_block_idx as u64,
+                                    info.cur_block_offset,
+                                );
                             }
                         }
                         persisted_tail = None; // sealed now
@@ -867,7 +1079,11 @@ impl Walrus {
                         persisted_tail = Some((active_block.id, 0));
                         if self.should_persist(&mut info, true) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    active_block.id | TAIL_FLAG,
+                                    0,
+                                );
                             }
                         }
                     }
@@ -883,7 +1099,10 @@ impl Walrus {
             }
 
             // Choose the best known tail offset: prefer in-memory progress for current active block
-            let (tail_block_id, mut tail_off) = match persisted_tail { Some(v) => v, None => return Ok(None) };
+            let (tail_block_id, mut tail_off) = match persisted_tail {
+                Some(v) => v,
+                None => return Ok(None),
+            };
             if tail_block_id == active_block.id {
                 // Use the max of persisted offset and in-memory offset for this process
                 if info.tail_block_id == active_block.id {
@@ -893,7 +1112,9 @@ impl Walrus {
                 // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
             }
             // If writer rotated after we set persisted_tail, loop to fold/rebaes
-            if tail_block_id != active_block.id { continue; }
+            if tail_block_id != active_block.id {
+                continue;
+            }
 
             if tail_off < written {
                 match active_block.read(tail_off) {
@@ -905,19 +1126,40 @@ impl Walrus {
                         persisted_tail = Some((tail_block_id, new_off));
                         if self.should_persist(&mut info, false) {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), tail_block_id | TAIL_FLAG, new_off);
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    tail_block_id | TAIL_FLAG,
+                                    new_off,
+                                );
                             }
                         }
-                        debug_print!("[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}", col_name, active_block.id, consumed, new_off);
+                        debug_print!(
+                            "[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}",
+                            col_name,
+                            active_block.id,
+                            consumed,
+                            new_off
+                        );
                         return Ok(Some(entry));
                     }
                     Err(_) => {
-                        debug_print!("[reader] read_next: tail read error col={}, block_id={}, offset={}", col_name, active_block.id, tail_off);
+                        debug_print!(
+                            "[reader] read_next: tail read error col={}, block_id={}, offset={}",
+                            col_name,
+                            active_block.id,
+                            tail_off
+                        );
                         return Ok(None);
                     }
                 }
             } else {
-                debug_print!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
+                debug_print!(
+                    "[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}",
+                    col_name,
+                    active_block.id,
+                    tail_off,
+                    written
+                );
                 return Ok(None);
             }
         }
@@ -946,18 +1188,25 @@ impl Walrus {
 
     fn startup_chore(&self) -> std::io::Result<()> {
         // Minimal recovery: scan wal_files, build reader chains, and rebuild trackers
-        let dir = match fs::read_dir("./wal_files") { Ok(d) => d, Err(_) => return Ok(()) };
+        let dir = match fs::read_dir("./wal_files") {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
         let mut files: Vec<String> = Vec::new();
         for entry in dir.flatten() {
             let path = entry.path();
             if let Some(s) = path.to_str() {
                 // skip index files
-                if s.ends_with("_index.db") { continue; }
+                if s.ends_with("_index.db") {
+                    continue;
+                }
                 files.push(s.to_string());
             }
         }
         files.sort();
-        if !files.is_empty() { debug_print!("[recovery] scanning files: {}", files.len()); }
+        if !files.is_empty() {
+            debug_print!("[recovery] scanning files: {}", files.len());
+        }
 
         // synthetic block ids btw
         let mut next_block_id: usize = 1;
@@ -966,7 +1215,10 @@ impl Walrus {
         for file_path in files.iter() {
             let mmap = match SharedMmapKeeper::get_mmap_arc(file_path) {
                 Ok(m) => m,
-                Err(e) => { debug_print!("[recovery] mmap open failed for {}: {}", file_path, e); continue; }
+                Err(e) => {
+                    debug_print!("[recovery] mmap open failed for {}: {}", file_path, e);
+                    continue;
+                }
             };
             seen_files.insert(file_path.clone());
             FileStateTracker::register_file_if_absent(file_path);
@@ -998,31 +1250,60 @@ impl Walrus {
                 // SAFETY: `aligned` is built from bounded bytes inside the block,
                 // copied into `AlignedVec` ensuring alignment for rkyv.
                 let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-                let md: Metadata = match archived.deserialize(&mut rkyv::Infallible) { Ok(m) => m, Err(_) => { break; } };
+                let md: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        break;
+                    }
+                };
                 col_name = Some(md.owned_by);
 
                 // scan entries to compute used
-                let block_stub = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used: 0 };
+                let block_stub = Block {
+                    id: next_block_id as u64,
+                    file_path: file_path.clone(),
+                    offset: block_offset,
+                    limit: DEFAULT_BLOCK_SIZE,
+                    mmap: mmap.clone(),
+                    used: 0,
+                };
                 let mut in_block_off: u64 = 0;
                 loop {
                     match block_stub.read(in_block_off) {
                         Ok((_entry, consumed)) => {
                             used += consumed as u64;
                             in_block_off += consumed as u64;
-                            if in_block_off >= DEFAULT_BLOCK_SIZE { break; }
+                            if in_block_off >= DEFAULT_BLOCK_SIZE {
+                                break;
+                            }
                         }
                         Err(_) => break,
                     }
                 }
-                if used == 0 { break; }
+                if used == 0 {
+                    break;
+                }
 
-                let block = Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
+                let block = Block {
+                    id: next_block_id as u64,
+                    file_path: file_path.clone(),
+                    offset: block_offset,
+                    limit: DEFAULT_BLOCK_SIZE,
+                    mmap: mmap.clone(),
+                    used,
+                };
                 // register and append
                 BlockStateTracker::register_block(next_block_id, file_path);
                 FileStateTracker::add_block_to_file_state(file_path);
                 if let Some(col) = col_name {
                     let _ = self.reader.append_block_to_chain(&col, block.clone());
-                    debug_print!("[recovery] appended block: file={}, block_id={}, used={}, col={}", file_path, block.id, block.used, col);
+                    debug_print!(
+                        "[recovery] appended block: file={}, block_id={}, used={}, col={}",
+                        file_path,
+                        block.id,
+                        block.used,
+                        col
+                    );
                 }
                 next_block_id += 1;
                 block_offset += DEFAULT_BLOCK_SIZE;
@@ -1035,9 +1316,14 @@ impl Walrus {
             if let Some(map) = map {
                 for (col, info_arc) in map.iter() {
                     if let Some(pos) = idx_guard.get(col) {
-                        let mut info = match info_arc.write() { Ok(v) => v, Err(_) => continue };
+                        let mut info = match info_arc.write() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
                         let mut ib = pos.cur_block_idx as usize;
-                        if ib > info.chain.len() { ib = info.chain.len(); }
+                        if ib > info.chain.len() {
+                            ib = info.chain.len();
+                        }
                         info.cur_block_idx = ib;
                         if ib < info.chain.len() {
                             let used = info.chain[ib].used;
@@ -1045,25 +1331,32 @@ impl Walrus {
                         } else {
                             info.cur_block_offset = 0;
                         }
-                        for i in 0..ib { BlockStateTracker::set_checkpointed_true(info.chain[i].id as usize); }
-                        if ib < info.chain.len() && info.cur_block_offset >= info.chain[ib].used { BlockStateTracker::set_checkpointed_true(info.chain[ib].id as usize); }
+                        for i in 0..ib {
+                            BlockStateTracker::set_checkpointed_true(info.chain[i].id as usize);
+                        }
+                        if ib < info.chain.len() && info.cur_block_offset >= info.chain[ib].used {
+                            BlockStateTracker::set_checkpointed_true(info.chain[ib].id as usize);
+                        }
                     }
                 }
             }
         }
 
         // enqueue deletion checks
-        for f in seen_files.into_iter() { flush_check(f); }
+        for f in seen_files.into_iter() {
+            flush_check(f);
+        }
         Ok(())
     }
 }
-
 
 static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();
 
 fn flush_check(file_path: String) {
     // readiness check fast path; hook actual reclamation later
-    if let Some((locked, checkpointed, total, fully_allocated)) = FileStateTracker::get_state_snapshot(&file_path) {
+    if let Some((locked, checkpointed, total, fully_allocated)) =
+        FileStateTracker::get_state_snapshot(&file_path)
+    {
         let ready_to_delete = fully_allocated && locked == 0 && total > 0 && checkpointed >= total;
         if ready_to_delete {
             if let Some(tx) = DELETION_TX.get() {
@@ -1113,8 +1406,12 @@ impl BlockStateTracker {
                 if let Some(b) = r.get(&block_id) {
                     b.is_checkpointed.store(true, Ordering::Release);
                     Some(b.file_path.clone())
-                } else { None }
-            } else { None }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
         if let Some(path) = path_opt {
