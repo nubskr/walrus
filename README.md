@@ -21,6 +21,15 @@
 - **Coordination-free Deletion**: Atomic file cleanup without blocking operations
 - **Comprehensive Benchmarking**: Built-in performance testing suite
 
+## Benchmarks
+
+Run quick benchmarks with:
+
+```bash
+pip install pandas matplotlib # we need these to show graphs
+make bench-and-show-reads
+```
+
 ## Quick Start
 
 Add Walrus to your `Cargo.toml`:
