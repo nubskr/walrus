@@ -317,6 +317,9 @@ impl BlockAllocator {
         Ok(ret)
     }
 
+    /*
+    the critical section of this call would be absolutely tiny given the exception of when a new file is being created, but it'll be amortized and in the majority of the scenario it would be a handful of microseconds and the overhead of a syscall isnt worth it, a hundred or two cycles are nothing in the grand scheme of things 
+    */
     fn lock(&self) {
         // Spin lock implementation
         while self

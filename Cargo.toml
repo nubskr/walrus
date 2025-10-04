@@ -1,7 +1,22 @@
 [package]
-name = "walrus"
+name = "walrus-rust"
 version = "0.1.0"
 edition = "2024"
+authors = ["nubskr <hello@nubskr.com>"]
+description = "A high-performance Write-Ahead Log (WAL) implementation in Rust"
+documentation = "https://docs.rs/walrus-rust"
+repository = "https://github.com/nubskr/walrus"
+license = "MIT"
+keywords = ["wal", "write-ahead-log", "database", "logging", "persistence"]
+categories = ["database-implementations", "data-structures", "concurrency"]
+readme = "README.md"
+exclude = [
+    "target/*",
+    "wal_files/*",
+    "*.csv",
+    "figures/*",
+    "scripts/__pycache__/*"
+]
 
 [dependencies]
 memmap2 = "0.9.8"

@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use walrus::wal::{Entry, WalIndex, Walrus};
+use walrus_rust::wal::{Entry, WalIndex, Walrus};
+use walrus_rust::ReadConsistency;
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
@@ -40,7 +41,7 @@ fn walindex_persists() {
 #[test]
 fn large_entry_forces_block_seal() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let large_data_1 = vec![0x42u8; 9 * 1024 * 1024]; // 9MB of 0x42
     let large_data_2 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
@@ -60,7 +61,7 @@ fn large_entry_forces_block_seal() {
 #[test]
 fn basic_roundtrip_single_topic() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"x").unwrap();
     wal.append_for_topic("t", b"y").unwrap();
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"x");
@@ -72,7 +73,7 @@ fn basic_roundtrip_single_topic() {
 #[test]
 fn basic_roundtrip_multi_topic() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("a", b"1").unwrap();
     wal.append_for_topic("b", b"2").unwrap();
     assert_eq!(wal.read_next("a").unwrap().unwrap().data, b"1");
@@ -83,11 +84,11 @@ fn basic_roundtrip_multi_topic() {
 #[test]
 fn persists_read_offsets_across_restart() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"a").unwrap();
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"a");
-    let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t").unwrap().unwrap().data, b"b");
     assert!(wal2.read_next("t").unwrap().is_none());
     cleanup_wal();
@@ -96,7 +97,7 @@ fn persists_read_offsets_across_restart() {
 #[test]
 fn checksum_corruption_is_detected_via_public_api() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"abcdef").unwrap();
     let path = first_data_file();
     let mut bytes = Vec::new();
@@ -116,7 +117,7 @@ fn checksum_corruption_is_detected_via_public_api() {
     } else {
         panic!("payload not found to corrupt");
     }
-    let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let res = wal2.read_next("t").unwrap();
     assert!(res.is_none());
     cleanup_wal();
@@ -125,7 +126,7 @@ fn checksum_corruption_is_detected_via_public_api() {
 #[test]
 fn stress_massive_single_entry() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let size = 100 * 1024 * 1024; // 100MB
     let mut massive_data = Vec::with_capacity(size);
@@ -149,7 +150,7 @@ fn stress_massive_single_entry() {
 #[test]
 fn stress_many_topics_with_validation() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let num_topics = 1000;
     let entries_per_topic = 100;
@@ -197,7 +198,7 @@ fn stress_many_topics_with_validation() {
 #[test]
 fn stress_rapid_write_read_cycles() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let cycles = 10000;
     let topic = "rapid_cycles";
@@ -244,7 +245,7 @@ fn stress_rapid_write_read_cycles() {
 #[test]
 fn stress_boundary_conditions() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let test_sizes = vec![
         0,               // Empty
@@ -293,7 +294,7 @@ fn stress_boundary_conditions() {
 #[test]
 fn stress_data_integrity_patterns() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let patterns = vec![
         ("zeros", vec![0u8; 1000]),
@@ -333,7 +334,7 @@ fn stress_data_integrity_patterns() {
 #[test]
 fn stress_concurrent_topic_validation() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let num_topics = 50;
     let entries_per_topic = 200;
@@ -384,7 +385,7 @@ fn stress_concurrent_topic_validation() {
 #[test]
 fn stress_extreme_topic_names() {
     cleanup_wal();
-    let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let extreme_topics = vec![
         "a".to_string(),                                      // Single char
@@ -421,7 +422,7 @@ mod checksum_tests {
     #[test]
     fn checksum_detects_corruption() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let test_data = b"test_checksum_data_12345";
         wal.append_for_topic("checksum_test", test_data).unwrap();
@@ -454,7 +455,7 @@ mod checksum_tests {
             panic!("Test data not found in file for corruption");
         }
 
-        let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
         let result = wal2.read_next("checksum_test").unwrap();
 
         match result {
@@ -595,7 +596,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_empty_topic_read() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         assert!(wal.read_next("empty_topic").unwrap().is_none());
 
@@ -605,7 +606,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_single_entry_per_topic() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("topic1", b"data1").unwrap();
         wal.append_for_topic("topic2", b"data2").unwrap();
@@ -622,7 +623,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_multiple_entries_same_topic() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let entries = vec![b"entry1", b"entry2", b"entry3", b"entry4"];
         for entry in &entries {
@@ -644,7 +645,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_interleaved_topics() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("a", b"a1").unwrap();
         wal.append_for_topic("b", b"b1").unwrap();
@@ -662,7 +663,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_large_entries() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let sizes = vec![1024, 64 * 1024, 512 * 1024, 1024 * 1024]; // 1KB to 1MB
 
@@ -683,7 +684,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_zero_length_entry() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("empty", b"").unwrap();
         wal.append_for_topic("empty", b"not_empty").unwrap();
@@ -697,7 +698,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_topic_isolation() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         for i in 0..10 {
             wal.append_for_topic("topic_a", &[i]).unwrap();
@@ -724,7 +725,7 @@ mod walrus_integration_tests {
         cleanup_wal();
 
         {
-            let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+            let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
             wal.append_for_topic("recovery_test", b"before_restart")
                 .unwrap();
             wal.append_for_topic("recovery_test", b"also_before")
@@ -737,7 +738,7 @@ mod walrus_integration_tests {
         }
 
         {
-            let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+            let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
             assert_eq!(
                 wal.read_next("recovery_test").unwrap().unwrap().data,
                 b"also_before"
@@ -751,7 +752,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_write_after_read_exhaustion() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("test", b"first").unwrap();
         assert_eq!(wal.read_next("test").unwrap().unwrap().data, b"first");
@@ -766,7 +767,7 @@ mod walrus_integration_tests {
     #[test]
     fn walrus_concurrent_topics_different_patterns() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let large_data = vec![0xAA; 100 * 1024]; // 100KB
         wal.append_for_topic("topic_large", &large_data).unwrap();
@@ -804,7 +805,7 @@ mod error_handling_tests {
     #[test]
     fn walrus_handles_invalid_data_gracefully() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("test", b"valid_data").unwrap();
 
@@ -821,7 +822,7 @@ mod error_handling_tests {
             f.write_all(&[0xFF, 0xFF]).unwrap(); // Invalid metadata length
         }
 
-        let wal2 = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
         let _result = wal2.read_next("test").unwrap();
 
         cleanup_wal();
@@ -834,7 +835,7 @@ mod stress_tests {
     #[test]
     fn walrus_many_small_entries() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let num_entries = 1000;
 
@@ -858,7 +859,7 @@ mod stress_tests {
     #[test]
     fn walrus_multiple_topics_stress() {
         cleanup_wal();
-        let wal = Walrus::with_consistency(walrus::ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         let num_topics = 10;
         let entries_per_topic = 100;

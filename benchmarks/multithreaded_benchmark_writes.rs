@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus::wal::Walrus;
+use walrus_rust::wal::Walrus;
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
@@ -27,7 +27,7 @@ fn multithreaded_benchmark() {
     println!("Configuration: 10 threads, 2 minutes write phase only");
 
     let wal = Arc::new(
-        Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 })
+        Walrus::with_consistency(walrus_rust::ReadConsistency::AtLeastOnce { persist_every: 50 })
             .expect("Failed to create Walrus"),
     );
     let num_threads = 10;

@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus::wal::Walrus;
+use walrus_rust::wal::Walrus;
 
 fn cleanup_wal() {
     // Remove WAL files directory
@@ -37,7 +37,7 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
     thread::sleep(Duration::from_millis(100));
 
     let wal = Arc::new(
-        Walrus::with_consistency(walrus::ReadConsistency::AtLeastOnce { persist_every: 50 })
+        Walrus::with_consistency(walrus_rust::ReadConsistency::AtLeastOnce { persist_every: 50 })
             .expect("Failed to create Walrus"),
     );
     let test_duration = Duration::from_secs(30); // 30 seconds per test

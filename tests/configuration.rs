@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use walrus::wal::{FsyncSchedule, ReadConsistency, Walrus};
+use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
 fn cleanup_wal() {
     // Aggressive cleanup to ensure complete removal
