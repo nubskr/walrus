@@ -1,4 +1,14 @@
-# Walrus 🦭
+<div align="center">
+  <img src="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-light.svg"
+       alt="walrus"
+       width="50%">
+</div>
+
+[Website][Rust] | [Getting started] | [Learn] | [Documentation] | [Contributing]
+</div>
+
+
+# Walrus
 
 A high-performance Write-Ahead Log (WAL) implementation in Rust designed for concurrent workloads with configurable consistency guarantees.
 
