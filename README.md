@@ -3,9 +3,10 @@
        alt="walrus"
        width="50%">
 </div>
+
 # Walrus
 
-A high-performance Write-Ahead Log (WAL) implementation in Rust designed for concurrent workloads with configurable consistency guarantees.
+A high-performance Write-Ahead Log (WAL) implementation in Rust designed for high throughput workloads
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
