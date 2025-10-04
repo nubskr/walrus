@@ -1,12 +1,9 @@
 <div align="center">
-  <img src="./figures/walrus1.png"
+  <img src="https://raw.githubusercontent.com/nubskr/walrus/refs/heads/master/figures/walrus1.png?token=GHSAT0AAAAAADHYYHC2OS5VGO7DXBTMKRAY2HBRQ7A"
        alt="walrus"
-       width="50%">
+       width="35%">
+    <div>Walrus: A high performance Write Ahead Log (WAL) in Rust</div>
 </div>
-
-# Walrus
-
-A high-performance Write-Ahead Log (WAL) implementation in Rust designed for high throughput workloads
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
