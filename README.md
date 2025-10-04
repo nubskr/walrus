@@ -1,7 +1,7 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/nubskr/walrus/refs/heads/master/figures/walrus1.png?token=GHSAT0AAAAAADHYYHC2OS5VGO7DXBTMKRAY2HBRQ7A"
        alt="walrus"
-       width="35%">
+       width="30%">
     <div>Walrus: A high performance Write Ahead Log (WAL) in Rust</div>
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
