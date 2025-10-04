@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/nubskr/walrus/refs/heads/master/figures/walrus1.png?token=GHSAT0AAAAAADHYYHC2OS5VGO7DXBTMKRAY2HBRQ7A"
+  <img src="./figures/walrus1.png"
        alt="walrus"
        width="30%">
     <div>Walrus: A high performance Write Ahead Log (WAL) in Rust</div>
