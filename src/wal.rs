@@ -997,7 +997,7 @@ impl Walrus {
                         for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
                             let fd = io_uring::types::Fd(*raw_fd);
 
-                            let fsync_op = io_uringopcode::Fsync::new(fd).build().user_data(i as u64);
+                            let fsync_op = io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
 
                             unsafe {
                                 if ring.submission().push(&fsync_op).is_err() {
