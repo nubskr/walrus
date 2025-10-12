@@ -9,6 +9,104 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
+// Function to get system memory information including dirty pages
+fn get_memory_info() -> (u64, u64, f64) {
+    // Returns (total_memory_kb, dirty_pages_kb, dirty_ratio)
+    
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, we can get memory info from vm_stat and sysctl
+        let total_memory = get_macos_total_memory();
+        let dirty_pages = get_macos_dirty_pages();
+        let dirty_ratio = if total_memory > 0 {
+            (dirty_pages as f64 / total_memory as f64) * 100.0
+        } else {
+            0.0
+        };
+        (total_memory, dirty_pages, dirty_ratio)
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, read from /proc/meminfo
+        get_linux_memory_info()
+    }
+    
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Fallback for other systems
+        (0, 0, 0.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_total_memory() -> u64 {
+    use std::process::Command;
+    
+    if let Ok(output) = Command::new("sysctl")
+        .args(&["-n", "hw.memsize"])
+        .output()
+    {
+        if let Ok(memsize_str) = String::from_utf8(output.stdout) {
+            if let Ok(memsize_bytes) = memsize_str.trim().parse::<u64>() {
+                return memsize_bytes / 1024; // Convert to KB
+            }
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_dirty_pages() -> u64 {
+    use std::process::Command;
+    
+    if let Ok(output) = Command::new("vm_stat").output() {
+        if let Ok(vm_stat_str) = String::from_utf8(output.stdout) {
+            // Parse vm_stat output to find dirty pages
+            for line in vm_stat_str.lines() {
+                if line.contains("Pages modified:") {
+                    // Extract the number from "Pages modified: 12345."
+                    if let Some(pages_str) = line.split_whitespace().nth(2) {
+                        if let Ok(pages) = pages_str.trim_end_matches('.').parse::<u64>() {
+                            // vm_stat reports in pages, typically 4KB each on macOS
+                            return pages * 4; // Convert to KB
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn get_linux_memory_info() -> (u64, u64, f64) {
+    let mut total_memory = 0u64;
+    let mut dirty_pages = 0u64;
+    
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    total_memory = kb_str.parse().unwrap_or(0);
+                }
+            } else if line.starts_with("Dirty:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    dirty_pages = kb_str.parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+    
+    let dirty_ratio = if total_memory > 0 {
+        (dirty_pages as f64 / total_memory as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    (total_memory, dirty_pages, dirty_ratio)
+}
+
 fn parse_fsync_schedule() -> FsyncSchedule {
     // Check environment variable first (for Makefile integration)
     if let Ok(fsync_env) = env::var("WALRUS_FSYNC") {
@@ -123,7 +221,7 @@ fn multithreaded_benchmark() {
     let mut csv_file = fs::File::create(csv_path).expect("Failed to create CSV file");
     writeln!(
         csv_file,
-        "timestamp,elapsed_seconds,writes_per_second,bytes_per_second,total_writes,total_bytes"
+        "timestamp,elapsed_seconds,writes_per_second,bytes_per_second,total_writes,total_bytes,dirty_pages_kb,dirty_ratio_percent"
     )
     .expect("Failed to write CSV header");
 
@@ -176,10 +274,11 @@ fn multithreaded_benchmark() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let (_, initial_dirty_kb, initial_dirty_ratio) = get_memory_info();
         writeln!(
             csv_file,
-            "{},{:.2},{:.0},{:.0},{},{}",
-            timestamp, 0.0, 0.0, 0.0, 0, 0
+            "{},{:.2},{:.0},{:.0},{},{},{},{:.2}",
+            timestamp, 0.0, 0.0, 0.0, 0, 0, initial_dirty_kb, initial_dirty_ratio
         )
         .expect("Failed to write initial CSV entry");
         csv_file.flush().expect("Failed to flush CSV");
@@ -205,6 +304,9 @@ fn multithreaded_benchmark() {
             let writes_per_second = (current_writes - last_writes) as f64 / interval_s;
             let bytes_per_second = (current_bytes - last_bytes) as f64 / interval_s;
 
+            // Get memory information including dirty pages
+            let (_, dirty_kb, dirty_ratio) = get_memory_info();
+
             // Only log if there's been some change or every 2 seconds (4 ticks of 0.5s)
             let should_log = (current_writes != last_writes) || (tick_index % 4 == 0);
 
@@ -217,13 +319,15 @@ fn multithreaded_benchmark() {
 
                 writeln!(
                     csv_file,
-                    "{},{:.2},{:.0},{:.0},{},{}",
+                    "{},{:.2},{:.0},{:.0},{},{},{},{:.2}",
                     timestamp,
                     elapsed_total,
                     writes_per_second,
                     bytes_per_second,
                     current_writes,
-                    current_bytes
+                    current_bytes,
+                    dirty_kb,
+                    dirty_ratio
                 )
                 .expect("Failed to write to CSV");
                 csv_file.flush().expect("Failed to flush CSV");
@@ -231,11 +335,13 @@ fn multithreaded_benchmark() {
                 // Print progress only if there's activity
                 if current_writes > last_writes {
                     println!(
-                        "[Monitor] {:.1}s: {:.0} writes/sec, {:.2} MB/sec, total: {} writes",
+                        "[Monitor] {:.1}s: {:.0} writes/sec, {:.2} MB/sec, total: {} writes, dirty: {:.2}% ({} KB)",
                         elapsed_total,
                         writes_per_second,
                         bytes_per_second / (1024.0 * 1024.0),
-                        current_writes
+                        current_writes,
+                        dirty_ratio,
+                        dirty_kb
                     );
                 }
             }
