@@ -79,6 +79,81 @@ fn test_fsync_schedule() {
 }
 
 #[test]
+fn test_fsync_schedule_sync_each() {
+    cleanup_wal();
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::SyncEach,
+    )
+    .unwrap();
+    
+    // Test that SyncEach mode works correctly
+    wal.append_for_topic("sync_each_test", b"msg1").unwrap();
+    wal.append_for_topic("sync_each_test", b"msg2").unwrap();
+    wal.append_for_topic("sync_each_test", b"msg3").unwrap();
+    
+    let entry1 = wal.read_next("sync_each_test").unwrap().unwrap();
+    assert_eq!(entry1.data, b"msg1");
+    
+    let entry2 = wal.read_next("sync_each_test").unwrap().unwrap();
+    assert_eq!(entry2.data, b"msg2");
+    
+    let entry3 = wal.read_next("sync_each_test").unwrap().unwrap();
+    assert_eq!(entry3.data, b"msg3");
+    
+    // Verify no more entries
+    assert!(wal.read_next("sync_each_test").unwrap().is_none());
+    
+    cleanup_wal();
+}
+
+#[test]
+fn test_fsync_schedule_sync_each_durability() {
+    cleanup_wal();
+    
+    // Test that SyncEach mode provides immediate durability
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::SyncEach,
+        )
+        .unwrap();
+        
+        wal.append_for_topic("durability_test", b"durable_msg1").unwrap();
+        wal.append_for_topic("durability_test", b"durable_msg2").unwrap();
+        
+        // Read both messages to ensure they're properly persisted
+        let entry1 = wal.read_next("durability_test").unwrap().unwrap();
+        assert_eq!(entry1.data, b"durable_msg1");
+        
+        let entry2 = wal.read_next("durability_test").unwrap().unwrap();
+        assert_eq!(entry2.data, b"durable_msg2");
+        
+        // Verify no more entries
+        assert!(wal.read_next("durability_test").unwrap().is_none());
+    } // Drop the WAL instance to simulate crash
+    
+    // Create new instance and verify position is persisted
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::SyncEach,
+        )
+        .unwrap();
+        
+        // Should have no more entries to read since we read everything
+        assert!(wal.read_next("durability_test").unwrap().is_none());
+        
+        // Add a new message and verify it works
+        wal.append_for_topic("durability_test", b"new_msg_after_restart").unwrap();
+        let entry3 = wal.read_next("durability_test").unwrap().unwrap();
+        assert_eq!(entry3.data, b"new_msg_after_restart");
+    }
+    
+    cleanup_wal();
+}
+
+#[test]
 fn test_constructors() {
     cleanup_wal();
     let wal1 = Walrus::new().unwrap();

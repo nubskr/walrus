@@ -351,6 +351,7 @@ struct Writer {
     col: String,
     publisher: Arc<mpsc::Sender<String>>,
     current_offset: Mutex<u64>,
+    fsync_schedule: FsyncSchedule,
 }
 
 impl Writer {
@@ -360,6 +361,7 @@ impl Writer {
         reader: Arc<Reader>,
         col: String,
         publisher: Arc<mpsc::Sender<String>>,
+        fsync_schedule: FsyncSchedule,
     ) -> Self {
         Writer {
             allocator,
@@ -368,6 +370,7 @@ impl Writer {
             col: col.clone(),
             publisher,
             current_offset: Mutex::new(0),
+            fsync_schedule,
         }
     }
 
@@ -419,7 +422,20 @@ impl Writer {
             *cur + need
         );
         *cur += need;
-        let _ = self.publisher.send(block.file_path.clone());
+        
+        // Handle fsync based on schedule
+        match self.fsync_schedule {
+            FsyncSchedule::SyncEach => {
+                // Immediate mmap flush, skip background flusher
+                block.mmap.flush()?;
+                debug_print!("[writer] immediate fsync: col={}, block_id={}", self.col, block.id);
+            }
+            FsyncSchedule::Milliseconds(_) => {
+                // Send to background flusher
+                let _ = self.publisher.send(block.file_path.clone());
+            }
+        }
+        
         Ok(())
     }
 }
@@ -719,6 +735,7 @@ pub enum ReadConsistency {
 #[derive(Clone, Copy, Debug)]
 pub enum FsyncSchedule {
     Milliseconds(u64),
+    SyncEach, // fsync after every single entry
 }
 
 pub struct Walrus {
@@ -756,6 +773,7 @@ impl Walrus {
         let tick = Arc::new(AtomicU64::new(0));
         let sleep_millis = match fsync_schedule {
             FsyncSchedule::Milliseconds(ms) => ms.max(1),
+            FsyncSchedule::SyncEach => 1000, // Still run background thread for cleanup, but less frequently
         };
         // background flusher
         thread::spawn(move || {
@@ -880,6 +898,7 @@ impl Walrus {
                         self.reader.clone(),
                         col_name.to_string(),
                         self.fsync_tx.clone(),
+                        self.fsync_schedule,
                     ));
                     map.insert(col_name.to_string(), w.clone());
                     w
