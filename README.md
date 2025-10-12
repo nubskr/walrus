@@ -129,17 +129,37 @@ let wal = Walrus::with_consistency_and_schedule(
 )?;
 ```
 
+#### `FsyncSchedule::NoFsync`
+- **Behavior**: Disable fsyncing entirely - data stays in OS buffers
+- **Guarantees**: No durability guarantees - data may be lost on crash/power failure
+- **Performance**: Fastest option - maximum throughput with no disk sync overhead
+- **Use Case**: Performance testing, non-critical data, or when external durability is handled
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },
+    FsyncSchedule::NoFsync  // No fsyncing - maximum performance
+)?;
+```
+
 ### Environment Variables
 
 - **`WALRUS_QUIET`**: Set to any value to suppress debug output during operations
-- **`WALRUS_FSYNC`**: Configure fsync schedule for benchmarks (`sync-each`, `async`, `<number>ms`)
+- **`WALRUS_FSYNC`**: Configure fsync schedule for benchmarks (`sync-each`, `no-fsync`, `async`, `<number>ms`)
 - **`WALRUS_THREADS`**: Configure thread range for scaling benchmark (`<number>` or `<start-end>`)
+- **`WALRUS_DURATION`**: Configure benchmark duration for both write and read phases (`30s`, `2m`, `1h`)
+- **`WALRUS_WRITE_DURATION`**: Configure write phase duration specifically (`1m`, `120s`)
+- **`WALRUS_READ_DURATION`**: Configure read phase duration specifically (`2m`, `180s`)
 
 ```bash
-export WALRUS_QUIET=1           # Suppress debug messages
-export WALRUS_FSYNC=sync-each   # Use sync-each fsync for benchmarks
-export WALRUS_THREADS=16        # Test scaling up to 16 threads
-export WALRUS_THREADS=2-8       # Test scaling from 2 to 8 threads
+export WALRUS_QUIET=1                    # Suppress debug messages
+export WALRUS_FSYNC=sync-each            # Use sync-each fsync for benchmarks
+export WALRUS_FSYNC=no-fsync             # Disable fsyncing for max performance
+export WALRUS_THREADS=16                 # Test scaling up to 16 threads
+export WALRUS_THREADS=2-8                # Test scaling from 2 to 8 threads
+export WALRUS_DURATION=30s               # Run benchmarks for 30 seconds
+export WALRUS_WRITE_DURATION=2m          # 2 minute write phase
+export WALRUS_READ_DURATION=1m           # 1 minute read phase
 ```
 
 ## File Structure and Storage
@@ -196,21 +216,23 @@ Walrus includes a comprehensive benchmarking suite to measure performance across
 ### Available Benchmarks
 
 #### 1. Write Benchmark (`multithreaded_benchmark_writes`)
-- **Duration**: 2 minutes
+- **Duration**: 2 minutes (configurable via `WALRUS_DURATION`)
 - **Threads**: 10 concurrent writers
 - **Data Size**: Random entries between 500B and 1KB
 - **Topics**: One topic per thread (`topic_0` through `topic_9`)
 - **Configuration**: `AtLeastOnce { persist_every: 50 }`
-- **Output**: `benchmark_throughput.csv`
+- **Monitoring**: Real-time throughput, dirty pages ratio, memory usage
+- **Output**: `benchmark_throughput.csv` (includes dirty pages data)
 
 #### 2. Read Benchmark (`multithreaded_benchmark_reads`)
 - **Phases**: 
-  - Write Phase: 1 minute (populate data)
-  - Read Phase: 2 minutes (consume data)
+  - Write Phase: 1 minute (configurable via `WALRUS_WRITE_DURATION`)
+  - Read Phase: 2 minutes (configurable via `WALRUS_READ_DURATION`)
 - **Threads**: 10 concurrent reader/writers
 - **Data Size**: Random entries between 500B and 1KB
 - **Configuration**: `AtLeastOnce { persist_every: 5000 }`
-- **Output**: `read_benchmark_throughput.csv`
+- **Monitoring**: Real-time throughput for both phases, dirty pages ratio, memory usage
+- **Output**: `read_benchmark_throughput.csv` (includes dirty pages data)
 
 #### 3. Scaling Benchmark (`scaling_benchmark`)
 - **Thread Counts**: 1 to 10 threads by default (configurable via `WALRUS_THREADS`)
@@ -281,9 +303,33 @@ WALRUS_FSYNC=sync-each WALRUS_THREADS=2-8 cargo test --test scaling_benchmark --
 Control when data is flushed to disk during benchmarks:
 
 - **`sync-each`**: Fsync after every write (slowest, most durable)
+- **`no-fsync`**: Disable fsyncing entirely (fastest, no durability)
+- **`none`**: Same as `no-fsync`
 - **`async`**: Async fsync every 1000ms (default)
 - **`<number>ms`**: Custom millisecond intervals (e.g., `100ms`, `500ms`, `2000ms`)
 - **`<number>`**: Same as above without "ms" suffix (e.g., `100`, `500`, `2000`)
+
+#### Duration Configuration
+
+Control how long benchmarks run:
+
+- **`WALRUS_DURATION`**: Set both write and read phase duration (e.g., `30s`, `2m`, `1h`)
+- **`WALRUS_WRITE_DURATION`**: Set write phase duration specifically
+- **`WALRUS_READ_DURATION`**: Set read phase duration specifically (reads benchmark only)
+- **`--duration <time>`**: Command line equivalent of `WALRUS_DURATION`
+- **`--write-duration <time>`**: Command line equivalent of `WALRUS_WRITE_DURATION`
+- **`--read-duration <time>`**: Command line equivalent of `WALRUS_READ_DURATION`
+
+**Duration Format:**
+- **`<number>s`**: Seconds (e.g., `30s`, `120s`)
+- **`<number>m`**: Minutes (e.g., `2m`, `5m`)
+- **`<number>h`**: Hours (e.g., `1h`, `2h`)
+- **`<number>`**: Raw seconds (e.g., `120`, `300`)
+
+**Defaults:**
+- Write benchmark: 2 minutes
+- Read benchmark: 1 minute write + 1 minute read
+- Scaling benchmark: 30 seconds per thread count
 
 #### Thread Count Configuration (Scaling Benchmark Only)
 
@@ -298,20 +344,72 @@ Configure how many threads to test in the scaling benchmark:
 
 **Environment Variables (Recommended for Makefile):**
 ```bash
-export WALRUS_FSYNC=sync-each     # Set fsync schedule
-export WALRUS_THREADS=16          # Set thread range
+export WALRUS_FSYNC=sync-each        # Set fsync schedule
+export WALRUS_FSYNC=no-fsync         # Disable fsyncing for max performance
+export WALRUS_THREADS=16             # Set thread range
+export WALRUS_DURATION=30s           # Set benchmark duration
+export WALRUS_WRITE_DURATION=2m      # Set write phase duration
+export WALRUS_READ_DURATION=1m       # Set read phase duration
 ```
 
 **Makefile Parameters:**
 ```bash
 FSYNC=sync-each make bench-writes
+FSYNC=no-fsync make bench-writes
 THREADS=16 make bench-scaling
 FSYNC=500ms THREADS=2-8 make bench-scaling-sync
 ```
 
 **Command Line Arguments:**
 ```bash
+# Scaling benchmark with custom fsync and threads
 cargo test --test scaling_benchmark -- --nocapture --fsync sync-each --threads 16
+
+# Write benchmark with no-fsync and custom duration
+cargo test --test multithreaded_benchmark_writes -- --nocapture --fsync no-fsync --duration 30s
+
+# Read benchmark with separate write/read durations
+cargo test --test multithreaded_benchmark_reads -- --nocapture --write-duration 2m --read-duration 1m
+```
+
+#### Practical Duration Examples
+
+**Quick Performance Test (30 seconds):**
+```bash
+# Environment variable approach
+WALRUS_DURATION=30s WALRUS_FSYNC=no-fsync cargo test --test multithreaded_benchmark_writes -- --nocapture
+
+# Command line approach  
+cargo test --test multithreaded_benchmark_writes -- --nocapture --duration 30s --fsync no-fsync
+```
+
+**Extended Durability Test (5 minutes):**
+```bash
+# Test sync-each performance over longer period
+WALRUS_DURATION=5m WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
+
+# Command line equivalent
+cargo test --test multithreaded_benchmark_writes -- --nocapture --duration 5m --fsync sync-each
+```
+
+**Read Benchmark with Different Phase Durations:**
+```bash
+# Long write phase, short read phase
+WALRUS_WRITE_DURATION=3m WALRUS_READ_DURATION=1m cargo test --test multithreaded_benchmark_reads -- --nocapture
+
+# Command line equivalent
+cargo test --test multithreaded_benchmark_reads -- --nocapture --write-duration 3m --read-duration 1m
+
+# Equal phases
+WALRUS_DURATION=2m cargo test --test multithreaded_benchmark_reads -- --nocapture
+```
+
+**Performance Comparison Suite:**
+```bash
+# Test different fsync modes with same duration
+WALRUS_DURATION=1m WALRUS_FSYNC=no-fsync cargo test --test multithreaded_benchmark_writes -- --nocapture
+WALRUS_DURATION=1m WALRUS_FSYNC=async cargo test --test multithreaded_benchmark_writes -- --nocapture  
+WALRUS_DURATION=1m WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
 ```
 
 #### Machine-Specific Recommendations
@@ -345,6 +443,36 @@ let data = vec![(counter % 256) as u8; size];
 ```
 
 This creates realistic variable-sized entries with predictable content for verification.
+
+### Dirty Pages Monitoring
+
+All benchmarks now include real-time monitoring of system dirty pages to understand memory pressure and I/O behavior:
+
+**What is monitored:**
+- **Dirty Pages**: Memory pages that have been modified but not yet written to disk
+- **Dirty Ratio**: Percentage of total system memory that is dirty
+- **Platform Support**: macOS (via `vm_stat`) and Linux (via `/proc/meminfo`)
+
+**CSV Output includes:**
+- `dirty_pages_kb`: Current dirty pages in kilobytes
+- `dirty_ratio_percent`: Percentage of total memory that is dirty
+
+**Console Output example:**
+```
+[Monitor] 15.0s: 45230 writes/sec, 43.2 MB/sec, total: 678450 writes, dirty: 2.1% (524288 KB)
+```
+
+**Why this matters:**
+- High dirty ratios indicate memory pressure and potential I/O bottlenecks
+- `sync-each` mode keeps dirty pages low (immediate flushing)
+- `no-fsync` mode may show higher dirty ratios (data stays in memory)
+- `async` mode shows periodic spikes when background flusher runs
+
+**Platform-specific details:**
+- **macOS**: Uses `sysctl hw.memsize` and `vm_stat` to get memory info
+- **Linux**: Reads `/proc/meminfo` for `MemTotal` and `Dirty` fields
+- **Other OS**: Reports zeros (monitoring disabled)
+
 ### Visualization Scripts
 
 The `scripts/` directory contains Python visualization tools:
@@ -383,12 +511,21 @@ This design enables multiple readers per topic and supports replay scenarios.
 
 ## Performance Tuning
 
-### For Maximum Throughput
+### For Maximum Throughput (No Durability)
 
 ```rust
 let wal = Walrus::with_consistency_and_schedule(
     ReadConsistency::AtLeastOnce { persist_every: 10000 },
-    FsyncSchedule::Milliseconds(5000)
+    FsyncSchedule::NoFsync  // No fsyncing - fastest possible
+)?;
+```
+
+### For High Throughput (Some Durability)
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::Milliseconds(5000)  // Infrequent fsyncing
 )?;
 ```
 
@@ -406,9 +543,19 @@ let wal = Walrus::with_consistency_and_schedule(
 ```rust
 let wal = Walrus::with_consistency_and_schedule(
     ReadConsistency::AtLeastOnce { persist_every: 1000 },
-    FsyncSchedule::Milliseconds(1000)
+    FsyncSchedule::Milliseconds(1000)  // Regular fsyncing
 )?;
 ```
+
+### Performance vs Durability Trade-offs
+
+| Configuration | Throughput | Durability | Use Case |
+|---------------|------------|------------|----------|
+| `NoFsync` | Highest | None | Performance testing, non-critical data |
+| `Milliseconds(5000)` | High | Low | High-throughput logging |
+| `Milliseconds(1000)` | Medium | Medium | Balanced production use |
+| `Milliseconds(100)` | Lower | High | Near real-time requirements |
+| `SyncEach` | Lowest | Highest | Critical financial/safety systems |
 
 ## Contributing
 
