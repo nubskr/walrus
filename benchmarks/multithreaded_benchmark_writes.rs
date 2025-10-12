@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +7,73 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus_rust::wal::Walrus;
+use walrus_rust::wal::{Walrus, FsyncSchedule, ReadConsistency};
+
+fn parse_fsync_schedule() -> FsyncSchedule {
+    // Check environment variable first (for Makefile integration)
+    if let Ok(fsync_env) = env::var("WALRUS_FSYNC") {
+        match fsync_env.as_str() {
+            "sync-each" => return FsyncSchedule::SyncEach,
+            "async" => return FsyncSchedule::Milliseconds(1000),
+            ms_str if ms_str.ends_with("ms") => {
+                if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                    return FsyncSchedule::Milliseconds(ms);
+                }
+            }
+            ms_str => {
+                if let Ok(ms) = ms_str.parse::<u64>() {
+                    return FsyncSchedule::Milliseconds(ms);
+                }
+            }
+        }
+    }
+    
+    // Check command line arguments (for direct cargo test usage)
+    let args: Vec<String> = env::args().collect();
+    
+    for i in 0..args.len() {
+        if args[i] == "--fsync" && i + 1 < args.len() {
+            match args[i + 1].as_str() {
+                "sync-each" => return FsyncSchedule::SyncEach,
+                "async" => return FsyncSchedule::Milliseconds(1000),
+                ms_str if ms_str.ends_with("ms") => {
+                    if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                        return FsyncSchedule::Milliseconds(ms);
+                    }
+                }
+                ms_str => {
+                    if let Ok(ms) = ms_str.parse::<u64>() {
+                        return FsyncSchedule::Milliseconds(ms);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Default to async (1000ms)
+    FsyncSchedule::Milliseconds(1000)
+}
+
+fn print_usage() {
+    println!("Usage: WALRUS_FSYNC=<schedule> cargo test multithreaded_benchmark_writes");
+    println!("   or: cargo test multithreaded_benchmark_writes -- --fsync <schedule>");
+    println!();
+    println!("Fsync Schedule Options:");
+    println!("  sync-each    Fsync after every write (slowest, most durable)");
+    println!("  async        Async fsync every 1000ms (default)");
+    println!("  <number>ms   Async fsync every N milliseconds (e.g., 500ms)");
+    println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
+    println!();
+    println!("Examples:");
+    println!("  WALRUS_FSYNC=sync-each cargo test multithreaded_benchmark_writes");
+    println!("  WALRUS_FSYNC=500ms cargo test multithreaded_benchmark_writes");
+    println!("  make bench-writes-sync  # Uses Makefile convenience targets");
+    println!();
+    println!("Makefile targets:");
+    println!("  make bench-writes       # Default (async 1000ms)");
+    println!("  make bench-writes-sync  # Sync each write");
+    println!("  make bench-writes-fast  # Fast async (100ms)");
+}
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
@@ -16,6 +83,13 @@ fn cleanup_wal() {
 
 #[test]
 fn multithreaded_benchmark() {
+    // Check for help flag
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return;
+    }
+
     cleanup_wal();
 
     // Enable quiet mode to suppress debug output during benchmark
@@ -23,12 +97,17 @@ fn multithreaded_benchmark() {
         std::env::set_var("WALRUS_QUIET", "1");
     }
 
+    let fsync_schedule = parse_fsync_schedule();
+
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, 2 minutes write phase only");
+    println!("Fsync schedule: {:?}", fsync_schedule);
 
     let wal = Arc::new(
-        Walrus::with_consistency(walrus_rust::ReadConsistency::AtLeastOnce { persist_every: 50 })
-            .expect("Failed to create Walrus"),
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::AtLeastOnce { persist_every: 50 },
+            fsync_schedule
+        ).expect("Failed to create Walrus"),
     );
     let num_threads = 10;
     let write_duration = Duration::from_secs(120); // 2 minutes

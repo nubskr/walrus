@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +7,122 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus_rust::wal::Walrus;
+use walrus_rust::wal::{Walrus, FsyncSchedule, ReadConsistency};
+
+fn parse_thread_range() -> (usize, usize) {
+    // Check environment variable first (for Makefile integration)
+    if let Ok(threads_env) = env::var("WALRUS_THREADS") {
+        if let Some((start_str, end_str)) = threads_env.split_once('-') {
+            // Range format: "1-16" or "2-8"
+            if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                if start > 0 && end >= start && end <= 128 {
+                    return (start, end);
+                }
+            }
+        } else if let Ok(max_threads) = threads_env.parse::<usize>() {
+            // Single number format: "16" means "1-16"
+            if max_threads > 0 && max_threads <= 128 {
+                return (1, max_threads);
+            }
+        }
+    }
+    
+    // Check command line arguments (for direct cargo test usage)
+    let args: Vec<String> = env::args().collect();
+    
+    for i in 0..args.len() {
+        if args[i] == "--threads" && i + 1 < args.len() {
+            let threads_arg = &args[i + 1];
+            if let Some((start_str, end_str)) = threads_arg.split_once('-') {
+                if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                    if start > 0 && end >= start && end <= 128 {
+                        return (start, end);
+                    }
+                }
+            } else if let Ok(max_threads) = threads_arg.parse::<usize>() {
+                if max_threads > 0 && max_threads <= 128 {
+                    return (1, max_threads);
+                }
+            }
+        }
+    }
+    
+    // Default: test 1 to 10 threads
+    (1, 10)
+}
+
+fn parse_fsync_schedule() -> FsyncSchedule {
+    // Check environment variable first (for Makefile integration)
+    if let Ok(fsync_env) = env::var("WALRUS_FSYNC") {
+        match fsync_env.as_str() {
+            "sync-each" => return FsyncSchedule::SyncEach,
+            "async" => return FsyncSchedule::Milliseconds(1000),
+            ms_str if ms_str.ends_with("ms") => {
+                if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                    return FsyncSchedule::Milliseconds(ms);
+                }
+            }
+            ms_str => {
+                if let Ok(ms) = ms_str.parse::<u64>() {
+                    return FsyncSchedule::Milliseconds(ms);
+                }
+            }
+        }
+    }
+    
+    // Check command line arguments (for direct cargo test usage)
+    let args: Vec<String> = env::args().collect();
+    
+    for i in 0..args.len() {
+        if args[i] == "--fsync" && i + 1 < args.len() {
+            match args[i + 1].as_str() {
+                "sync-each" => return FsyncSchedule::SyncEach,
+                "async" => return FsyncSchedule::Milliseconds(1000),
+                ms_str if ms_str.ends_with("ms") => {
+                    if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                        return FsyncSchedule::Milliseconds(ms);
+                    }
+                }
+                ms_str => {
+                    if let Ok(ms) = ms_str.parse::<u64>() {
+                        return FsyncSchedule::Milliseconds(ms);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Default to async (1000ms)
+    FsyncSchedule::Milliseconds(1000)
+}
+
+fn print_usage() {
+    println!("Usage: WALRUS_FSYNC=<schedule> WALRUS_THREADS=<range> cargo test scaling_benchmark");
+    println!("   or: cargo test scaling_benchmark -- --fsync <schedule> --threads <range>");
+    println!();
+    println!("Fsync Schedule Options:");
+    println!("  sync-each    Fsync after every write (slowest, most durable)");
+    println!("  async        Async fsync every 1000ms (default)");
+    println!("  <number>ms   Async fsync every N milliseconds (e.g., 500ms)");
+    println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
+    println!();
+    println!("Thread Range Options:");
+    println!("  <number>     Test from 1 to N threads (e.g., 16 means 1-16)");
+    println!("  <start-end>  Test from start to end threads (e.g., 2-8, 1-32)");
+    println!("  Default: 1-10 threads");
+    println!();
+    println!("Examples:");
+    println!("  WALRUS_FSYNC=sync-each WALRUS_THREADS=16 cargo test scaling_benchmark");
+    println!("  WALRUS_THREADS=2-8 cargo test scaling_benchmark");
+    println!("  make bench-scaling-sync  # Uses Makefile convenience targets");
+    println!("  THREADS=32 make bench-scaling  # Test up to 32 threads");
+    println!();
+    println!("Makefile targets:");
+    println!("  make bench-scaling       # Default (1-10 threads, async 1000ms)");
+    println!("  make bench-scaling-sync  # Sync each write");
+    println!("  make bench-scaling-fast  # Fast async (100ms)");
+    println!("  THREADS=16 make bench-scaling  # Custom thread count");
+}
 
 fn cleanup_wal() {
     // Remove WAL files directory
@@ -36,9 +152,12 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
     // Small delay to ensure complete cleanup
     thread::sleep(Duration::from_millis(100));
 
+    let fsync_schedule = parse_fsync_schedule();
     let wal = Arc::new(
-        Walrus::with_consistency(walrus_rust::ReadConsistency::AtLeastOnce { persist_every: 50 })
-            .expect("Failed to create Walrus"),
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::AtLeastOnce { persist_every: 50 },
+            fsync_schedule
+        ).expect("Failed to create Walrus"),
     );
     let test_duration = Duration::from_secs(30); // 30 seconds per test
 
@@ -154,8 +273,8 @@ class LiveScalingPlot:
         self.ax.set_ylabel('Throughput (ops/sec)')
         self.ax.set_title('WAL Write Throughput Scaling (Live)')
         self.ax.grid(True, alpha=0.3)
-        self.ax.set_xlim(0.5, 10.5)
-        self.ax.set_xticks(range(1, 11))
+        self.ax.set_xlim(0.5, 32.5)  # Support up to 32 threads by default
+        self.ax.set_xticks(range(1, 33, 2))  # Show every other tick to avoid crowding
         
         # Format Y-axis to avoid scientific notation
         self.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
@@ -179,10 +298,31 @@ class LiveScalingPlot:
             # Styling
             self.ax.set_xlabel('Number of Threads')
             self.ax.set_ylabel('Throughput (ops/sec)')
-            self.ax.set_title(f'WAL Write Throughput Scaling (Live) - {len(df)}/10 tests complete')
+            
+            # Dynamic title and limits based on actual data
+            min_threads = df['threads'].min()
+            max_threads = df['threads'].max()
+            total_expected = max_threads - min_threads + 1
+            self.ax.set_title(f'WAL Write Throughput Scaling (Live) - {len(df)}/{total_expected} tests complete')
             self.ax.grid(True, alpha=0.3)
-            self.ax.set_xlim(0.5, 10.5)
-            self.ax.set_xticks(range(1, 11))
+            
+            # Dynamic X-axis limits and ticks
+            x_margin = max(1, (max_threads - min_threads) * 0.05)
+            self.ax.set_xlim(min_threads - x_margin, max_threads + x_margin)
+            
+            # Smart tick spacing
+            thread_range = max_threads - min_threads + 1
+            if thread_range <= 10:
+                tick_step = 1
+            elif thread_range <= 20:
+                tick_step = 2
+            else:
+                tick_step = max(1, thread_range // 10)
+            
+            ticks = list(range(min_threads, max_threads + 1, tick_step))
+            if max_threads not in ticks:
+                ticks.append(max_threads)
+            self.ax.set_xticks(ticks)
             
             # Format Y-axis
             self.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
@@ -220,9 +360,20 @@ if __name__ == '__main__':
 
 #[test]
 fn scaling_benchmark() {
+    // Check for help flag
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return;
+    }
+
+    let fsync_schedule = parse_fsync_schedule();
+    let (start_threads, end_threads) = parse_thread_range();
+    
     println!("=== WAL Scaling Benchmark ===");
-    println!("Testing throughput scaling from 1 to 10 threads");
+    println!("Testing throughput scaling from {} to {} threads", start_threads, end_threads);
     println!("Each test runs for 30 seconds with random 500B-1KB entries");
+    println!("Fsync schedule: {:?}", fsync_schedule);
     println!();
 
     // Create the live plotting script
@@ -258,8 +409,8 @@ fn scaling_benchmark() {
 
     let mut results = Vec::new();
 
-    // Test from 1 to 10 threads
-    for num_threads in 1..=10 {
+    // Test from start_threads to end_threads
+    for num_threads in start_threads..=end_threads {
         println!("Testing with {} thread(s)...", num_threads);
         let throughput = run_benchmark_with_threads(num_threads);
         results.push((num_threads, throughput));
@@ -320,8 +471,22 @@ plt.grid(True, alpha=0.3)
 ax = plt.gca()
 ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
 
-# Set integer ticks on X-axis
-plt.xticks(range(1, 11))
+# Dynamic X-axis ticks based on data
+min_threads = df['threads'].min()
+max_threads = df['threads'].max()
+thread_range = max_threads - min_threads + 1
+
+if thread_range <= 10:
+    tick_step = 1
+elif thread_range <= 20:
+    tick_step = 2
+else:
+    tick_step = max(1, thread_range // 10)
+
+ticks = list(range(min_threads, max_threads + 1, tick_step))
+if max_threads not in ticks:
+    ticks.append(max_threads)
+plt.xticks(ticks)
 
 # Add some styling
 plt.tight_layout()

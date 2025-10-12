@@ -116,12 +116,30 @@ let wal = Walrus::with_consistency_and_schedule(
 )?;
 ```
 
+#### `FsyncSchedule::SyncEach`
+- **Behavior**: Fsync immediately after every write operation
+- **Guarantees**: Maximum durability - data is guaranteed on disk before write returns
+- **Performance**: Slowest option due to synchronous disk operations
+- **Use Case**: Critical systems requiring immediate persistence
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach  // Fsync after every write
+)?;
+```
+
 ### Environment Variables
 
 - **`WALRUS_QUIET`**: Set to any value to suppress debug output during operations
+- **`WALRUS_FSYNC`**: Configure fsync schedule for benchmarks (`sync-each`, `async`, `<number>ms`)
+- **`WALRUS_THREADS`**: Configure thread range for scaling benchmark (`<number>` or `<start-end>`)
 
 ```bash
-export WALRUS_QUIET=1  # Suppress debug messages
+export WALRUS_QUIET=1           # Suppress debug messages
+export WALRUS_FSYNC=sync-each   # Use sync-each fsync for benchmarks
+export WALRUS_THREADS=16        # Test scaling up to 16 threads
+export WALRUS_THREADS=2-8       # Test scaling from 2 to 8 threads
 ```
 
 ## File Structure and Storage
@@ -195,10 +213,11 @@ Walrus includes a comprehensive benchmarking suite to measure performance across
 - **Output**: `read_benchmark_throughput.csv`
 
 #### 3. Scaling Benchmark (`scaling_benchmark`)
-- **Thread Counts**: 1 to 10 threads (tested sequentially)
+- **Thread Counts**: 1 to 10 threads by default (configurable via `WALRUS_THREADS`)
 - **Duration**: 30 seconds per thread count
 - **Data Size**: Random entries between 500B and 1KB
 - **Configuration**: `AtLeastOnce { persist_every: 50 }`
+- **Fsync Schedule**: Configurable via `WALRUS_FSYNC` (default: async 1000ms)
 - **Output**: `scaling_results.csv` and `scaling_results_live.csv`
 
 ### Running Benchmarks
@@ -206,10 +225,26 @@ Walrus includes a comprehensive benchmarking suite to measure performance across
 #### Using Make (Recommended)
 
 ```bash
-# Run individual benchmarks
-make bench-writes      # Write benchmark
-make bench-reads       # Read benchmark  
-make bench-scaling     # Scaling benchmark
+# Run individual benchmarks (default settings)
+make bench-writes      # Write benchmark (async 1000ms fsync)
+make bench-reads       # Read benchmark (async 1000ms fsync)  
+make bench-scaling     # Scaling benchmark (1-10 threads, async 1000ms fsync)
+
+# Run with different fsync schedules
+make bench-writes-sync    # Fsync after every write (most durable, slowest)
+make bench-reads-sync     # Fsync after every write
+make bench-scaling-sync   # Fsync after every write
+
+make bench-writes-fast    # 100ms fsync interval (faster)
+make bench-reads-fast     # 100ms fsync interval
+make bench-scaling-fast   # 100ms fsync interval
+
+# Custom configurations
+FSYNC=sync-each make bench-writes           # Custom fsync schedule
+FSYNC=500ms make bench-reads               # Custom fsync interval
+THREADS=16 make bench-scaling              # Test up to 16 threads
+THREADS=2-8 make bench-scaling-sync        # Test 2-8 threads with sync-each
+FSYNC=250ms THREADS=32 make bench-scaling  # Combined custom settings
 
 # Show results
 make show-writes       # Visualize write results
@@ -227,14 +262,76 @@ make clean            # Remove CSV files
 #### Using Cargo Directly
 
 ```bash
-# Write benchmark
+# Default benchmarks
 cargo test --test multithreaded_benchmark_writes -- --nocapture
-
-# Read benchmark  
 cargo test --test multithreaded_benchmark_reads -- --nocapture
-
-# Scaling benchmark
 cargo test --test scaling_benchmark -- --nocapture
+
+# With environment variables
+WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
+WALRUS_FSYNC=500ms cargo test --test multithreaded_benchmark_reads -- --nocapture
+WALRUS_THREADS=16 cargo test --test scaling_benchmark -- --nocapture
+WALRUS_FSYNC=sync-each WALRUS_THREADS=2-8 cargo test --test scaling_benchmark -- --nocapture
+```
+
+### Benchmark Configuration Options
+
+#### Fsync Schedule Configuration
+
+Control when data is flushed to disk during benchmarks:
+
+- **`sync-each`**: Fsync after every write (slowest, most durable)
+- **`async`**: Async fsync every 1000ms (default)
+- **`<number>ms`**: Custom millisecond intervals (e.g., `100ms`, `500ms`, `2000ms`)
+- **`<number>`**: Same as above without "ms" suffix (e.g., `100`, `500`, `2000`)
+
+#### Thread Count Configuration (Scaling Benchmark Only)
+
+Configure how many threads to test in the scaling benchmark:
+
+- **`<number>`**: Test from 1 to N threads (e.g., `16` means test 1-16 threads)
+- **`<start-end>`**: Test specific range (e.g., `2-8`, `4-12`, `1-32`)
+- **Default**: `1-10` threads
+- **Maximum**: 128 threads
+
+#### Configuration Methods
+
+**Environment Variables (Recommended for Makefile):**
+```bash
+export WALRUS_FSYNC=sync-each     # Set fsync schedule
+export WALRUS_THREADS=16          # Set thread range
+```
+
+**Makefile Parameters:**
+```bash
+FSYNC=sync-each make bench-writes
+THREADS=16 make bench-scaling
+FSYNC=500ms THREADS=2-8 make bench-scaling-sync
+```
+
+**Command Line Arguments:**
+```bash
+cargo test --test scaling_benchmark -- --nocapture --fsync sync-each --threads 16
+```
+
+#### Machine-Specific Recommendations
+
+**Laptops/Small Systems:**
+```bash
+THREADS=4 make bench-scaling        # Test 1-4 threads
+THREADS=1-6 make bench-scaling-fast # Test 1-6 threads with fast fsync
+```
+
+**Workstations:**
+```bash
+THREADS=16 make bench-scaling       # Test 1-16 threads
+THREADS=2-12 make bench-scaling     # Skip single-thread test
+```
+
+**Servers/High-end Systems:**
+```bash
+THREADS=32 make bench-scaling       # Test 1-32 threads
+THREADS=4-24 make bench-scaling     # Focus on multi-thread performance
 ```
 
 ### Benchmark Data Generation
@@ -300,7 +397,7 @@ let wal = Walrus::with_consistency_and_schedule(
 ```rust
 let wal = Walrus::with_consistency_and_schedule(
     ReadConsistency::StrictlyAtOnce,
-    FsyncSchedule::Milliseconds(100)
+    FsyncSchedule::SyncEach  // Fsync after every write
 )?;
 ```
 
