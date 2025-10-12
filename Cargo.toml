@@ -22,6 +22,7 @@ exclude = [
 memmap2 = "0.9.8"
 rkyv = { version = "0.7", features = ["validation", "strict"] }
 rand = "0.8"
+libc = "0.2.177"
 
 [[test]]
 name = "multithreaded_benchmark_writes"

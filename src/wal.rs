@@ -11,6 +11,16 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+
+// Global flag to choose backend
+static USE_FD_BACKEND: AtomicBool = AtomicBool::new(false);
+
+// Public function to enable FD backend
+pub fn enable_fd_backend() {
+    USE_FD_BACKEND.store(true, Ordering::Relaxed);
+}
 
 // Macro to conditionally print debug messages
 macro_rules! debug_print {
@@ -47,8 +57,104 @@ fn checksum64(data: &[u8]) -> u64 {
     hash
 }
 
-#[derive(Clone, Debug)]
+// FD-based backend for storage
+#[derive(Debug)]
+struct FdBackend {
+    file: std::fs::File,
+    len: usize,
+}
 
+impl FdBackend {
+    fn new(path: &str, use_o_sync: bool) -> std::io::Result<Self> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        
+        #[cfg(unix)]
+        if use_o_sync {
+            opts.custom_flags(libc::O_SYNC);
+        }
+        
+        let file = opts.open(path)?;
+        let metadata = file.metadata()?;
+        let len = metadata.len() as usize;
+        
+        Ok(Self { file, len })
+    }
+    
+    fn write(&self, offset: usize, data: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        // pwrite doesn't move the file cursor
+        let _ = self.file.write_at(data, offset as u64);
+    }
+    
+    fn read(&self, offset: usize, dest: &mut [u8]) {
+        use std::os::unix::fs::FileExt;
+        // pread doesn't move the file cursor
+        let _ = self.file.read_at(dest, offset as u64);
+    }
+    
+    fn flush(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+    
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+// Storage backend abstraction
+#[derive(Debug)]
+enum StorageImpl {
+    Mmap(MmapMut),
+    Fd(FdBackend),
+}
+
+impl StorageImpl {
+    fn write(&self, offset: usize, data: &[u8]) {
+        match self {
+            StorageImpl::Mmap(mmap) => {
+                debug_assert!(offset <= mmap.len());
+                debug_assert!(mmap.len() - offset >= data.len());
+                unsafe {
+                    let ptr = mmap.as_ptr() as *mut u8;
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+                }
+            }
+            StorageImpl::Fd(fd) => {
+                fd.write(offset, data);
+            }
+        }
+    }
+    
+    fn read(&self, offset: usize, dest: &mut [u8]) {
+        match self {
+            StorageImpl::Mmap(mmap) => {
+                debug_assert!(offset + dest.len() <= mmap.len());
+                let src = &mmap[offset..offset + dest.len()];
+                dest.copy_from_slice(src);
+            }
+            StorageImpl::Fd(fd) => {
+                fd.read(offset, dest);
+            }
+        }
+    }
+    
+    fn flush(&self) -> std::io::Result<()> {
+        match self {
+            StorageImpl::Mmap(mmap) => mmap.flush(),
+            StorageImpl::Fd(fd) => fd.flush(),
+        }
+    }
+    
+    fn len(&self) -> usize {
+        match self {
+            StorageImpl::Mmap(mmap) => mmap.len(),
+            StorageImpl::Fd(fd) => fd.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub data: Vec<u8>,
 }
@@ -442,48 +548,56 @@ impl Writer {
 
 #[derive(Debug)]
 struct SharedMmap {
-    mmap: MmapMut,
+    storage: StorageImpl,
     last_touched_at: AtomicU64,
 }
 
 // SAFETY: `SharedMmap` provides interior mutability only via methods that
 // enforce bounds and perform atomic timestamp updates; the underlying
-// `MmapMut` supports concurrent reads and explicit flushes.
+// storage supports concurrent reads and explicit flushes.
 unsafe impl Sync for SharedMmap {}
-// SAFETY: The struct holds an `MmapMut` which is safe to move between threads;
+// SAFETY: The struct holds storage that is safe to move between threads;
 // timestamps are atomics, so sending is sound.
 unsafe impl Send for SharedMmap {}
 
+// Store the fsync schedule globally for SharedMmap::new to access
+static GLOBAL_FSYNC_SCHEDULE: OnceLock<FsyncSchedule> = OnceLock::new();
+
 impl SharedMmap {
     pub fn new(path: &str) -> std::io::Result<Arc<Self>> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        // SAFETY: `file` is opened read/write and lives for the duration of this
-        // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let storage = if USE_FD_BACKEND.load(Ordering::Relaxed) {
+            // Check if we should use O_SYNC
+            let use_o_sync = GLOBAL_FSYNC_SCHEDULE
+                .get()
+                .map(|s| matches!(s, FsyncSchedule::SyncEach))
+                .unwrap_or(false);
+            
+            StorageImpl::Fd(FdBackend::new(path, use_o_sync)?)
+        } else {
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            // SAFETY: `file` is opened read/write and lives for the duration of this
+            // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            StorageImpl::Mmap(mmap)
+        };
+        
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             .as_millis() as u64;
         Ok(Arc::new(Self {
-            mmap,
+            storage,
             last_touched_at: AtomicU64::new(now_ms),
         }))
     }
 
     pub fn write(&self, offset: usize, data: &[u8]) {
         // Bounds check before raw copy to maintain memory safety
-        debug_assert!(offset <= self.mmap.len());
-        debug_assert!(self.mmap.len() - offset >= data.len());
-        // SAFETY: We validated that the destination range [offset, offset+len)
-        // is within the mmap and does not overlap `data`. The pointer is valid
-        // for writes for the size of `data.len()` bytes and due to non overlapping
-        // block segments served by BlockAllocator, we guarantee that no two writers
-        // would step over each other's toes
-        unsafe {
-            let ptr = self.mmap.as_ptr() as *mut u8; // Get pointer when needed
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-        }
+        debug_assert!(offset <= self.storage.len());
+        debug_assert!(self.storage.len() - offset >= data.len());
+        
+        self.storage.write(offset, data);
+        
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
@@ -492,17 +606,16 @@ impl SharedMmap {
     }
 
     pub fn read(&self, offset: usize, dest: &mut [u8]) {
-        debug_assert!(offset + dest.len() <= self.mmap.len());
-        let src = &self.mmap[offset..offset + dest.len()];
-        dest.copy_from_slice(src);
+        debug_assert!(offset + dest.len() <= self.storage.len());
+        self.storage.read(offset, dest);
     }
 
     pub fn len(&self) -> usize {
-        self.mmap.len()
+        self.storage.len()
     }
 
     pub fn flush(&self) -> std::io::Result<()> {
-        self.mmap.flush()
+        self.storage.flush()
     }
 }
 
@@ -762,6 +875,10 @@ impl Walrus {
         fsync_schedule: FsyncSchedule,
     ) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
+        
+        // Store the fsync schedule globally for SharedMmap::new to access
+        let _ = GLOBAL_FSYNC_SCHEDULE.set(fsync_schedule);
+        
         let allocator = Arc::new(BlockAllocator::new()?);
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
@@ -769,11 +886,11 @@ impl Walrus {
         let (del_tx, del_rx) = mpsc::channel::<String>();
         let del_tx_arc = Arc::new(del_tx);
         let _ = DELETION_TX.set(del_tx_arc.clone());
-        let pool: HashMap<String, MmapMut> = HashMap::new();
+        let pool: HashMap<String, StorageImpl> = HashMap::new();
         let tick = Arc::new(AtomicU64::new(0));
         let sleep_millis = match fsync_schedule {
             FsyncSchedule::Milliseconds(ms) => ms.max(1),
-            FsyncSchedule::SyncEach => 1000, // Still run background thread for cleanup, but less frequently
+            FsyncSchedule::SyncEach => 5000, // need to still run so that tickers work
         };
         // background flusher
         thread::spawn(move || {
@@ -798,36 +915,59 @@ impl Walrus {
                     }
 
                     if !pool.contains_key(&path) {
-                        match OpenOptions::new().read(true).write(true).open(&path) {
-                            Ok(file) => {
-                                // SAFETY: The file is opened read/write and lives at least until
-                                // the created mapping is inserted into `pool`, which owns it.
-                                match unsafe { MmapMut::map_mut(&file) } {
-                                    Ok(mmap) => {
-                                        pool.insert(path.clone(), mmap);
-                                    }
-                                    Err(e) => {
-                                        debug_print!(
-                                            "[flush] failed to create memory map for {}: {}",
-                                            path,
-                                            e
-                                        );
-                                        continue;
-                                    }
+                        if USE_FD_BACKEND.load(Ordering::Relaxed) {
+                            // FD backend path
+                            let use_o_sync = GLOBAL_FSYNC_SCHEDULE
+                                .get()
+                                .map(|s| matches!(s, FsyncSchedule::SyncEach))
+                                .unwrap_or(false);
+                            
+                            match FdBackend::new(&path, use_o_sync) {
+                                Ok(fd) => {
+                                    pool.insert(path.clone(), StorageImpl::Fd(fd));
+                                }
+                                Err(e) => {
+                                    debug_print!(
+                                        "[flush] failed to create FD backend for {}: {}",
+                                        path,
+                                        e
+                                    );
+                                    continue;
                                 }
                             }
-                            Err(e) => {
-                                debug_print!(
-                                    "[flush] failed to open file for flushing {}: {}",
-                                    path,
-                                    e
-                                );
-                                continue;
+                        } else {
+                            // Mmap backend path
+                            match OpenOptions::new().read(true).write(true).open(&path) {
+                                Ok(file) => {
+                                    // SAFETY: The file is opened read/write and lives at least until
+                                    // the created mapping is inserted into `pool`, which owns it.
+                                    match unsafe { MmapMut::map_mut(&file) } {
+                                        Ok(mmap) => {
+                                            pool.insert(path.clone(), StorageImpl::Mmap(mmap));
+                                        }
+                                        Err(e) => {
+                                            debug_print!(
+                                                "[flush] failed to create memory map for {}: {}",
+                                                path,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug_print!(
+                                        "[flush] failed to open file for flushing {}: {}",
+                                        path,
+                                        e
+                                    );
+                                    continue;
+                                }
                             }
                         }
                     }
-                    if let Some(mmap) = pool.get_mut(&path) {
-                        if let Err(e) = mmap.flush() {
+                    if let Some(storage) = pool.get_mut(&path) {
+                        if let Err(e) = storage.flush() {
                             debug_print!("[flush] flush error for {}: {}", path, e);
                         }
                     }
@@ -844,7 +984,7 @@ impl Walrus {
                         .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
-                        let mut empty: HashMap<String, MmapMut> = HashMap::new();
+                        let mut empty: HashMap<String, StorageImpl> = HashMap::new();
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
                         // perform batched deletions now that mmaps are dropped
                         for path in delete_pending.drain() {
@@ -1371,7 +1511,6 @@ impl Walrus {
         Ok(())
     }
 }
-
 static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();
 
 fn flush_check(file_path: String) {
