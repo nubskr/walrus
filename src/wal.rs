@@ -904,7 +904,7 @@ impl Walrus {
             let mut delete_pending = std::collections::HashSet::new();
 
             // Create io_uring instance for batched fsync (only used with FD backend)
-            let mut ring = IoUring::new(2048).expect("Failed to create io_uring");
+            let mut ring = io_uring::IoUring::new(2048).expect("Failed to create io_uring");
 
             loop {
                 thread::sleep(Duration::from_millis(sleep_millis));
@@ -985,7 +985,7 @@ impl Walrus {
 
                     for path in unique.iter() {
                         if let Some(StorageImpl::Fd(fd_backend)) = pool.get(path) {
-                            let raw_fd = fd_backend.as_raw_fd();
+                            let raw_fd = fd_backend.file.as_raw_fd();
                             fsync_batch.push((raw_fd, path.clone()));
                         }
                     }
@@ -995,9 +995,9 @@ impl Walrus {
 
                         // Push all fsync operations to submission queue
                         for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
-                            let fd = types::Fd(*raw_fd);
+                            let fd = io_uring::types::Fd(*raw_fd);
 
-                            let fsync_op = opcode::Fsync::new(fd).build().user_data(i as u64);
+                            let fsync_op = io_uringopcode::Fsync::new(fd).build().user_data(i as u64);
 
                             unsafe {
                                 if ring.submission().push(&fsync_op).is_err() {
