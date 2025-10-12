@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 // Global flag to choose backend
-static USE_FD_BACKEND: AtomicBool = AtomicBool::new(false);
+static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
 
 // Public function to enable FD backend
 pub fn enable_fd_backend() {
