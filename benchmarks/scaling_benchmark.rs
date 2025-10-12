@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus_rust::wal::{Walrus, FsyncSchedule, ReadConsistency};
+use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
 fn parse_thread_range() -> (usize, usize) {
     // Check environment variable first (for Makefile integration)
@@ -26,15 +26,16 @@ fn parse_thread_range() -> (usize, usize) {
             }
         }
     }
-    
+
     // Check command line arguments (for direct cargo test usage)
     let args: Vec<String> = env::args().collect();
-    
+
     for i in 0..args.len() {
         if args[i] == "--threads" && i + 1 < args.len() {
             let threads_arg = &args[i + 1];
             if let Some((start_str, end_str)) = threads_arg.split_once('-') {
-                if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>())
+                {
                     if start > 0 && end >= start && end <= 128 {
                         return (start, end);
                     }
@@ -46,7 +47,7 @@ fn parse_thread_range() -> (usize, usize) {
             }
         }
     }
-    
+
     // Default: test 1 to 10 threads
     (1, 10)
 }
@@ -58,7 +59,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             "sync-each" => return FsyncSchedule::SyncEach,
             "async" => return FsyncSchedule::Milliseconds(1000),
             ms_str if ms_str.ends_with("ms") => {
-                if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
                     return FsyncSchedule::Milliseconds(ms);
                 }
             }
@@ -69,17 +70,17 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             }
         }
     }
-    
+
     // Check command line arguments (for direct cargo test usage)
     let args: Vec<String> = env::args().collect();
-    
+
     for i in 0..args.len() {
         if args[i] == "--fsync" && i + 1 < args.len() {
             match args[i + 1].as_str() {
                 "sync-each" => return FsyncSchedule::SyncEach,
                 "async" => return FsyncSchedule::Milliseconds(1000),
                 ms_str if ms_str.ends_with("ms") => {
-                    if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                    if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
                         return FsyncSchedule::Milliseconds(ms);
                     }
                 }
@@ -91,7 +92,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             }
         }
     }
-    
+
     // Default to async (1000ms)
     FsyncSchedule::Milliseconds(1000)
 }
@@ -156,8 +157,9 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
             ReadConsistency::AtLeastOnce { persist_every: 50 },
-            fsync_schedule
-        ).expect("Failed to create Walrus"),
+            fsync_schedule,
+        )
+        .expect("Failed to create Walrus"),
     );
     let test_duration = Duration::from_secs(30); // 30 seconds per test
 
@@ -369,9 +371,12 @@ fn scaling_benchmark() {
 
     let fsync_schedule = parse_fsync_schedule();
     let (start_threads, end_threads) = parse_thread_range();
-    
+
     println!("=== WAL Scaling Benchmark ===");
-    println!("Testing throughput scaling from {} to {} threads", start_threads, end_threads);
+    println!(
+        "Testing throughput scaling from {} to {} threads",
+        start_threads, end_threads
+    );
     println!("Each test runs for 30 seconds with random 500B-1KB entries");
     println!("Fsync schedule: {:?}", fsync_schedule);
     println!();

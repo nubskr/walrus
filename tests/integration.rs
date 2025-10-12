@@ -2,8 +2,8 @@ use std::fs;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use walrus_rust::wal::Walrus;
 use walrus_rust::ReadConsistency;
+use walrus_rust::wal::Walrus;
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");

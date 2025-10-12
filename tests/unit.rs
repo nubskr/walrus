@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use walrus_rust::wal::{Entry, WalIndex, Walrus};
 use walrus_rust::ReadConsistency;
+use walrus_rust::wal::{Entry, WalIndex, Walrus};
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");

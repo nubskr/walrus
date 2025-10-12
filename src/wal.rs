@@ -4,6 +4,8 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -11,8 +13,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 
 // Global flag to choose backend
 static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
@@ -68,35 +68,35 @@ impl FdBackend {
     fn new(path: &str, use_o_sync: bool) -> std::io::Result<Self> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
-        
+
         #[cfg(unix)]
         if use_o_sync {
             opts.custom_flags(libc::O_SYNC);
         }
-        
+
         let file = opts.open(path)?;
         let metadata = file.metadata()?;
         let len = metadata.len() as usize;
-        
+
         Ok(Self { file, len })
     }
-    
+
     fn write(&self, offset: usize, data: &[u8]) {
         use std::os::unix::fs::FileExt;
         // pwrite doesn't move the file cursor
         let _ = self.file.write_at(data, offset as u64);
     }
-    
+
     fn read(&self, offset: usize, dest: &mut [u8]) {
         use std::os::unix::fs::FileExt;
         // pread doesn't move the file cursor
         let _ = self.file.read_at(dest, offset as u64);
     }
-    
+
     fn flush(&self) -> std::io::Result<()> {
         self.file.sync_all()
     }
-    
+
     fn len(&self) -> usize {
         self.len
     }
@@ -125,7 +125,7 @@ impl StorageImpl {
             }
         }
     }
-    
+
     fn read(&self, offset: usize, dest: &mut [u8]) {
         match self {
             StorageImpl::Mmap(mmap) => {
@@ -138,14 +138,14 @@ impl StorageImpl {
             }
         }
     }
-    
+
     fn flush(&self) -> std::io::Result<()> {
         match self {
             StorageImpl::Mmap(mmap) => mmap.flush(),
             StorageImpl::Fd(fd) => fd.flush(),
         }
     }
-    
+
     fn len(&self) -> usize {
         match self {
             StorageImpl::Mmap(mmap) => mmap.len(),
@@ -424,7 +424,7 @@ impl BlockAllocator {
     }
 
     /*
-    the critical section of this call would be absolutely tiny given the exception of when a new file is being created, but it'll be amortized and in the majority of the scenario it would be a handful of microseconds and the overhead of a syscall isnt worth it, a hundred or two cycles are nothing in the grand scheme of things 
+    the critical section of this call would be absolutely tiny given the exception of when a new file is being created, but it'll be amortized and in the majority of the scenario it would be a handful of microseconds and the overhead of a syscall isnt worth it, a hundred or two cycles are nothing in the grand scheme of things
     */
     fn lock(&self) {
         // Spin lock implementation
@@ -528,20 +528,24 @@ impl Writer {
             *cur + need
         );
         *cur += need;
-        
+
         // Handle fsync based on schedule
         match self.fsync_schedule {
             FsyncSchedule::SyncEach => {
                 // Immediate mmap flush, skip background flusher
                 block.mmap.flush()?;
-                debug_print!("[writer] immediate fsync: col={}, block_id={}", self.col, block.id);
+                debug_print!(
+                    "[writer] immediate fsync: col={}, block_id={}",
+                    self.col,
+                    block.id
+                );
             }
             FsyncSchedule::Milliseconds(_) => {
                 // Send to background flusher
                 let _ = self.publisher.send(block.file_path.clone());
             }
         }
-        
+
         Ok(())
     }
 }
@@ -571,7 +575,7 @@ impl SharedMmap {
                 .get()
                 .map(|s| matches!(s, FsyncSchedule::SyncEach))
                 .unwrap_or(false);
-            
+
             StorageImpl::Fd(FdBackend::new(path, use_o_sync)?)
         } else {
             let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -580,7 +584,7 @@ impl SharedMmap {
             let mmap = unsafe { MmapMut::map_mut(&file)? };
             StorageImpl::Mmap(mmap)
         };
-        
+
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
@@ -595,9 +599,9 @@ impl SharedMmap {
         // Bounds check before raw copy to maintain memory safety
         debug_assert!(offset <= self.storage.len());
         debug_assert!(self.storage.len() - offset >= data.len());
-        
+
         self.storage.write(offset, data);
-        
+
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
@@ -875,10 +879,10 @@ impl Walrus {
         fsync_schedule: FsyncSchedule,
     ) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
-        
+
         // Store the fsync schedule globally for SharedMmap::new to access
         let _ = GLOBAL_FSYNC_SCHEDULE.set(fsync_schedule);
-        
+
         let allocator = Arc::new(BlockAllocator::new()?);
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
@@ -898,30 +902,39 @@ impl Walrus {
             let tick = tick;
             let del_rx = del_rx;
             let mut delete_pending = std::collections::HashSet::new();
+
+            // Create io_uring instance for batched fsync (only used with FD backend)
+            let mut ring = IoUring::new(2048).expect("Failed to create io_uring");
+
             loop {
                 thread::sleep(Duration::from_millis(sleep_millis));
+
+                // Phase 1: Collect unique paths to flush
                 let mut unique = std::collections::HashSet::new();
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
                 }
+
                 if !unique.is_empty() {
                     debug_print!("[flush] scheduling {} paths", unique.len());
                 }
-                for path in unique.into_iter() {
+
+                // Phase 2: Open/map files if needed
+                for path in unique.iter() {
                     // Skip if file doesn't exist
                     if !std::path::Path::new(&path).exists() {
                         debug_print!("[flush] file does not exist, skipping: {}", path);
                         continue;
                     }
 
-                    if !pool.contains_key(&path) {
+                    if !pool.contains_key(path) {
                         if USE_FD_BACKEND.load(Ordering::Relaxed) {
                             // FD backend path
                             let use_o_sync = GLOBAL_FSYNC_SCHEDULE
                                 .get()
                                 .map(|s| matches!(s, FsyncSchedule::SyncEach))
                                 .unwrap_or(false);
-                            
+
                             match FdBackend::new(&path, use_o_sync) {
                                 Ok(fd) => {
                                     pool.insert(path.clone(), StorageImpl::Fd(fd));
@@ -932,11 +945,10 @@ impl Walrus {
                                         path,
                                         e
                                     );
-                                    continue;
                                 }
                             }
                         } else {
-                            // Mmap backend path
+                            // Mmap backend path (unchanged)
                             match OpenOptions::new().read(true).write(true).open(&path) {
                                 Ok(file) => {
                                     // SAFETY: The file is opened read/write and lives at least until
@@ -951,7 +963,6 @@ impl Walrus {
                                                 path,
                                                 e
                                             );
-                                            continue;
                                         }
                                     }
                                 }
@@ -961,22 +972,92 @@ impl Walrus {
                                         path,
                                         e
                                     );
-                                    continue;
                                 }
                             }
                         }
                     }
-                    if let Some(storage) = pool.get_mut(&path) {
-                        if let Err(e) = storage.flush() {
-                            debug_print!("[flush] flush error for {}: {}", path, e);
+                }
+
+                // Phase 3: Flush operations
+                if USE_FD_BACKEND.load(Ordering::Relaxed) {
+                    // FD backend: Use io_uring for batched fsync
+                    let mut fsync_batch = Vec::new();
+
+                    for path in unique.iter() {
+                        if let Some(StorageImpl::Fd(fd_backend)) = pool.get(path) {
+                            let raw_fd = fd_backend.as_raw_fd();
+                            fsync_batch.push((raw_fd, path.clone()));
+                        }
+                    }
+
+                    if !fsync_batch.is_empty() {
+                        debug_print!("[flush] batching {} fsync operations", fsync_batch.len());
+
+                        // Push all fsync operations to submission queue
+                        for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
+                            let fd = types::Fd(*raw_fd);
+
+                            let fsync_op = opcode::Fsync::new(fd).build().user_data(i as u64);
+
+                            unsafe {
+                                if ring.submission().push(&fsync_op).is_err() {
+                                    // Submission queue full, submit current batch
+                                    ring.submit().expect("Failed to submit fsync batch");
+                                    ring.submission()
+                                        .push(&fsync_op)
+                                        .expect("Failed to push fsync op");
+                                }
+                            }
+                        }
+
+                        // Single syscall to submit all fsync operations!
+                        match ring.submit_and_wait(fsync_batch.len()) {
+                            Ok(submitted) => {
+                                debug_print!(
+                                    "[flush] submitted {} fsync ops in one syscall",
+                                    submitted
+                                );
+                            }
+                            Err(e) => {
+                                debug_print!("[flush] failed to submit fsync batch: {}", e);
+                            }
+                        }
+
+                        // Process completions
+                        for _ in 0..fsync_batch.len() {
+                            if let Some(cqe) = ring.completion().next() {
+                                let idx = cqe.user_data() as usize;
+                                let result = cqe.result();
+
+                                if result < 0 {
+                                    let (_fd, path) = &fsync_batch[idx];
+                                    debug_print!(
+                                        "[flush] fsync error for {}: error code {}",
+                                        path,
+                                        result
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Mmap backend: Use existing storage.flush() method
+                    for path in unique.iter() {
+                        if let Some(storage) = pool.get_mut(path) {
+                            if let Err(e) = storage.flush() {
+                                debug_print!("[flush] flush error for {}: {}", path, e);
+                            }
                         }
                     }
                 }
-                // collect deletion requests
+
+                // Phase 4: Handle deletion requests
                 while let Ok(path) = del_rx.try_recv() {
                     debug_print!("[reclaim] deletion requested: {}", path);
                     delete_pending.insert(path);
                 }
+
+                // Phase 5: Periodic cleanup
                 let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
                 if n >= 1000 {
                     // WARN: we clean up once every 1000 times the fsync runs
@@ -986,7 +1067,8 @@ impl Walrus {
                     {
                         let mut empty: HashMap<String, StorageImpl> = HashMap::new();
                         std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
-                        // perform batched deletions now that mmaps are dropped
+
+                        // Perform batched deletions now that mmaps/fds are dropped
                         for path in delete_pending.drain() {
                             match fs::remove_file(&path) {
                                 Ok(_) => debug_print!("[reclaim] deleted file {}", path),
@@ -999,6 +1081,7 @@ impl Walrus {
                 }
             }
         });
+
         let idx = WalIndex::new("read_offset_idx")?;
         let instance = Walrus {
             allocator,

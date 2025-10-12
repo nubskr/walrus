@@ -1,6 +1,6 @@
 //! # Walrus 🦭
 //!
-//! A high-performance Write-Ahead Log (WAL) implementation in Rust designed for concurrent 
+//! A high-performance Write-Ahead Log (WAL) implementation in Rust designed for concurrent
 //! workloads
 //!
 //! ## Quick Start
@@ -50,4 +50,4 @@
 
 #![recursion_limit = "256"]
 pub mod wal;
-pub use wal::{Entry, ReadConsistency, FsyncSchedule, Walrus};
+pub use wal::{Entry, FsyncSchedule, ReadConsistency, Walrus};

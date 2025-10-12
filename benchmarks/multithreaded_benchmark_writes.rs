@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use walrus_rust::wal::{Walrus, FsyncSchedule, ReadConsistency};
+use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
 fn parse_fsync_schedule() -> FsyncSchedule {
     // Check environment variable first (for Makefile integration)
@@ -16,7 +16,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             "sync-each" => return FsyncSchedule::SyncEach,
             "async" => return FsyncSchedule::Milliseconds(1000),
             ms_str if ms_str.ends_with("ms") => {
-                if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
                     return FsyncSchedule::Milliseconds(ms);
                 }
             }
@@ -27,17 +27,17 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             }
         }
     }
-    
+
     // Check command line arguments (for direct cargo test usage)
     let args: Vec<String> = env::args().collect();
-    
+
     for i in 0..args.len() {
         if args[i] == "--fsync" && i + 1 < args.len() {
             match args[i + 1].as_str() {
                 "sync-each" => return FsyncSchedule::SyncEach,
                 "async" => return FsyncSchedule::Milliseconds(1000),
                 ms_str if ms_str.ends_with("ms") => {
-                    if let Ok(ms) = ms_str[..ms_str.len()-2].parse::<u64>() {
+                    if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
                         return FsyncSchedule::Milliseconds(ms);
                     }
                 }
@@ -49,7 +49,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
             }
         }
     }
-    
+
     // Default to async (1000ms)
     FsyncSchedule::Milliseconds(1000)
 }
@@ -106,8 +106,9 @@ fn multithreaded_benchmark() {
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
             ReadConsistency::AtLeastOnce { persist_every: 50 },
-            fsync_schedule
-        ).expect("Failed to create Walrus"),
+            fsync_schedule,
+        )
+        .expect("Failed to create Walrus"),
     );
     let num_threads = 10;
     let write_duration = Duration::from_secs(120); // 2 minutes

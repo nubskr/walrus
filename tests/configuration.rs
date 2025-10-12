@@ -86,27 +86,26 @@ fn test_fsync_schedule_sync_each() {
         FsyncSchedule::SyncEach,
     )
     .unwrap();
-    
+
     // Test that SyncEach mode works correctly
     wal.append_for_topic("sync_each_test", b"msg1").unwrap();
     wal.append_for_topic("sync_each_test", b"msg2").unwrap();
     wal.append_for_topic("sync_each_test", b"msg3").unwrap();
-    
+
     let entry1 = wal.read_next("sync_each_test").unwrap().unwrap();
     assert_eq!(entry1.data, b"msg1");
-    
+
     let entry2 = wal.read_next("sync_each_test").unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
-    
+
     let entry3 = wal.read_next("sync_each_test").unwrap().unwrap();
     assert_eq!(entry3.data, b"msg3");
-    
+
     // Verify no more entries
     assert!(wal.read_next("sync_each_test").unwrap().is_none());
-    
+
     cleanup_wal();
 }
-
 
 #[test]
 fn test_constructors() {
