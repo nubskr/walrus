@@ -544,6 +544,10 @@ impl Writer {
                 // Send to background flusher
                 let _ = self.publisher.send(block.file_path.clone());
             }
+            FsyncSchedule::NoFsync => {
+                // No fsyncing at all - maximum throughput, no durability guarantees
+                debug_print!("[writer] no fsync: col={}, block_id={}", self.col, block.id);
+            }
         }
 
         Ok(())
@@ -853,6 +857,7 @@ pub enum ReadConsistency {
 pub enum FsyncSchedule {
     Milliseconds(u64),
     SyncEach, // fsync after every single entry
+    NoFsync,  // disable fsyncing entirely (maximum throughput, no durability)
 }
 
 pub struct Walrus {
@@ -894,7 +899,8 @@ impl Walrus {
         let tick = Arc::new(AtomicU64::new(0));
         let sleep_millis = match fsync_schedule {
             FsyncSchedule::Milliseconds(ms) => ms.max(1),
-            FsyncSchedule::SyncEach => 5000, // need to still run so that tickers work
+            FsyncSchedule::SyncEach => 5000, // Still run background thread for cleanup, but less frequently
+            FsyncSchedule::NoFsync => 10000, // Even less frequent cleanup when no fsyncing
         };
         // background flusher
         thread::spawn(move || {

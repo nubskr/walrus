@@ -57,6 +57,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
     if let Ok(fsync_env) = env::var("WALRUS_FSYNC") {
         match fsync_env.as_str() {
             "sync-each" => return FsyncSchedule::SyncEach,
+            "no-fsync" | "none" => return FsyncSchedule::NoFsync,
             "async" => return FsyncSchedule::Milliseconds(1000),
             ms_str if ms_str.ends_with("ms") => {
                 if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
@@ -78,6 +79,7 @@ fn parse_fsync_schedule() -> FsyncSchedule {
         if args[i] == "--fsync" && i + 1 < args.len() {
             match args[i + 1].as_str() {
                 "sync-each" => return FsyncSchedule::SyncEach,
+                "no-fsync" | "none" => return FsyncSchedule::NoFsync,
                 "async" => return FsyncSchedule::Milliseconds(1000),
                 ms_str if ms_str.ends_with("ms") => {
                     if let Ok(ms) = ms_str[..ms_str.len() - 2].parse::<u64>() {
@@ -103,6 +105,8 @@ fn print_usage() {
     println!();
     println!("Fsync Schedule Options:");
     println!("  sync-each    Fsync after every write (slowest, most durable)");
+    println!("  no-fsync     Disable fsyncing entirely (fastest, no durability)");
+    println!("  none         Same as no-fsync");
     println!("  async        Async fsync every 1000ms (default)");
     println!("  <number>ms   Async fsync every N milliseconds (e.g., 500ms)");
     println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
@@ -114,6 +118,7 @@ fn print_usage() {
     println!();
     println!("Examples:");
     println!("  WALRUS_FSYNC=sync-each WALRUS_THREADS=16 cargo test scaling_benchmark");
+    println!("  WALRUS_FSYNC=no-fsync WALRUS_THREADS=32 cargo test scaling_benchmark");
     println!("  WALRUS_THREADS=2-8 cargo test scaling_benchmark");
     println!("  make bench-scaling-sync  # Uses Makefile convenience targets");
     println!("  THREADS=32 make bench-scaling  # Test up to 32 threads");
