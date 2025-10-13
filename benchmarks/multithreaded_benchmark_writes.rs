@@ -260,7 +260,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, {:.0}s write phase only", write_duration.as_secs());
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Duration: {:?} (15% ramp-up period)", write_duration);
+    println!("Duration: {:?} (500k entry batches, 50ms delays)", write_duration);
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -440,50 +440,42 @@ fn multithreaded_benchmark() {
             let mut local_errors = 0u64;
             let mut counter = 0u64;
 
-            // Write phase - start slow and ramp up to simulate realistic workload
+            // Write phase - batch-based writes with delays between batches
             let mut rng = rand::thread_rng();
-            let ramp_up_duration = write_duration.mul_f64(0.15); // 15% of total duration for ramp-up
+            let batch_size = 500_000; // 500k entries per batch
+            let batch_delay = Duration::from_millis(50); // 50ms delay between batches
 
             while start_time.elapsed() < write_duration {
-                // Calculate current write rate based on ramp-up
-                let elapsed = start_time.elapsed();
-                let delay_ms = if elapsed < ramp_up_duration {
-                    // Ramp up from 50ms delay to 0ms delay over ramp_up_duration
-                    let ramp_progress = elapsed.as_secs_f64() / ramp_up_duration.as_secs_f64();
-                    let max_delay_ms = 50.0;
-                    max_delay_ms * (1.0 - ramp_progress)
-                } else {
-                    // Full speed after ramp-up
-                    0.0
-                };
+                // Write a batch of entries as fast as possible
+                for _ in 0..batch_size {
+                    // Check if we've exceeded the duration during the batch
+                    if start_time.elapsed() >= write_duration {
+                        break;
+                    }
 
-                // Apply the delay if we're still ramping up
-                if delay_ms > 0.1 {
-                    thread::sleep(Duration::from_millis(delay_ms as u64));
+                    // Random entry size between 500B and 1KB
+                    let size = rng.gen_range(500..=1024);
+                    let data = vec![(counter % 256) as u8; size];
+
+                    match wal_clone.append_for_topic(&topic, &data) {
+                        Ok(_) => {
+                            local_writes += 1;
+                            local_write_bytes += data.len() as u64;
+                            // Update global counters in real-time so the monitor sees progress
+                            total_writes_clone.fetch_add(1, Ordering::Relaxed);
+                            total_write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            local_errors += 1;
+                        }
+                    }
+
+                    counter += 1;
                 }
 
-                // Random entry size between 500B and 1KB
-                let size = rng.gen_range(500..=1024);
-                let data = vec![(counter % 256) as u8; size];
-
-                match wal_clone.append_for_topic(&topic, &data) {
-                    Ok(_) => {
-                        local_writes += 1;
-                        local_write_bytes += data.len() as u64;
-                        // Update global counters in real-time so the monitor sees progress
-                        total_writes_clone.fetch_add(1, Ordering::Relaxed);
-                        total_write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        local_errors += 1;
-                    }
-                }
-
-                counter += 1;
-
-                // Small gap after every 100k writes (50μs) - reduced frequency
-                if counter % 100000 == 0 {
-                    thread::sleep(Duration::from_micros(50));
+                // Delay between batches (unless we've exceeded duration)
+                if start_time.elapsed() < write_duration {
+                    thread::sleep(batch_delay);
                 }
             }
 
