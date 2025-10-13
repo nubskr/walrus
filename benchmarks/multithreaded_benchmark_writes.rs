@@ -260,7 +260,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, {:.0}s write phase only", write_duration.as_secs());
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Duration: {:?} (batch ramp-up: 200k→300k→400k→500k, 50ms delays)", write_duration);
+    println!("Duration: {:?} (batch ramp-up: 50k→100k→150k...→500k, 50ms delays)", write_duration);
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -446,12 +446,18 @@ fn multithreaded_benchmark() {
             let mut batch_number = 0;
 
             while start_time.elapsed() < write_duration {
-                // Determine batch size based on ramp-up sequence
+                // Determine batch size based on gradual ramp-up sequence
                 let current_batch_size = match batch_number {
-                    0 => 200_000, // First batch: 200k entries
-                    1 => 300_000, // Second batch: 300k entries  
-                    2 => 400_000, // Third batch: 400k entries
-                    _ => 500_000, // All subsequent batches: 500k entries
+                    0 => 50_000,   // Batch 1: 50k entries
+                    1 => 100_000,  // Batch 2: 100k entries
+                    2 => 150_000,  // Batch 3: 150k entries
+                    3 => 200_000,  // Batch 4: 200k entries
+                    4 => 250_000,  // Batch 5: 250k entries
+                    5 => 300_000,  // Batch 6: 300k entries
+                    6 => 350_000,  // Batch 7: 350k entries
+                    7 => 400_000,  // Batch 8: 400k entries
+                    8 => 450_000,  // Batch 9: 450k entries
+                    _ => 500_000,  // Batch 10+: 500k entries (steady state)
                 };
 
                 // Write a batch of entries as fast as possible
