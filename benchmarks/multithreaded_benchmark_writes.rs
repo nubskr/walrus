@@ -260,7 +260,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, {:.0}s write phase only", write_duration.as_secs());
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Duration: {:?} (batch ramp-up: 50k→100k→150k...→500k, 50ms delays)", write_duration);
+    println!("Duration: {:?} (batch ramp-up: 50k→100k→150k...→500k, 100ms delays)", write_duration);
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -442,7 +442,7 @@ fn multithreaded_benchmark() {
 
             // Write phase - batch-based writes with ramp-up and delays between batches
             let mut rng = rand::thread_rng();
-            let batch_delay = Duration::from_millis(50); // 50ms delay between batches
+            let batch_delay = Duration::from_millis(100); // 100ms delay between batches
             let mut batch_number = 0;
 
             while start_time.elapsed() < write_duration {
