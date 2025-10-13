@@ -260,7 +260,7 @@ fn multithreaded_benchmark() {
     println!("=== Multi-threaded WAL Benchmark ===");
     println!("Configuration: 10 threads, {:.0}s write phase only", write_duration.as_secs());
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Duration: {:?} (500k entry batches, 50ms delays)", write_duration);
+    println!("Duration: {:?} (batch ramp-up: 200k→300k→400k→500k, 50ms delays)", write_duration);
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -440,14 +440,22 @@ fn multithreaded_benchmark() {
             let mut local_errors = 0u64;
             let mut counter = 0u64;
 
-            // Write phase - batch-based writes with delays between batches
+            // Write phase - batch-based writes with ramp-up and delays between batches
             let mut rng = rand::thread_rng();
-            let batch_size = 500_000; // 500k entries per batch
             let batch_delay = Duration::from_millis(50); // 50ms delay between batches
+            let mut batch_number = 0;
 
             while start_time.elapsed() < write_duration {
+                // Determine batch size based on ramp-up sequence
+                let current_batch_size = match batch_number {
+                    0 => 200_000, // First batch: 200k entries
+                    1 => 300_000, // Second batch: 300k entries  
+                    2 => 400_000, // Third batch: 400k entries
+                    _ => 500_000, // All subsequent batches: 500k entries
+                };
+
                 // Write a batch of entries as fast as possible
-                for _ in 0..batch_size {
+                for _ in 0..current_batch_size {
                     // Check if we've exceeded the duration during the batch
                     if start_time.elapsed() >= write_duration {
                         break;
@@ -472,6 +480,9 @@ fn multithreaded_benchmark() {
 
                     counter += 1;
                 }
+
+                // Increment batch number for next iteration
+                batch_number += 1;
 
                 // Delay between batches (unless we've exceeded duration)
                 if start_time.elapsed() < write_duration {
