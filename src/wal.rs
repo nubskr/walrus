@@ -876,7 +876,7 @@ impl Walrus {
     }
 
     pub fn with_consistency(mode: ReadConsistency) -> std::io::Result<Self> {
-        Self::with_consistency_and_schedule(mode, FsyncSchedule::Milliseconds(1000))
+        Self::with_consistency_and_schedule(mode, FsyncSchedule::Milliseconds(200))
     }
 
     pub fn with_consistency_and_schedule(

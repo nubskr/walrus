@@ -284,7 +284,7 @@ fn multithreaded_read_benchmark() {
     println!("Configuration: 10 threads, {:.0}s write phase + {:.0}s read phase", 
              write_duration.as_secs(), read_duration.as_secs());
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Write duration: {:?}, Read duration: {:?}", write_duration, read_duration);
+    println!("Write duration: {:?} (15% ramp-up), Read duration: {:?}", write_duration, read_duration);
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -528,10 +528,28 @@ fn multithreaded_read_benchmark() {
             let mut local_write_errors = 0u64;
             let mut counter = 0u64;
 
-            // Write phase - populate data for reading
+            // Write phase - start slow and ramp up to simulate realistic workload
             let mut rng = rand::thread_rng();
+            let ramp_up_duration = write_duration.mul_f64(0.15); // 15% of total duration for ramp-up
 
             while write_start_time.elapsed() < write_duration {
+                // Calculate current write rate based on ramp-up
+                let elapsed = write_start_time.elapsed();
+                let delay_ms = if elapsed < ramp_up_duration {
+                    // Ramp up from 50ms delay to 0ms delay over ramp_up_duration
+                    let ramp_progress = elapsed.as_secs_f64() / ramp_up_duration.as_secs_f64();
+                    let max_delay_ms = 50.0;
+                    max_delay_ms * (1.0 - ramp_progress)
+                } else {
+                    // Full speed after ramp-up
+                    0.0
+                };
+
+                // Apply the delay if we're still ramping up
+                if delay_ms > 0.1 {
+                    thread::sleep(Duration::from_millis(delay_ms as u64));
+                }
+
                 // Random entry size between 500B and 1KB
                 let size = rng.gen_range(500..=1024);
                 let data = vec![(counter % 256) as u8; size];
