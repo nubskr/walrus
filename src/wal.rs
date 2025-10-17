@@ -1309,7 +1309,8 @@ impl Walrus {
 
         if use_io_uring {
             // io_uring path
-            let mut ring = io_uring::IoUring::new(write_plan.len() + 64).map_err(|e| {
+            let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
+            let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e))
             })?;
             let mut buffers: Vec<Vec<u8>> = Vec::new();
