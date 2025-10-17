@@ -735,6 +735,12 @@ impl Reader {
             })?;
             let before = info.chain.len();
             info.chain.push(block.clone());
+            // If we were reading this as the active tail, carry over progress to sealed chain
+            let new_idx = info.chain.len().saturating_sub(1);
+            if info.tail_block_id == block.id {
+                info.cur_block_idx = new_idx;
+                info.cur_block_offset = info.tail_offset.min(block.used);
+            }
             debug_print!(
                 "[reader] chain append(fast): col={}, block_id={}, chain_len {}->{}",
                 col,
@@ -768,6 +774,12 @@ impl Reader {
             std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
         })?;
         info.chain.push(block.clone());
+        // If we were reading this as the active tail, carry over progress to sealed chain
+        let new_idx = info.chain.len().saturating_sub(1);
+        if info.tail_block_id == block.id {
+            info.cur_block_idx = new_idx;
+            info.cur_block_offset = info.tail_offset.min(block.used);
+        }
         debug_print!(
             "[reader] chain append(slow/new): col={}, block_id={}, chain_len {}->{}",
             col,
