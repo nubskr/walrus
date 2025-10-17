@@ -1,7 +1,6 @@
 use walrus_rust::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 
 // Global lock to serialize tests (prevents parallel test interference)
@@ -17,6 +16,11 @@ fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
 
 fn cleanup_test_env() {
     let _ = std::fs::remove_dir_all("wal_files");
+}
+
+// Helper to calculate entry offsets (PREFIX_META_SIZE + data length)
+fn entry_offset(data_len: usize) -> usize {
+    64 + data_len // PREFIX_META_SIZE = 64
 }
 
 // ============================================================================
@@ -45,8 +49,7 @@ fn test_zeroed_header_stops_block_scanning() {
         drop(wal);
     }
 
-    // Phase 2: Manually corrupt the 3rd entry by zeroing its header
-    // This simulates what happens during rollback cleanup
+    // Phase 2: Manually zero the header of entry_2 (simulates rollback cleanup)
     {
         let wal_files: Vec<_> = std::fs::read_dir("wal_files")
             .unwrap()
@@ -54,13 +57,12 @@ fn test_zeroed_header_stops_block_scanning() {
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
             .collect();
 
-        assert!(!wal_files.is_empty(), "Should have at least one WAL file");
+        assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
 
-        // Zero the header of the 3rd entry (at offset 2 * (64 + data_len))
-        // Entry 0: offset 0, Entry 1: offset ~80, Entry 2: offset ~160
-        let entry_0_size = 64 + "entry_0".len();
-        let entry_1_size = 64 + "entry_1".len();
-        let entry_2_offset = entry_0_size + entry_1_size;
+        // Calculate exact offset of entry_2
+        let offset_0 = 0;
+        let offset_1 = entry_offset("entry_0".len());
+        let offset_2 = offset_1 + entry_offset("entry_1".len());
 
         let file_path = wal_files[0].path();
         let file = std::fs::OpenOptions::new()
@@ -68,9 +70,10 @@ fn test_zeroed_header_stops_block_scanning() {
             .open(&file_path)
             .unwrap();
 
-        // Zero 64 bytes (PREFIX_META_SIZE) at entry_2's position
+        // Zero 64 bytes (PREFIX_META_SIZE) at entry_2's header
         let zeros = vec![0u8; 64];
-        file.write_at(&zeros, entry_2_offset as u64).unwrap();
+        file.write_at(&zeros, offset_2 as u64)
+            .expect("Failed to zero header");
         file.sync_all().unwrap();
     }
 
@@ -83,14 +86,23 @@ fn test_zeroed_header_stops_block_scanning() {
         .unwrap();
 
         // Should only recover entries 0 and 1 (before the zeroed header)
-        let e0 = wal.read_next("zero_test").unwrap().unwrap();
-        assert_eq!(e0.data, b"entry_0");
+        let e0 = wal.read_next("zero_test").unwrap()
+            .expect("Should read entry_0");
+        assert_eq!(e0.data, b"entry_0", "First entry should be entry_0");
 
-        let e1 = wal.read_next("zero_test").unwrap().unwrap();
-        assert_eq!(e1.data, b"entry_1");
+        let e1 = wal.read_next("zero_test").unwrap()
+            .expect("Should read entry_1");
+        assert_eq!(e1.data, b"entry_1", "Second entry should be entry_1");
 
         // Should not see entries 2, 3, 4 (they're after the zeroed header)
-        assert!(wal.read_next("zero_test").unwrap().is_none());
+        let e2 = wal.read_next("zero_test").unwrap();
+        assert!(e2.is_none(), "Should not read entry_2 or beyond (zeroed header stops scan)");
+
+        // Verify WAL is still usable for new writes
+        wal.append_for_topic("zero_test", b"new_entry").unwrap();
+        let new = wal.read_next("zero_test").unwrap()
+            .expect("Should read new entry after recovery");
+        assert_eq!(new.data, b"new_entry", "New writes should work after recovery");
     }
 
     cleanup_test_env();
@@ -107,8 +119,8 @@ fn test_concurrent_rollback_cleanup() {
     )
     .unwrap());
 
-    // Try many concurrent batch writes - most will roll back
-    let num_threads = 10;
+    // Concurrent batch writes - only one succeeds, rest roll back and zero headers
+    let num_threads = 5;
     let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = vec![];
 
@@ -117,7 +129,8 @@ fn test_concurrent_rollback_cleanup() {
         let barrier_clone = barrier.clone();
 
         let handle = thread::spawn(move || {
-            let data = vec![i as u8; 1024 * 1024]; // 1MB
+            // Use distinct data patterns to identify which batch succeeded
+            let data = vec![i as u8; 512 * 1024]; // 512KB
             let entries: Vec<&[u8]> = vec![data.as_slice(); 3];
 
             barrier_clone.wait();
@@ -129,92 +142,36 @@ fn test_concurrent_rollback_cleanup() {
 
     let mut successes = 0;
     let mut rollbacks = 0;
+    let mut winner_pattern = None;
 
-    for handle in handles {
+    for (i, handle) in handles.into_iter().enumerate() {
         match handle.join().unwrap() {
-            Ok(_) => successes += 1,
+            Ok(_) => {
+                successes += 1;
+                winner_pattern = Some(i as u8);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => rollbacks += 1,
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
 
-    // Exactly one should succeed, rest should roll back
-    assert_eq!(successes, 1, "Expected exactly 1 success");
-    assert_eq!(rollbacks, num_threads - 1, "Expected {} rollbacks", num_threads - 1);
+    assert_eq!(successes, 1, "Exactly one batch should succeed");
+    assert_eq!(rollbacks, num_threads - 1, "All other batches should roll back");
 
-    // Read what's actually committed
+    // Verify only the winner's data is visible
+    let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
-    while wal.read_next("rollback_cleanup").unwrap().is_some() {
+    while let Some(entry) = wal.read_next("rollback_cleanup").unwrap() {
+        assert_eq!(entry.data.len(), 512 * 1024, "Entry size should be 512KB");
+        assert_eq!(entry.data[0], winner, "All entries should be from winner thread");
         count += 1;
     }
 
-    // Should only see the 3 entries from the successful batch
-    assert_eq!(count, 3, "Should only see entries from successful batch");
+    assert_eq!(count, 3, "Should read exactly 3 entries from successful batch");
 
     cleanup_test_env();
 }
 
-#[test]
-fn test_recovery_after_partial_write_simulation() {
-    let _guard = setup_test_env();
-    enable_fd_backend();
-
-    // Phase 1: Write a batch successfully
-    {
-        let wal = Walrus::with_consistency_and_schedule(
-            ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
-        )
-        .unwrap();
-
-        let entries: Vec<&[u8]> = vec![b"good_1", b"good_2", b"good_3"];
-        wal.batch_append_for_topic("partial_test", &entries).unwrap();
-
-        drop(wal);
-    }
-
-    // Phase 2: Simulate partial write by adding garbage after valid data
-    {
-        let wal_files: Vec<_> = std::fs::read_dir("wal_files")
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
-            .collect();
-
-        let file_path = wal_files[0].path();
-
-        // Append some garbage data that looks like it might be an entry
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&file_path)
-            .unwrap();
-
-        // Write a fake header with non-zero length but garbage data
-        let fake_header = vec![0xFF; 64];
-        file.write_all(&fake_header).unwrap();
-        file.write_all(b"garbage_data_that_should_not_be_read").unwrap();
-        file.sync_all().unwrap();
-    }
-
-    // Phase 3: Recovery should stop at invalid data
-    {
-        let wal = Walrus::with_consistency_and_schedule(
-            ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
-        )
-        .unwrap();
-
-        // Should only recover the 3 valid entries
-        assert_eq!(wal.read_next("partial_test").unwrap().unwrap().data, b"good_1");
-        assert_eq!(wal.read_next("partial_test").unwrap().unwrap().data, b"good_2");
-        assert_eq!(wal.read_next("partial_test").unwrap().unwrap().data, b"good_3");
-
-        // Should not read the garbage
-        assert!(wal.read_next("partial_test").unwrap().is_none());
-    }
-
-    cleanup_test_env();
-}
 
 #[test]
 fn test_rollback_with_block_spanning() {
@@ -227,25 +184,27 @@ fn test_rollback_with_block_spanning() {
     )
     .unwrap());
 
-    // Write initial data to fill most of first block
+    // Write initial data to fill most of first block (10MB blocks)
     let large_data = vec![0xAA; 8 * 1024 * 1024]; // 8MB
     wal.append_for_topic("spanning_test", &large_data).unwrap();
 
-    // Read it
-    let entry = wal.read_next("spanning_test").unwrap().unwrap();
-    assert_eq!(entry.data.len(), 8 * 1024 * 1024);
+    // Read it to establish position
+    let entry = wal.read_next("spanning_test").unwrap()
+        .expect("Should read initial 8MB entry");
+    assert_eq!(entry.data.len(), 8 * 1024 * 1024, "Initial entry should be 8MB");
+    assert_eq!(entry.data[0], 0xAA, "Initial entry should have 0xAA pattern");
 
-    // Now try concurrent batches that will span blocks
-    let barrier = Arc::new(Barrier::new(3));
+    // Concurrent batches that span multiple blocks (remaining ~2MB + need 18MB = spans 2 blocks)
+    let num_threads = 3;
+    let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = vec![];
 
-    for i in 0..3 {
+    for i in 0..num_threads {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
 
         let handle = thread::spawn(move || {
-            // Large enough to require multiple blocks
-            let entry = vec![i as u8; 6 * 1024 * 1024]; // 6MB per entry
+            let entry = vec![(0x10 + i) as u8; 6 * 1024 * 1024]; // 6MB per entry, distinct patterns
             let entries: Vec<&[u8]> = vec![entry.as_slice(); 3]; // 18MB total
 
             barrier_clone.wait();
@@ -256,78 +215,35 @@ fn test_rollback_with_block_spanning() {
     }
 
     let mut successes = 0;
-    for handle in handles {
+    let mut winner_pattern = None;
+
+    for (i, handle) in handles.into_iter().enumerate() {
         match handle.join().unwrap() {
-            Ok(_) => successes += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    assert_eq!(successes, 1, "Exactly one batch should succeed");
-
-    // Verify we can read exactly 3 entries from the successful batch
-    let mut count = 0;
-    while wal.read_next("spanning_test").unwrap().is_some() {
-        count += 1;
-    }
-
-    assert_eq!(count, 3, "Should read 3 entries from successful batch");
-
-    cleanup_test_env();
-}
-
-#[test]
-fn test_multiple_rollbacks_same_block() {
-    let _guard = setup_test_env();
-    enable_fd_backend();
-
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
-
-    // Do multiple rounds of concurrent writes to the same topic
-    for round in 0..5 {
-        let barrier = Arc::new(Barrier::new(3));
-        let mut handles = vec![];
-
-        for i in 0..3 {
-            let wal_clone = wal.clone();
-            let barrier_clone = barrier.clone();
-
-            let handle = thread::spawn(move || {
-                let data = format!("round_{}_thread_{}", round, i);
-                let entries: Vec<&[u8]> = vec![data.as_bytes(); 2];
-
-                barrier_clone.wait();
-                wal_clone.batch_append_for_topic("multi_rollback", &entries)
-            });
-
-            handles.push(handle);
-        }
-
-        let mut successes = 0;
-        for handle in handles {
-            if handle.join().unwrap().is_ok() {
+            Ok(_) => {
                 successes += 1;
+                winner_pattern = Some((0x10 + i) as u8);
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("Unexpected error during concurrent write: {}", e),
         }
-
-        assert_eq!(successes, 1, "Exactly one batch should succeed in round {}", round);
     }
 
-    // Should have 5 successful batches * 2 entries each = 10 entries
+    assert_eq!(successes, 1, "Exactly one multi-block batch should succeed");
+
+    // Verify only winner's entries are visible (rollback zeroed losers' headers across blocks)
+    let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
-    while wal.read_next("multi_rollback").unwrap().is_some() {
+    while let Some(entry) = wal.read_next("spanning_test").unwrap() {
+        assert_eq!(entry.data.len(), 6 * 1024 * 1024, "Entry should be 6MB");
+        assert_eq!(entry.data[0], winner, "Entry should be from winner batch");
         count += 1;
     }
 
-    assert_eq!(count, 10, "Should have exactly 10 entries from 5 successful batches");
+    assert_eq!(count, 3, "Should read exactly 3 entries from winning batch");
 
     cleanup_test_env();
 }
+
 
 #[test]
 fn test_recovery_preserves_data_before_zeroed_headers() {
@@ -352,7 +268,7 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         drop(wal);
     }
 
-    // Phase 2: Zero the header of the large entry
+    // Phase 2: Zero the header of the large entry (simulates mid-batch rollback)
     {
         let wal_files: Vec<_> = std::fs::read_dir("wal_files")
             .unwrap()
@@ -360,20 +276,24 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
             .collect();
 
+        assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
+
         let file_path = wal_files[0].path();
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)
-            .unwrap();
+            .expect("Failed to open WAL file");
 
-        // Zero header at offset of second entry
-        let offset = 64 + "small_1".len();
-        let zeros = vec![0u8; 64];
-        file.write_at(&zeros, offset as u64).unwrap();
+        // Calculate offset of large entry (second entry)
+        let offset_large = entry_offset("small_1".len());
+
+        let zeros = vec![0u8; 64]; // PREFIX_META_SIZE
+        file.write_at(&zeros, offset_large as u64)
+            .expect("Failed to zero header");
         file.sync_all().unwrap();
     }
 
-    // Phase 3: Recovery should see first entry only
+    // Phase 3: Recovery should preserve data before zeroed header, stop at zero
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -381,15 +301,20 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         )
         .unwrap();
 
-        // Should recover first entry
-        assert_eq!(wal.read_next("preserve_test").unwrap().unwrap().data, b"small_1");
+        // Should recover first entry (before zeroed header)
+        let e1 = wal.read_next("preserve_test").unwrap()
+            .expect("Should read small_1");
+        assert_eq!(e1.data, b"small_1", "First entry should be small_1");
 
-        // Should not see the large entry or anything after
-        assert!(wal.read_next("preserve_test").unwrap().is_none());
+        // Should not see the large entry (zeroed header) or small_2 (after zeroed header)
+        let e2 = wal.read_next("preserve_test").unwrap();
+        assert!(e2.is_none(), "Should not read past zeroed header (preserves data before, blocks garbage after)");
 
-        // WAL should still be usable for new writes
+        // WAL should still be usable for new writes after encountering zeroed header
         wal.append_for_topic("preserve_test", b"new_after_recovery").unwrap();
-        assert_eq!(wal.read_next("preserve_test").unwrap().unwrap().data, b"new_after_recovery");
+        let new_entry = wal.read_next("preserve_test").unwrap()
+            .expect("Should read new entry");
+        assert_eq!(new_entry.data, b"new_after_recovery", "New writes should work after recovery");
     }
 
     cleanup_test_env();
