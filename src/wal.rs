@@ -1725,9 +1725,13 @@ impl Walrus {
                 (blk.clone(), *off)
             };
 
-            // If persisted tail points to a different block and that block is now sealed in chain, fold it
+            // Handle persisted tail folding/initialization/rebasing
             if let Some((tail_block_id, tail_off)) = persisted_tail {
                 if tail_block_id != active_block.id {
+                    // Check if this tail block is now in the sealed chain
+                    let mut info = info_arc.write().map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                    })?;
                     if let Some((idx, _)) = info
                         .chain
                         .iter()
@@ -1750,24 +1754,20 @@ impl Walrus {
                     } else {
                         // rebase tail to current active block at 0
                         persisted_tail = Some((active_block.id, 0));
-                        if self.should_persist(&mut info, true) {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    active_block.id | TAIL_FLAG,
-                                    0,
-                                );
-                            }
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(
+                                col_name.to_string(),
+                                active_block.id | TAIL_FLAG,
+                                0,
+                            );
                         }
                     }
                 }
             } else {
                 // No persisted tail; init at current active block start
                 persisted_tail = Some((active_block.id, 0));
-                if self.should_persist(&mut info, true) {
-                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
-                    }
+                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                    let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
                 }
             }
 
@@ -1781,8 +1781,6 @@ impl Walrus {
                 if snap_id == active_block.id {
                     tail_off = tail_off.max(snap_off);
                 }
-            } else {
-                // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
             }
             // If writer rotated after we set persisted_tail, loop to fold/rebase
             if tail_block_id != active_block.id {
@@ -1803,7 +1801,6 @@ impl Walrus {
                         })?;
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
-                        persisted_tail = Some((tail_block_id, new_off));
                         let maybe_persist = if self.should_persist(&mut info, false) {
                             Some((tail_block_id | TAIL_FLAG, new_off))
                         } else {
