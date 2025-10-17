@@ -1661,22 +1661,29 @@ impl Walrus {
 
                 match block.read(off) {
                     Ok((entry, consumed)) => {
-                        info.cur_block_offset = off + consumed as u64;
-                        if self.should_persist(&mut info, false) {
+                        // Compute new offset and whether to persist while holding the column lock
+                        let new_off = off + consumed as u64;
+                        info.cur_block_offset = new_off;
+                        let maybe_persist = if self.should_persist(&mut info, false) {
+                            Some((info.cur_block_idx as u64, new_off))
+                        } else {
+                            None
+                        };
+
+                        // Drop the column lock before touching the index to avoid lock inversion
+                        drop(info);
+                        if let Some((idx_val, off_val)) = maybe_persist {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    info.cur_block_idx as u64,
-                                    info.cur_block_offset,
-                                );
+                                let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
                             }
                         }
+
                         debug_print!(
                             "[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}",
                             col_name,
                             block.id,
                             consumed,
-                            info.cur_block_offset
+                            new_off
                         );
                         return Ok(Some(entry));
                     }
@@ -1787,15 +1794,20 @@ impl Walrus {
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
                         persisted_tail = Some((tail_block_id, new_off));
-                        if self.should_persist(&mut info, false) {
+                        let maybe_persist = if self.should_persist(&mut info, false) {
+                            Some((tail_block_id | TAIL_FLAG, new_off))
+                        } else {
+                            None
+                        };
+
+                        // Drop the column lock before touching the index to avoid lock inversion
+                        drop(info);
+                        if let Some((idx_val, off_val)) = maybe_persist {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    tail_block_id | TAIL_FLAG,
-                                    new_off,
-                                );
+                                let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
                             }
                         }
+
                         debug_print!(
                             "[reader] read_next: tail OK col={}, block_id={}, consumed={}, new_tail_off={}",
                             col_name,
@@ -2166,6 +2178,14 @@ impl Walrus {
                 std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
             })?;
 
+            // Prepare persistence outside the lock
+            enum PersistTarget {
+                Tail { blk_id: u64, off: u64 },
+                Sealed { idx: u64, off: u64 },
+                None,
+            }
+            let mut target = PersistTarget::None;
+
             // Update position
             if saw_tail {
                 // Ensure sealed chain is caught up
@@ -2175,28 +2195,16 @@ impl Walrus {
                 info.tail_block_id = final_tail_block_id;
                 info.tail_offset = final_tail_offset;
 
-                // Persist tail position
+                // Decide whether to persist tail position
                 match self.read_consistency {
                     ReadConsistency::StrictlyAtOnce => {
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(
-                                col_name.to_string(),
-                                final_tail_block_id | TAIL_FLAG,
-                                final_tail_offset,
-                            );
-                        }
+                        target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
                     }
                     ReadConsistency::AtLeastOnce { persist_every } => {
                         info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
                         if info.reads_since_persist >= persist_every {
                             info.reads_since_persist = 0;
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    final_tail_block_id | TAIL_FLAG,
-                                    final_tail_offset,
-                                );
-                            }
+                            target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
                         }
                     }
                 }
@@ -2205,31 +2213,37 @@ impl Walrus {
                 info.cur_block_idx = final_block_idx;
                 info.cur_block_offset = final_block_offset;
 
-                // Persist sealed position
+                // Decide whether to persist sealed position
                 match self.read_consistency {
                     ReadConsistency::StrictlyAtOnce => {
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(
-                                col_name.to_string(),
-                                final_block_idx as u64,
-                                final_block_offset,
-                            );
-                        }
+                        target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
                     }
                     ReadConsistency::AtLeastOnce { persist_every } => {
                         info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
                         if info.reads_since_persist >= persist_every {
                             info.reads_since_persist = 0;
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    final_block_idx as u64,
-                                    final_block_offset,
-                                );
-                            }
+                            target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
                         }
                     }
                 }
+            }
+
+            // Drop the column lock before touching the index to avoid lock inversion
+            drop(info);
+
+            // Persist if needed
+            match target {
+                PersistTarget::Tail { blk_id, off } => {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
+                    }
+                }
+                PersistTarget::Sealed { idx, off } => {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(col_name.to_string(), idx, off);
+                    }
+                }
+                PersistTarget::None => {}
             }
         }
 
