@@ -1638,7 +1638,14 @@ impl Walrus {
             }
         }
 
+        // Important: release the per-column lock; we'll reacquire each iteration
+        drop(info);
+
         loop {
+            // Reacquire column lock at the start of each iteration
+            let mut info = info_arc.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
             // Sealed chain path
             if info.cur_block_idx < info.chain.len() {
                 let idx = info.cur_block_idx;
@@ -1671,6 +1678,7 @@ impl Walrus {
                         };
 
                         // Drop the column lock before touching the index to avoid lock inversion
+                        // Release before returning; we'll not use `info` after this branch
                         drop(info);
                         if let Some((idx_val, off_val)) = maybe_persist {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
@@ -1725,13 +1733,9 @@ impl Walrus {
                 (blk.clone(), *off)
             };
 
-            // Handle persisted tail folding/initialization/rebasing
+            // If persisted tail points to a different block and that block is now sealed in chain, fold it
             if let Some((tail_block_id, tail_off)) = persisted_tail {
                 if tail_block_id != active_block.id {
-                    // Check if this tail block is now in the sealed chain
-                    let mut info = info_arc.write().map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
-                    })?;
                     if let Some((idx, _)) = info
                         .chain
                         .iter()
@@ -1754,20 +1758,24 @@ impl Walrus {
                     } else {
                         // rebase tail to current active block at 0
                         persisted_tail = Some((active_block.id, 0));
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(
-                                col_name.to_string(),
-                                active_block.id | TAIL_FLAG,
-                                0,
-                            );
+                        if self.should_persist(&mut info, true) {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    active_block.id | TAIL_FLAG,
+                                    0,
+                                );
+                            }
                         }
                     }
                 }
             } else {
                 // No persisted tail; init at current active block start
                 persisted_tail = Some((active_block.id, 0));
-                if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                    let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                if self.should_persist(&mut info, true) {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                    }
                 }
             }
 
@@ -1781,13 +1789,12 @@ impl Walrus {
                 if snap_id == active_block.id {
                     tail_off = tail_off.max(snap_off);
                 }
+            } else {
+                // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
             }
             // If writer rotated after we set persisted_tail, loop to fold/rebase
             if tail_block_id != active_block.id {
-                // Reacquire column lock for the next iteration
-                info = info_arc.write().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
-                })?;
+                // Loop to next iteration; `info` will be reacquired at loop top
                 continue;
             }
 
@@ -1796,11 +1803,12 @@ impl Walrus {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
                         // Reacquire column lock to update in-memory progress, then decide persistence
-                        info = info_arc.write().map_err(|_| {
+                        let mut info = info_arc.write().map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
                         })?;
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
+                        persisted_tail = Some((tail_block_id, new_off));
                         let maybe_persist = if self.should_persist(&mut info, false) {
                             Some((tail_block_id | TAIL_FLAG, new_off))
                         } else {
@@ -2006,7 +2014,7 @@ impl Walrus {
             }
 
             // Reacquire column lock for the rest of the function
-            info = info_arc.write().map_err(|_| {
+            let mut info = info_arc.write().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
             })?;
         }
