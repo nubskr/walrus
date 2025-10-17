@@ -7,8 +7,7 @@ static TEST_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| M
 
 fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Remove WALRUS_QUIET to enable logging for debugging
-    // unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
+    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
     let _ = std::fs::remove_dir_all("wal_files");
     std::fs::create_dir_all("wal_files").unwrap();
     guard
