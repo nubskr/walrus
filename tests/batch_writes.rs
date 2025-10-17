@@ -1,20 +1,21 @@
 use walrus_rust::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-fn setup_test_env() -> String {
-    let test_id = format!("batch_test_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos());
+// Global lock to serialize tests (prevents parallel test interference)
+static TEST_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+
+fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
+    let guard = TEST_LOCK.lock().unwrap();
+
     unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
 
     // Clean up old test directories
     let _ = std::fs::remove_dir_all("wal_files");
     std::fs::create_dir_all("wal_files").unwrap();
 
-    test_id
+    guard
 }
 
 fn cleanup_test_env() {
@@ -27,7 +28,7 @@ fn cleanup_test_env() {
 
 #[test]
 fn test_batch_write_basic() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -59,7 +60,7 @@ fn test_batch_write_basic() {
 
 #[test]
 fn test_batch_write_atomicity_with_reader() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -98,7 +99,7 @@ fn test_batch_write_atomicity_with_reader() {
 
 #[test]
 fn test_batch_size_limit_enforcement() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -131,7 +132,7 @@ fn test_batch_size_limit_enforcement() {
 
 #[test]
 fn test_concurrent_batch_writes_rejected() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(
@@ -192,7 +193,7 @@ fn test_concurrent_batch_writes_rejected() {
 
 #[test]
 fn test_regular_write_blocked_during_batch() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(
@@ -256,7 +257,7 @@ fn test_regular_write_blocked_during_batch() {
 
 #[test]
 fn test_empty_batch() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -282,7 +283,7 @@ fn test_empty_batch() {
 
 #[test]
 fn test_batch_spans_multiple_blocks() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -312,7 +313,7 @@ fn test_batch_spans_multiple_blocks() {
 
 #[test]
 fn test_batch_with_varying_entry_sizes() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -362,7 +363,7 @@ fn test_batch_with_varying_entry_sizes() {
 
 #[test]
 fn test_chaos_interleaved_batch_and_regular_writes() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(
@@ -417,7 +418,7 @@ fn test_chaos_interleaved_batch_and_regular_writes() {
 
 #[test]
 fn test_chaos_multiple_topics_concurrent_batches() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(
@@ -476,7 +477,7 @@ fn test_chaos_multiple_topics_concurrent_batches() {
 
 #[test]
 fn test_chaos_batch_write_with_concurrent_readers() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(
@@ -552,7 +553,7 @@ fn test_chaos_batch_write_with_concurrent_readers() {
 
 #[test]
 fn test_batch_single_entry() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -573,7 +574,7 @@ fn test_batch_single_entry() {
 
 #[test]
 fn test_batch_exactly_at_block_boundary() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -605,7 +606,7 @@ fn test_batch_exactly_at_block_boundary() {
 
 #[test]
 fn test_batch_then_regular_write() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -631,7 +632,7 @@ fn test_batch_then_regular_write() {
 
 #[test]
 fn test_multiple_sequential_batches() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -669,7 +670,7 @@ fn test_multiple_sequential_batches() {
 #[test]
 #[ignore] // Run with --ignored flag for long-running tests
 fn test_stress_large_batch_1000_entries() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -701,7 +702,7 @@ fn test_stress_large_batch_1000_entries() {
 #[test]
 #[ignore]
 fn test_stress_many_small_batches() {
-    setup_test_env();
+    let _guard = setup_test_env();
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(

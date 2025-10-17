@@ -1262,28 +1262,31 @@ impl Walrus {
         let mut write_plan: Vec<(Block, u64, usize)> = Vec::new();
         let mut batch_idx = 0;
 
+        // Use a LOCAL offset for planning, don't update the writer's offset yet
+        let mut planning_offset = *cur_offset;
+
         while batch_idx < batch.len() {
             let data = batch[batch_idx];
             let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
-            let available = block.limit - *cur_offset;
+            let available = block.limit - planning_offset;
 
             if available >= need {
                 // Fits in current block
-                write_plan.push((block.clone(), *cur_offset, batch_idx));
-                *cur_offset += need;
+                write_plan.push((block.clone(), planning_offset, batch_idx));
+                planning_offset += need;
                 batch_idx += 1;
             } else {
                 // Need to seal and allocate new block
                 debug_print!(
                     "[batch] sealing block_id={}, used={}, need={}, limit={}",
                     block.id,
-                    *cur_offset,
+                    planning_offset,
                     need,
                     block.limit
                 );
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
-                sealed.used = *cur_offset;
+                sealed.used = planning_offset;
                 sealed.mmap.flush()?;
                 let _ = self.reader.append_block_to_chain(col_name, sealed);
 
@@ -1294,7 +1297,7 @@ impl Walrus {
 
                 revert_info.allocated_block_ids.push(new_block.id);
                 *block = new_block;
-                *cur_offset = 0;
+                planning_offset = 0;
             }
         }
 
@@ -1425,6 +1428,9 @@ impl Walrus {
                         }
                     }
 
+                    // NOW update the writer's offset to make data visible to readers
+                    *cur_offset = planning_offset;
+
                     debug_print!(
                         "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
                         batch.len(),
@@ -1466,6 +1472,9 @@ impl Walrus {
                     fsynced.insert(blk.file_path.clone());
                 }
             }
+
+            // NOW update the writer's offset to make data visible to readers
+            *cur_offset = planning_offset;
 
             debug_print!(
                 "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
