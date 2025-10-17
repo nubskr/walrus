@@ -1935,6 +1935,7 @@ impl Walrus {
         })?;
 
         // Hydrate from index if needed
+        let mut persisted_tail_for_fold: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
         if !info.hydrated_from_index {
             if let Ok(idx_guard) = self.read_offset_index.read() {
                 if let Some(pos) = idx_guard.get(col_name) {
@@ -1944,6 +1945,7 @@ impl Walrus {
                         info.tail_offset = pos.cur_block_offset;
                         info.cur_block_idx = info.chain.len();
                         info.cur_block_offset = 0;
+                        persisted_tail_for_fold = Some((tail_block_id, pos.cur_block_offset));
                     } else {
                         let mut ib = pos.cur_block_idx as usize;
                         if ib > info.chain.len() {
@@ -1959,6 +1961,29 @@ impl Walrus {
                     }
                 }
                 info.hydrated_from_index = true;
+            }
+        }
+
+        // Fold persisted tail into sealed chain if recoverable
+        if let Some((tail_block_id, tail_off)) = persisted_tail_for_fold {
+            if !info.chain.is_empty() {
+                if let Some((idx, _)) = info
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .find(|(_, b)| b.id == tail_block_id)
+                {
+                    info.cur_block_idx = idx;
+                    info.cur_block_offset = tail_off.min(info.chain[idx].used);
+                    // Clear in-memory tail since it is now represented in sealed chain
+                    info.tail_block_id = 0;
+                    info.tail_offset = 0;
+                } else {
+                    // If block id not found, rebase to last sealed block start
+                    let last = info.chain.len() - 1;
+                    info.cur_block_idx = last;
+                    info.cur_block_offset = 0;
+                }
             }
         }
 
@@ -2150,9 +2175,8 @@ impl Walrus {
                     break; // Incomplete entry
                 }
 
-                // Check budget: always allow at least one entry, even if it exceeds the budget
-                if total_data_bytes > 0 && total_data_bytes + data_size > max_bytes {
-                    // Would exceed budget - stop here (but only after at least one entry)
+                // Check budget strictly on payload bytes
+                if total_data_bytes + data_size > max_bytes {
                     break;
                 }
 
