@@ -36,16 +36,10 @@ fn test_zeroed_header_stops_block_scanning() {
         )
         .unwrap();
 
-        // Write 5 entries
+        // Write 5 entries (but don't read them - we want to read after recovery)
         for i in 0..5 {
             let data = format!("entry_{}", i);
             wal.append_for_topic("zero_test", data.as_bytes()).unwrap();
-        }
-
-        // Read all entries to verify they're written
-        for i in 0..5 {
-            let entry = wal.read_next("zero_test").unwrap().unwrap();
-            assert_eq!(entry.data, format!("entry_{}", i).as_bytes());
         }
 
         drop(wal);
@@ -340,7 +334,7 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    // Phase 1: Write mixed small and large entries
+    // Phase 1: Write mixed small and large entries (but don't read them yet)
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -354,12 +348,6 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         wal.append_for_topic("preserve_test", &large).unwrap();
 
         wal.append_for_topic("preserve_test", b"small_2").unwrap();
-
-        // Read them all
-        assert_eq!(wal.read_next("preserve_test").unwrap().unwrap().data, b"small_1");
-        let e2 = wal.read_next("preserve_test").unwrap().unwrap();
-        assert_eq!(e2.data.len(), 2 * 1024 * 1024);
-        assert_eq!(wal.read_next("preserve_test").unwrap().unwrap().data, b"small_2");
 
         drop(wal);
     }
