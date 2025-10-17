@@ -2200,67 +2200,66 @@ impl Walrus {
 
         // 5) Commit progress
         if entries_parsed > 0 {
-            let mut info = if hold_lock_during_io {
-                // reuse the held lock
-                info
-            } else {
-                info_arc.write().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
-                })?
-            };
-
-            // Prepare persistence outside the lock
-            enum PersistTarget {
-                Tail { blk_id: u64, off: u64 },
-                Sealed { idx: u64, off: u64 },
-                None,
-            }
+            // Prepare persistence target while holding the appropriate lock
+            enum PersistTarget { Tail { blk_id: u64, off: u64 }, Sealed { idx: u64, off: u64 }, None }
             let mut target = PersistTarget::None;
 
-            // Update position
-            if saw_tail {
-                // Ensure sealed chain is caught up
-                info.cur_block_idx = chain_len_at_plan;
-                info.cur_block_offset = 0;
-                // Then set tail progress
-                info.tail_block_id = final_tail_block_id;
-                info.tail_offset = final_tail_offset;
-
-                // Decide whether to persist tail position
-                match self.read_consistency {
-                    ReadConsistency::StrictlyAtOnce => {
-                        target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
+            if hold_lock_during_io {
+                // We still hold the original write guard `info` here
+                // Update position
+                if saw_tail {
+                    info.cur_block_idx = chain_len_at_plan;
+                    info.cur_block_offset = 0;
+                    info.tail_block_id = final_tail_block_id;
+                    info.tail_offset = final_tail_offset;
+                    match self.read_consistency {
+                        ReadConsistency::StrictlyAtOnce => {
+                            target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
+                        }
+                        ReadConsistency::AtLeastOnce { persist_every: _ } => {}
                     }
-                    ReadConsistency::AtLeastOnce { persist_every } => {
-                        info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
-                        if info.reads_since_persist >= persist_every {
-                            info.reads_since_persist = 0;
+                } else {
+                    info.cur_block_idx = final_block_idx;
+                    info.cur_block_offset = final_block_offset;
+                    match self.read_consistency {
+                        ReadConsistency::StrictlyAtOnce => {
+                            target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
+                        }
+                        ReadConsistency::AtLeastOnce { persist_every: _ } => {}
+                    }
+                }
+                // Release before persisting index
+                drop(info);
+            } else {
+                // Reacquire to update
+                let mut info2 = info_arc.write().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                })?;
+                if saw_tail {
+                    info2.cur_block_idx = chain_len_at_plan;
+                    info2.cur_block_offset = 0;
+                    info2.tail_block_id = final_tail_block_id;
+                    info2.tail_offset = final_tail_offset;
+                    if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
+                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(entries_parsed);
+                        if info2.reads_since_persist >= persist_every {
+                            info2.reads_since_persist = 0;
                             target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
                         }
                     }
-                }
-            } else {
-                // Sealed-only
-                info.cur_block_idx = final_block_idx;
-                info.cur_block_offset = final_block_offset;
-
-                // Decide whether to persist sealed position
-                match self.read_consistency {
-                    ReadConsistency::StrictlyAtOnce => {
-                        target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
-                    }
-                    ReadConsistency::AtLeastOnce { persist_every } => {
-                        info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
-                        if info.reads_since_persist >= persist_every {
-                            info.reads_since_persist = 0;
+                } else {
+                    info2.cur_block_idx = final_block_idx;
+                    info2.cur_block_offset = final_block_offset;
+                    if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
+                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(entries_parsed);
+                        if info2.reads_since_persist >= persist_every {
+                            info2.reads_since_persist = 0;
                             target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
                         }
                     }
                 }
+                drop(info2);
             }
-
-            // Drop the column lock before touching the index to avoid lock inversion
-            drop(info);
 
             // Persist if needed
             match target {
