@@ -679,23 +679,30 @@ fn test_stress_large_batch_1000_entries() {
     )
     .unwrap();
 
+    println!("[stress] Creating 1000 entries of 1MB each...");
     // Create 1000 entries of 1MB each
     let entry = vec![0xCD; 1024 * 1024];
     let entries: Vec<&[u8]> = (0..1000).map(|_| entry.as_slice()).collect();
 
+    println!("[stress] Writing batch of 1GB...");
     let start = std::time::Instant::now();
     wal.batch_append_for_topic("stress_topic", &entries).unwrap();
     let duration = start.elapsed();
 
-    println!("Batch write of 1000x1MB entries took: {:?}", duration);
+    println!("[stress] Batch write of 1000x1MB entries took: {:?}", duration);
 
+    println!("[stress] Verifying all 1000 entries...");
     // Verify all entries
-    for _ in 0..1000 {
+    for i in 0..1000 {
+        if i % 100 == 0 {
+            println!("[stress] Verified {} entries...", i);
+        }
         let e = wal.read_next("stress_topic").unwrap().unwrap();
         assert_eq!(e.data.len(), 1024 * 1024);
         assert_eq!(e.data[0], 0xCD);
     }
 
+    println!("[stress] All 1000 entries verified successfully!");
     cleanup_test_env();
 }
 
@@ -711,25 +718,34 @@ fn test_stress_many_small_batches() {
     )
     .unwrap();
 
+    println!("[stress] Writing 10000 batches of 10 entries each...");
     let start = std::time::Instant::now();
 
     // Write 10000 batches of 10 small entries each
     for i in 0..10000 {
+        if i % 1000 == 0 {
+            println!("[stress] Written {} batches...", i);
+        }
         let data = format!("batch_{}", i);
         let entries: Vec<&[u8]> = (0..10).map(|_| data.as_bytes()).collect();
         wal.batch_append_for_topic("stress_topic", &entries).unwrap();
     }
 
     let duration = start.elapsed();
-    println!("10000 batches of 10 entries took: {:?}", duration);
+    println!("[stress] 10000 batches of 10 entries took: {:?}", duration);
 
+    println!("[stress] Reading and verifying 100000 entries...");
     // Count entries
     let mut count = 0;
     while wal.read_next("stress_topic").unwrap().is_some() {
         count += 1;
+        if count % 10000 == 0 {
+            println!("[stress] Read {} entries...", count);
+        }
     }
 
     assert_eq!(count, 100000);
+    println!("[stress] All 100000 entries verified successfully!");
 
     cleanup_test_env();
 }
