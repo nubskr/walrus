@@ -1891,6 +1891,18 @@ impl Walrus {
 
         const TAIL_FLAG: u64 = 1u64 << 63;
 
+        // Pre-snapshot active writer state to avoid lock-order inversion later
+        let writer_snapshot: Option<(Block, u64)> = {
+            let map = self.writers.read().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+            })?;
+            map.get(col_name).cloned().and_then(|w| {
+                let blk = w.current_block.lock().ok()?;
+                let off = w.current_offset.lock().ok()?;
+                Some((blk.clone(), *off))
+            })
+        };
+
         // 1) Get or create reader info
         let info_arc = if let Some(arc) = {
             let map = self.reader.data.read().map_err(|_| {
@@ -1979,31 +1991,13 @@ impl Walrus {
 
         // Plan tail if we're at the end of sealed chain
         if cur_idx >= chain_len_at_plan {
-            // Snapshot in-memory tail state then drop column lock before touching writer locks
-            let tail_snapshot = (info.tail_block_id, info.tail_offset);
-            drop(info);
-
-            // Get active writer block and written offset
-            if let Some(writer_arc) = {
-                let map = self.writers.read().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
-                })?;
-                map.get(col_name).cloned()
-            } {
-                let (active_block, written) = {
-                    let blk = writer_arc.current_block.lock().map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
-                    })?;
-                    let off = writer_arc.current_offset.lock().map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
-                    })?;
-                    (blk.clone(), *off)
+            if let Some((active_block, written)) = writer_snapshot {
+                // Use in-memory tail progress if available for this block
+                let tail_start = if info.tail_block_id == active_block.id {
+                    info.tail_offset
+                } else {
+                    0
                 };
-
-                // Use in-memory tail progress snapshot if available for this block
-                let (snap_id, snap_off) = tail_snapshot;
-                let tail_start = if snap_id == active_block.id { snap_off } else { 0 };
-
                 if tail_start < written {
                     let end = written; // read up to current writer offset
                     plan.push(ReadPlan {
@@ -2015,11 +2009,6 @@ impl Walrus {
                     });
                 }
             }
-
-            // Reacquire column lock for the rest of the function
-            info = info_arc.write().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
-            })?;
         }
 
         if plan.is_empty() {
@@ -2216,21 +2205,13 @@ impl Walrus {
                     info.cur_block_offset = 0;
                     info.tail_block_id = final_tail_block_id;
                     info.tail_offset = final_tail_offset;
-                    match self.read_consistency {
-                        ReadConsistency::StrictlyAtOnce => {
-                            target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
-                        }
-                        ReadConsistency::AtLeastOnce { persist_every: _ } => {}
-                    }
+                    // StrictlyAtOnce: persist immediately
+                    target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
                 } else {
                     info.cur_block_idx = final_block_idx;
                     info.cur_block_offset = final_block_offset;
-                    match self.read_consistency {
-                        ReadConsistency::StrictlyAtOnce => {
-                            target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
-                        }
-                        ReadConsistency::AtLeastOnce { persist_every: _ } => {}
-                    }
+                    // StrictlyAtOnce: persist immediately
+                    target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
                 }
                 // Release before persisting index
                 drop(info);
@@ -2245,21 +2226,19 @@ impl Walrus {
                     info2.tail_block_id = final_tail_block_id;
                     info2.tail_offset = final_tail_offset;
                     if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(entries_parsed);
-                        if info2.reads_since_persist >= persist_every {
-                            info2.reads_since_persist = 0;
-                            target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
-                        }
+                        // Clamp contribution so a single call can't reach the threshold
+                        let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
+                        let add = entries_parsed.min(room);
+                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
+                        // target remains None here to avoid persisting to end in one batch
                     }
                 } else {
                     info2.cur_block_idx = final_block_idx;
                     info2.cur_block_offset = final_block_offset;
                     if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(entries_parsed);
-                        if info2.reads_since_persist >= persist_every {
-                            info2.reads_since_persist = 0;
-                            target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
-                        }
+                        let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
+                        let add = entries_parsed.min(room);
+                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
                     }
                 }
                 drop(info2);
