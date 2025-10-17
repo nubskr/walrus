@@ -281,6 +281,19 @@ impl Block {
         let consumed = PREFIX_META_SIZE + actual_entry_size;
         Ok((Entry { data: ret_buffer }, consumed))
     }
+
+    fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
+        // Zero a small region within this block; used to invalidate headers on rollback
+        // Caller ensures size is reasonable (typically PREFIX_META_SIZE)
+        let len = size as usize;
+        if len == 0 {
+            return Ok(());
+        }
+        let zeros = vec![0u8; len];
+        let file_offset = self.offset + in_block_offset;
+        self.mmap.write(file_offset as usize, &zeros);
+        Ok(())
+    }
 }
 
 fn make_new_file() -> std::io::Result<String> {
@@ -1420,6 +1433,19 @@ impl Walrus {
                     }
 
                     if !all_success {
+                        // Clean up garbage before rollback: zero headers for all planned entries
+                        for (blk, offset, _idx) in write_plan.iter() {
+                            let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
+                        }
+
+                        // Ensure zeros are persisted
+                        let mut fsynced = std::collections::HashSet::new();
+                        for (blk, _, _) in write_plan.iter() {
+                            if fsynced.insert(blk.file_path.clone()) {
+                                let _ = blk.mmap.flush();
+                            }
+                        }
+
                         // Rollback
                         *cur_offset = revert_info.original_offset;
                         for block_id in revert_info.allocated_block_ids {
@@ -1452,6 +1478,19 @@ impl Walrus {
                     Ok(())
                 }
                 Err(e) => {
+                    // Clean up garbage before rollback: zero headers for all planned entries
+                    for (blk, offset, _idx) in write_plan.iter() {
+                        let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
+                    }
+
+                    // Ensure zeros are persisted
+                    let mut fsynced = std::collections::HashSet::new();
+                    for (blk, _, _) in write_plan.iter() {
+                        if fsynced.insert(blk.file_path.clone()) {
+                            let _ = blk.mmap.flush();
+                        }
+                    }
+
                     // Rollback
                     *cur_offset = revert_info.original_offset;
                     for block_id in revert_info.allocated_block_ids {
@@ -1467,7 +1506,19 @@ impl Walrus {
                 let next_block_start = blk.offset + blk.limit;
 
                 if let Err(e) = blk.write(*offset, data, col_name, next_block_start) {
-                    // Rollback on error
+                    // Clean up any partially written headers up to and including the failed index
+                    for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
+                        let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
+                    }
+
+                    // Flush zeros and rollback
+                    let mut fsynced = std::collections::HashSet::new();
+                    for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
+                        if fsynced.insert(w_blk.file_path.clone()) {
+                            let _ = w_blk.mmap.flush();
+                        }
+                    }
+
                     *cur_offset = revert_info.original_offset;
                     for block_id in revert_info.allocated_block_ids {
                         FileStateTracker::set_block_unlocked(block_id as usize);
