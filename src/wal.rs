@@ -1702,6 +1702,9 @@ impl Walrus {
             }
 
             // Tail path ---
+            // Snapshot in-memory tail state under lock, then drop column lock to avoid lock inversion
+            let tail_snapshot = (info.tail_block_id, info.tail_offset);
+            drop(info);
 
             let writer_arc = {
                 let map = self.writers.read().map_err(|_| {
@@ -1768,21 +1771,25 @@ impl Walrus {
                 }
             }
 
-            // Choose the best known tail offset: prefer in-memory progress for current active block
+            // Choose the best known tail offset: prefer in-memory snapshot for current active block
             let (tail_block_id, mut tail_off) = match persisted_tail {
                 Some(v) => v,
                 None => return Ok(None),
             };
             if tail_block_id == active_block.id {
-                // Use the max of persisted offset and in-memory offset for this process
-                if info.tail_block_id == active_block.id {
-                    tail_off = tail_off.max(info.tail_offset);
+                let (snap_id, snap_off) = tail_snapshot;
+                if snap_id == active_block.id {
+                    tail_off = tail_off.max(snap_off);
                 }
             } else {
                 // If writer rotated and persisted tail points elsewhere, loop above will fold/rebase
             }
-            // If writer rotated after we set persisted_tail, loop to fold/rebaes
+            // If writer rotated after we set persisted_tail, loop to fold/rebase
             if tail_block_id != active_block.id {
+                // Reacquire column lock for the next iteration
+                info = info_arc.write().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                })?;
                 continue;
             }
 
@@ -1790,7 +1797,10 @@ impl Walrus {
                 match active_block.read(tail_off) {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
-                        // Update in-memory tail progress immediately for AtLeastOnce
+                        // Reacquire column lock to update in-memory progress, then decide persistence
+                        info = info_arc.write().map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                        })?;
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
                         persisted_tail = Some((tail_block_id, new_off));
@@ -1799,8 +1809,6 @@ impl Walrus {
                         } else {
                             None
                         };
-
-                        // Drop the column lock before touching the index to avoid lock inversion
                         drop(info);
                         if let Some((idx_val, off_val)) = maybe_persist {
                             if let Ok(mut idx_guard) = self.read_offset_index.write() {
@@ -1962,6 +1970,10 @@ impl Walrus {
 
         // Plan tail if budget remains
         if budget_left > 0 && cur_idx >= chain_len_at_plan {
+            // Snapshot in-memory tail state then drop column lock before touching writer locks
+            let tail_snapshot = (info.tail_block_id, info.tail_offset);
+            drop(info);
+
             // Get active writer block and written offset
             if let Some(writer_arc) = {
                 let map = self.writers.read().map_err(|_| {
@@ -1979,12 +1991,9 @@ impl Walrus {
                     (blk.clone(), *off)
                 };
 
-                // Use in-memory tail progress if available for this block
-                let tail_start = if info.tail_block_id == active_block.id {
-                    info.tail_offset
-                } else {
-                    0
-                };
+                // Use in-memory tail progress snapshot if available for this block
+                let (snap_id, snap_off) = tail_snapshot;
+                let tail_start = if snap_id == active_block.id { snap_off } else { 0 };
 
                 if tail_start < written {
                     let end = (tail_start + budget_left).min(written);
@@ -1998,6 +2007,11 @@ impl Walrus {
                     budget_left = budget_left.saturating_sub(end - tail_start);
                 }
             }
+
+            // Reacquire column lock for the rest of the function
+            info = info_arc.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
         }
 
         if plan.is_empty() {
