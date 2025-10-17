@@ -1955,16 +1955,16 @@ impl Walrus {
         let chain_len_at_plan = chain_snapshot.len();
 
         // 2) Build read plan from sealed chain, then tail
+        // Important: Plan full file ranges; enforce the byte budget only during parse on payload bytes
         let mut plan: Vec<ReadPlan> = Vec::new();
-        let mut budget_left = max_bytes as u64;
         let mut cur_idx = info.cur_block_idx;
         let mut cur_off = info.cur_block_offset;
 
         // Plan sealed blocks
-        while cur_idx < chain_len_at_plan && budget_left > 0 {
+        while cur_idx < chain_len_at_plan {
             let blk = chain_snapshot[cur_idx].clone();
             if cur_off < blk.used {
-                let end = (cur_off + budget_left).min(blk.used);
+                let end = blk.used; // read rest of sealed block; budget enforced during parse
                 plan.push(ReadPlan {
                     blk: blk.clone(),
                     start: cur_off,
@@ -1972,14 +1972,13 @@ impl Walrus {
                     is_tail: false,
                     chain_idx: Some(cur_idx),
                 });
-                budget_left = budget_left.saturating_sub(end - cur_off);
             }
             cur_idx += 1;
             cur_off = 0;
         }
 
-        // Plan tail if budget remains
-        if budget_left > 0 && cur_idx >= chain_len_at_plan {
+        // Plan tail if we're at the end of sealed chain
+        if cur_idx >= chain_len_at_plan {
             // Snapshot in-memory tail state then drop column lock before touching writer locks
             let tail_snapshot = (info.tail_block_id, info.tail_offset);
             drop(info);
@@ -2006,7 +2005,7 @@ impl Walrus {
                 let tail_start = if snap_id == active_block.id { snap_off } else { 0 };
 
                 if tail_start < written {
-                    let end = (tail_start + budget_left).min(written);
+                    let end = written; // read up to current writer offset
                     plan.push(ReadPlan {
                         blk: active_block.clone(),
                         start: tail_start,
@@ -2014,7 +2013,6 @@ impl Walrus {
                         is_tail: true,
                         chain_idx: None,
                     });
-                    budget_left = budget_left.saturating_sub(end - tail_start);
                 }
             }
 
@@ -2028,7 +2026,11 @@ impl Walrus {
             return Ok(Vec::new());
         }
 
-        drop(info); // Unlock before IO
+        // Hold lock across IO/parse for StrictlyAtOnce to avoid duplicate consumption
+        let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce);
+        if !hold_lock_during_io {
+            drop(info); // Unlock before IO for AtLeastOnce
+        }
 
         // 3) Read ranges via io_uring (FD backend) or mmap
         let use_io_uring = USE_FD_BACKEND.load(Ordering::Relaxed);
@@ -2198,9 +2200,14 @@ impl Walrus {
 
         // 5) Commit progress
         if entries_parsed > 0 {
-            let mut info = info_arc.write().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
-            })?;
+            let mut info = if hold_lock_during_io {
+                // reuse the held lock
+                info
+            } else {
+                info_arc.write().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                })?
+            };
 
             // Prepare persistence outside the lock
             enum PersistTarget {
