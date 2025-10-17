@@ -2175,8 +2175,11 @@ impl Walrus {
                     break; // Incomplete entry
                 }
 
-                // Check budget strictly on payload bytes
-                if total_data_bytes + data_size > max_bytes {
+                // Enforce byte budget on payload bytes, but always allow at least one entry.
+                let next_total = total_data_bytes
+                    .checked_add(data_size)
+                    .unwrap_or(usize::MAX);
+                if next_total > max_bytes && !entries.is_empty() {
                     break;
                 }
 
@@ -2195,7 +2198,7 @@ impl Walrus {
 
                 // Add to results
                 entries.push(Entry { data: data_slice.to_vec() });
-                total_data_bytes += data_size;
+                total_data_bytes = next_total;
                 entries_parsed += 1;
 
                 // Update position tracking
