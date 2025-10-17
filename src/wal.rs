@@ -1849,6 +1849,393 @@ impl Walrus {
         }
     }
 
+    pub fn batch_read_for_topic(&self, col_name: &str, max_bytes: usize) -> std::io::Result<Vec<Entry>> {
+        // Helper struct for read planning
+        struct ReadPlan {
+            blk: Block,
+            start: u64,
+            end: u64,
+            is_tail: bool,
+            chain_idx: Option<usize>,
+        }
+
+        const TAIL_FLAG: u64 = 1u64 << 63;
+
+        // 1) Get or create reader info
+        let info_arc = if let Some(arc) = {
+            let map = self.reader.data.read().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map read lock poisoned")
+            })?;
+            map.get(col_name).cloned()
+        } {
+            arc
+        } else {
+            let mut map = self.reader.data.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "reader map write lock poisoned")
+            })?;
+            map.entry(col_name.to_string())
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(ColReaderInfo {
+                        chain: Vec::new(),
+                        cur_block_idx: 0,
+                        cur_block_offset: 0,
+                        reads_since_persist: 0,
+                        tail_block_id: 0,
+                        tail_offset: 0,
+                        hydrated_from_index: false,
+                    }))
+                })
+                .clone()
+        };
+
+        let mut info = info_arc.write().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+        })?;
+
+        // Hydrate from index if needed
+        if !info.hydrated_from_index {
+            if let Ok(idx_guard) = self.read_offset_index.read() {
+                if let Some(pos) = idx_guard.get(col_name) {
+                    if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+                        let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
+                        info.tail_block_id = tail_block_id;
+                        info.tail_offset = pos.cur_block_offset;
+                        info.cur_block_idx = info.chain.len();
+                        info.cur_block_offset = 0;
+                    } else {
+                        let mut ib = pos.cur_block_idx as usize;
+                        if ib > info.chain.len() {
+                            ib = info.chain.len();
+                        }
+                        info.cur_block_idx = ib;
+                        if ib < info.chain.len() {
+                            let used = info.chain[ib].used;
+                            info.cur_block_offset = pos.cur_block_offset.min(used);
+                        } else {
+                            info.cur_block_offset = 0;
+                        }
+                    }
+                }
+                info.hydrated_from_index = true;
+            }
+        }
+
+        // Cache chain snapshot to avoid locking during parse
+        let chain_snapshot = info.chain.clone();
+        let chain_len_at_plan = chain_snapshot.len();
+
+        // 2) Build read plan from sealed chain, then tail
+        let mut plan: Vec<ReadPlan> = Vec::new();
+        let mut budget_left = max_bytes as u64;
+        let mut cur_idx = info.cur_block_idx;
+        let mut cur_off = info.cur_block_offset;
+
+        // Plan sealed blocks
+        while cur_idx < chain_len_at_plan && budget_left > 0 {
+            let blk = chain_snapshot[cur_idx].clone();
+            if cur_off < blk.used {
+                let end = (cur_off + budget_left).min(blk.used);
+                plan.push(ReadPlan {
+                    blk: blk.clone(),
+                    start: cur_off,
+                    end,
+                    is_tail: false,
+                    chain_idx: Some(cur_idx),
+                });
+                budget_left = budget_left.saturating_sub(end - cur_off);
+            }
+            cur_idx += 1;
+            cur_off = 0;
+        }
+
+        // Plan tail if budget remains
+        if budget_left > 0 && cur_idx >= chain_len_at_plan {
+            // Get active writer block and written offset
+            if let Some(writer_arc) = {
+                let map = self.writers.read().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+                })?;
+                map.get(col_name).cloned()
+            } {
+                let (active_block, written) = {
+                    let blk = writer_arc.current_block.lock().map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+                    })?;
+                    let off = writer_arc.current_offset.lock().map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+                    })?;
+                    (blk.clone(), *off)
+                };
+
+                // Use in-memory tail progress if available for this block
+                let tail_start = if info.tail_block_id == active_block.id {
+                    info.tail_offset
+                } else {
+                    0
+                };
+
+                if tail_start < written {
+                    let end = (tail_start + budget_left).min(written);
+                    plan.push(ReadPlan {
+                        blk: active_block.clone(),
+                        start: tail_start,
+                        end,
+                        is_tail: true,
+                        chain_idx: None,
+                    });
+                    budget_left = budget_left.saturating_sub(end - tail_start);
+                }
+            }
+        }
+
+        if plan.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        drop(info); // Unlock before IO
+
+        // 3) Read ranges via io_uring (FD backend) or mmap
+        let use_io_uring = USE_FD_BACKEND.load(Ordering::Relaxed);
+        let buffers: Vec<Vec<u8>>;
+
+        if use_io_uring {
+            // io_uring path
+            let ring_size = (plan.len() + 64).min(4096) as u32;
+            let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e))
+            })?;
+
+            let mut temp_buffers: Vec<Vec<u8>> = vec![Vec::new(); plan.len()];
+            let mut expected_sizes: Vec<usize> = vec![0; plan.len()];
+
+            for (plan_idx, read_plan) in plan.iter().enumerate() {
+                let size = (read_plan.end - read_plan.start) as usize;
+                expected_sizes[plan_idx] = size;
+                let mut buffer = vec![0u8; size];
+                let file_offset = read_plan.blk.offset + read_plan.start;
+
+                let fd = if let StorageImpl::Fd(fd_backend) = &read_plan.blk.mmap.storage {
+                    io_uring::types::Fd(fd_backend.file.as_raw_fd())
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "batch reads require FD backend when io_uring is enabled",
+                    ));
+                };
+
+                let read_op = io_uring::opcode::Read::new(fd, buffer.as_mut_ptr(), size as u32)
+                    .offset(file_offset)
+                    .build()
+                    .user_data(plan_idx as u64);
+
+                temp_buffers[plan_idx] = buffer;
+
+                unsafe {
+                    ring.submission().push(&read_op).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("io_uring push failed: {}", e),
+                        )
+                    })?;
+                }
+            }
+
+            // Submit and wait for all reads
+            ring.submit_and_wait(plan.len())?;
+
+            // Process completions and validate read lengths
+            for _ in 0..plan.len() {
+                if let Some(cqe) = ring.completion().next() {
+                    let plan_idx = cqe.user_data() as usize;
+                    let got = cqe.result();
+                    if got < 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("io_uring read failed: {}", got),
+                        ));
+                    }
+                    if (got as usize) != expected_sizes[plan_idx] {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("short read: got {} bytes, expected {}", got, expected_sizes[plan_idx]),
+                        ));
+                    }
+                }
+            }
+
+            buffers = temp_buffers;
+        } else {
+            // mmap fallback: copy ranges
+            buffers = plan.iter().map(|read_plan| {
+                let size = (read_plan.end - read_plan.start) as usize;
+                let mut buffer = vec![0u8; size];
+                let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
+                read_plan.blk.mmap.read(file_offset, &mut buffer);
+                buffer
+            }).collect();
+        }
+
+        // 4) Parse entries from buffers in plan order
+        let mut entries = Vec::new();
+        let mut total_data_bytes = 0usize;
+        let mut final_block_idx = 0usize;
+        let mut final_block_offset = 0u64;
+        let mut final_tail_block_id = 0u64;
+        let mut final_tail_offset = 0u64;
+        let mut entries_parsed = 0u32;
+        let mut saw_tail = false;
+
+        for (plan_idx, read_plan) in plan.iter().enumerate() {
+            let buffer = &buffers[plan_idx];
+            let mut buf_offset = 0usize;
+
+            while buf_offset < buffer.len() {
+                // Try to read metadata header
+                if buf_offset + PREFIX_META_SIZE > buffer.len() {
+                    break; // Not enough data for header
+                }
+
+                let meta_len = (buffer[buf_offset] as usize) | ((buffer[buf_offset + 1] as usize) << 8);
+
+                if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+                    // Invalid or zeroed header - stop parsing this block
+                    break;
+                }
+
+                // Deserialize metadata
+                let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
+                aligned.extend_from_slice(&buffer[buf_offset + 2..buf_offset + 2 + meta_len]);
+
+                let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+                let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
+                    Ok(m) => m,
+                    Err(_) => break, // Parse error - stop
+                };
+
+                let data_size = meta.read_size;
+                let entry_consumed = PREFIX_META_SIZE + data_size;
+
+                // Check if we have enough buffer space for the data
+                if buf_offset + entry_consumed > buffer.len() {
+                    break; // Incomplete entry
+                }
+
+                // Check budget
+                if total_data_bytes + data_size > max_bytes {
+                    // Would exceed budget - stop here
+                    break;
+                }
+
+                // Extract and verify data
+                let data_start = buf_offset + PREFIX_META_SIZE;
+                let data_end = data_start + data_size;
+                let data_slice = &buffer[data_start..data_end];
+
+                // Verify checksum
+                if checksum64(data_slice) != meta.checksum {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "checksum mismatch in batch read",
+                    ));
+                }
+
+                // Add to results
+                entries.push(Entry { data: data_slice.to_vec() });
+                total_data_bytes += data_size;
+                entries_parsed += 1;
+
+                // Update position tracking
+                let in_block_offset = read_plan.start + buf_offset as u64 + entry_consumed as u64;
+
+                if read_plan.is_tail {
+                    saw_tail = true;
+                    final_tail_block_id = read_plan.blk.id;
+                    final_tail_offset = in_block_offset;
+                } else if let Some(idx) = read_plan.chain_idx {
+                    final_block_idx = idx;
+                    final_block_offset = in_block_offset;
+                }
+
+                buf_offset += entry_consumed;
+            }
+        }
+
+        // 5) Commit progress
+        if entries_parsed > 0 {
+            let mut info = info_arc.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
+
+            // Update position
+            if saw_tail {
+                // Ensure sealed chain is caught up
+                info.cur_block_idx = chain_len_at_plan;
+                info.cur_block_offset = 0;
+                // Then set tail progress
+                info.tail_block_id = final_tail_block_id;
+                info.tail_offset = final_tail_offset;
+
+                // Persist tail position
+                match self.read_consistency {
+                    ReadConsistency::StrictlyAtOnce => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(
+                                col_name.to_string(),
+                                final_tail_block_id | TAIL_FLAG,
+                                final_tail_offset,
+                            );
+                        }
+                    }
+                    ReadConsistency::AtLeastOnce { persist_every } => {
+                        info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
+                        if info.reads_since_persist >= persist_every {
+                            info.reads_since_persist = 0;
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    final_tail_block_id | TAIL_FLAG,
+                                    final_tail_offset,
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Sealed-only
+                info.cur_block_idx = final_block_idx;
+                info.cur_block_offset = final_block_offset;
+
+                // Persist sealed position
+                match self.read_consistency {
+                    ReadConsistency::StrictlyAtOnce => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(
+                                col_name.to_string(),
+                                final_block_idx as u64,
+                                final_block_offset,
+                            );
+                        }
+                    }
+                    ReadConsistency::AtLeastOnce { persist_every } => {
+                        info.reads_since_persist = info.reads_since_persist.saturating_add(entries_parsed);
+                        if info.reads_since_persist >= persist_every {
+                            info.reads_since_persist = 0;
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(
+                                    col_name.to_string(),
+                                    final_block_idx as u64,
+                                    final_block_offset,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     fn startup_chore(&self) -> std::io::Result<()> {
         // Minimal recovery: scan wal_files, build reader chains, and rebuild trackers
         let dir = match fs::read_dir("./wal_files") {
