@@ -1734,6 +1734,10 @@ impl Walrus {
             };
 
             // If persisted tail points to a different block and that block is now sealed in chain, fold it
+            // Reacquire column lock for folding/rebasing decisions
+            let mut info = info_arc.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
             if let Some((tail_block_id, tail_off)) = persisted_tail {
                 if tail_block_id != active_block.id {
                     if let Some((idx, _)) = info
@@ -1754,6 +1758,7 @@ impl Walrus {
                             }
                         }
                         persisted_tail = None; // sealed now
+                        drop(info);
                         continue;
                     } else {
                         // rebase tail to current active block at 0
@@ -1778,6 +1783,7 @@ impl Walrus {
                     }
                 }
             }
+            drop(info);
 
             // Choose the best known tail offset: prefer in-memory snapshot for current active block
             let (tail_block_id, mut tail_off) = match persisted_tail {
@@ -1808,7 +1814,6 @@ impl Walrus {
                         })?;
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
-                        persisted_tail = Some((tail_block_id, new_off));
                         let maybe_persist = if self.should_persist(&mut info, false) {
                             Some((tail_block_id | TAIL_FLAG, new_off))
                         } else {
@@ -2014,7 +2019,7 @@ impl Walrus {
             }
 
             // Reacquire column lock for the rest of the function
-            let mut info = info_arc.write().map_err(|_| {
+            info = info_arc.write().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
             })?;
         }
