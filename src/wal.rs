@@ -1568,25 +1568,22 @@ impl Walrus {
             }
         }
 
-        // If we have a persisted tail and some sealed blocks were recovered, fold into the block by ID
-        if let Some((tail_block_id, tail_off)) = persisted_tail {
+        // If we have a persisted tail and some sealed blocks were recovered, fold into the last block
+        if let Some((_, tail_off)) = persisted_tail {
             if !info.chain.is_empty() {
-                // Find the tail block by ID (it might not be the last block in the chain!)
-                if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
-                    info.cur_block_idx = idx;
-                    info.cur_block_offset = tail_off.min(info.chain[idx].used);
-                    if self.should_persist(&mut info, true) {
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(
-                                col_name.to_string(),
-                                info.cur_block_idx as u64,
-                                info.cur_block_offset,
-                            );
-                        }
+                let ib = info.chain.len() - 1;
+                info.cur_block_idx = ib;
+                info.cur_block_offset = tail_off.min(info.chain[ib].used);
+                if self.should_persist(&mut info, true) {
+                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                        let _ = idx_guard.set(
+                            col_name.to_string(),
+                            info.cur_block_idx as u64,
+                            info.cur_block_offset,
+                        );
                     }
-                    persisted_tail = None;
                 }
-                // else: tail block not in chain yet, leave persisted_tail for tail path to handle
+                persisted_tail = None;
             }
         }
 
