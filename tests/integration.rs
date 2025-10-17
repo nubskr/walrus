@@ -8,6 +8,8 @@ use walrus_rust::wal::Walrus;
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
     thread::sleep(Duration::from_millis(10));
+    // Ensure debug logging stays quiet for tests
+    std::env::set_var("WALRUS_QUIET", "1");
 }
 
 fn first_data_file() -> String {

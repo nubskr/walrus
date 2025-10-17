@@ -5,6 +5,8 @@ use walrus_rust::wal::{Entry, WalIndex, Walrus};
 
 fn cleanup_wal() {
     let _ = fs::remove_dir_all("wal_files");
+    // Quiet debug output for test runs
+    std::env::set_var("WALRUS_QUIET", "1");
 }
 
 fn first_data_file() -> String {
