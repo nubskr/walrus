@@ -168,11 +168,19 @@ Walrus organizes data in the following structure:
 
 ```
 wal_files/
-├── wal_1234567890.log          # Log files (10MB blocks, 100 blocks per file)
-├── wal_1234567891.log
-├── read_offset_idx_index.db    # Persistent read offset index
-└── read_offset_idx_index.db.tmp # Temporary file for atomic updates
+├── 1700000000                  # Default instance log file (10MB blocks, 100 per file)
+├── read_offset_idx_index.db    # Default instance read-offset index
+├── analytics/                  # Keyed instance for "analytics"
+│   ├── 1700000100
+│   └── read_offset_idx_index.db
+└── transactions/               # Keyed instance for "transactions"
+    ├── 1700000200
+    └── read_offset_idx_index.db
 ```
+
+Each `Walrus` instance writes under `wal_files/`. Instances created with the new
+key-aware constructors store their files inside a sanitized subdirectory named
+after the key, keeping topics with different durability requirements isolated.
 
 ### Storage Configuration
 
@@ -193,6 +201,24 @@ Creates a WAL with custom consistency mode and default fsync schedule (1000ms).
 
 #### `Walrus::with_consistency_and_schedule(mode: ReadConsistency, schedule: FsyncSchedule) -> std::io::Result<Self>`
 Creates a WAL with full configuration control.
+
+#### `Walrus::new_for_key(key: &str) -> std::io::Result<Self>`
+Creates a new WAL instance that is namespaced under `wal_files/<sanitized-key>/`,
+allowing multiple configurations to coexist without sharing log or index files.
+
+#### `Walrus::with_consistency_for_key(key: &str, mode: ReadConsistency) -> std::io::Result<Self>`
+Same as `with_consistency`, but stores all files inside the directory that
+corresponds to the provided key.
+
+#### `Walrus::with_consistency_and_schedule_for_key(key: &str, mode: ReadConsistency, schedule: FsyncSchedule) -> std::io::Result<Self>`
+Full configuration control plus per-key isolation, ideal when different topics
+need separate fsync guarantees or tuning.
+
+You can also set the environment variable `WALRUS_INSTANCE_KEY` to force the
+default constructors (`Walrus::new`, `Walrus::with_consistency`, etc.) to use a
+sanitized subdirectory under `wal_files/` that matches the supplied key. This is
+handy when you want multiple independent WAL instances in the same process
+without switching APIs.
 
 #### `append_for_topic(&self, topic: &str, data: &[u8]) -> std::io::Result<()>`
 Appends data to the specified topic. Topics are created automatically on first write.
@@ -602,4 +628,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Persistent read offset tracking
 
 ---
-

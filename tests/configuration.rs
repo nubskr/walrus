@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestEnv, current_wal_dir};
+use common::{TestEnv, current_wal_dir, sanitize_key, wal_root_dir};
 use std::fs;
 use std::sync::Arc;
 use std::thread;
@@ -500,4 +500,82 @@ fn test_file_state_tracking() {
     }
 
     assert!(wal.read_next("state_test").unwrap().is_none());
+}
+
+#[test]
+fn key_based_instances_use_isolated_directories() {
+    let _env = setup_env();
+
+    {
+        let wal = Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce)
+            .unwrap();
+        wal.append_for_topic("tx", b"txn-1").unwrap();
+    }
+
+    {
+        let wal =
+            Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("events", b"evt-1").unwrap();
+    }
+
+    let mut dir_names: Vec<_> = fs::read_dir(wal_root_dir())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    dir_names.sort();
+
+    assert_eq!(
+        dir_names,
+        vec![sanitize_key("analytics"), sanitize_key("transactions")]
+    );
+}
+
+#[test]
+fn key_based_instances_recover_independently() {
+    let _env = setup_env();
+
+    {
+        let wal = Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce)
+            .unwrap();
+        wal.append_for_topic("tx", b"a").unwrap();
+        wal.append_for_topic("tx", b"b").unwrap();
+    }
+
+    {
+        let wal =
+            Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("events", b"x").unwrap();
+    }
+
+    let wal_tx =
+        Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce).unwrap();
+    assert_eq!(wal_tx.read_next("tx").unwrap().unwrap().data, b"a");
+    assert_eq!(wal_tx.read_next("tx").unwrap().unwrap().data, b"b");
+    assert!(wal_tx.read_next("tx").unwrap().is_none());
+
+    let wal_an =
+        Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+    assert!(wal_an.read_next("tx").unwrap().is_none());
+    assert_eq!(wal_an.read_next("events").unwrap().unwrap().data, b"x");
+    assert!(wal_an.read_next("events").unwrap().is_none());
+}
+
+#[test]
+fn key_names_are_sanitized_for_directories() {
+    let _env = setup_env();
+    let key = "prod/payments::v1";
+
+    {
+        let wal = Walrus::with_consistency_for_key(key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("topic", b"payload").unwrap();
+    }
+
+    let expected_dir = wal_root_dir().join(sanitize_key(key));
+    assert!(
+        expected_dir.is_dir(),
+        "expected namespace directory {:?} to exist",
+        expected_dir
+    );
 }

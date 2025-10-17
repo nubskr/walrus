@@ -23,6 +23,8 @@ memmap2 = "0.9.8"
 rkyv = { version = "0.7", features = ["validation", "strict"] }
 rand = "0.8"
 libc = "0.2.177"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.10"
 
 [[test]]

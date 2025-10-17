@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -63,12 +64,64 @@ fn wal_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("wal_files"))
 }
 
-fn ensure_wal_data_dir() -> std::io::Result<()> {
-    fs::create_dir_all(wal_data_dir())
+fn sanitize_namespace(key: &str) -> String {
+    let mut sanitized: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.trim_matches('_').is_empty() {
+        sanitized = format!("ns_{:x}", checksum64(key.as_bytes()));
+    }
+    sanitized
 }
 
-fn wal_index_path(file_name: &str) -> PathBuf {
-    wal_data_dir().join(format!("{}_index.db", file_name))
+#[derive(Debug, Clone)]
+struct WalPathManager {
+    root: PathBuf,
+}
+
+impl WalPathManager {
+    fn default() -> Self {
+        let mut root = wal_data_dir();
+        if let Ok(key) = std::env::var("WALRUS_INSTANCE_KEY") {
+            root.push(sanitize_namespace(&key));
+        }
+        Self { root }
+    }
+
+    fn for_key(key: &str) -> Self {
+        let mut root = wal_data_dir();
+        root.push(sanitize_namespace(key));
+        Self { root }
+    }
+
+    fn ensure_root(&self) -> std::io::Result<()> {
+        fs::create_dir_all(&self.root)
+    }
+
+    fn index_path(&self, file_name: &str) -> PathBuf {
+        self.root.join(format!("{}_index.db", file_name))
+    }
+
+    fn create_new_file(&self) -> std::io::Result<String> {
+        self.ensure_root()?;
+        let file_name = now_millis_str();
+        let path = self.root.join(&file_name);
+        let f = std::fs::File::create(&path)?;
+        f.set_len(MAX_FILE_SIZE)?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 // FD-based backend for storage
@@ -310,26 +363,16 @@ impl Block {
     }
 }
 
-fn make_new_file() -> std::io::Result<String> {
-    ensure_wal_data_dir()?;
-    let file_name = now_millis_str();
-    let dir = wal_data_dir();
-    let path = dir.join(&file_name);
-    let f = std::fs::File::create(&path)?;
-    f.set_len(MAX_FILE_SIZE)?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
 // has block metas to give out
 struct BlockAllocator {
     next_block: UnsafeCell<Block>,
     lock: AtomicBool,
+    paths: Arc<WalPathManager>,
 }
 
 impl BlockAllocator {
-    pub fn new() -> std::io::Result<Self> {
-        let _ = ensure_wal_data_dir();
-        let file1 = make_new_file()?;
+    pub fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
+        let file1 = paths.create_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
         debug_print!(
             "[alloc] init: created file={}, max_file_size={}B, block_size={}B",
@@ -347,6 +390,7 @@ impl BlockAllocator {
                 used: 0,
             }),
             lock: AtomicBool::new(false),
+            paths,
         })
     }
 
@@ -365,7 +409,7 @@ impl BlockAllocator {
         if data.offset >= MAX_FILE_SIZE {
             // mark previous file as fully allocated before switching
             FileStateTracker::set_fully_allocated(prev_block_file_path);
-            data.file_path = make_new_file()?;
+            data.file_path = self.paths.create_new_file()?;
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
             data.offset = 0;
             data.used = 0;
@@ -416,7 +460,7 @@ impl BlockAllocator {
         let data = unsafe { &mut *self.next_block.get() };
         if data.offset + alloc_size > MAX_FILE_SIZE {
             let prev_block_file_path = data.file_path.clone();
-            data.file_path = make_new_file()?;
+            data.file_path = self.paths.create_new_file()?;
             data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
             data.offset = 0;
             // mark the previous file fully allocated now
@@ -833,8 +877,13 @@ pub struct WalIndex {
 
 impl WalIndex {
     pub fn new(file_name: &str) -> std::io::Result<Self> {
-        let _ = ensure_wal_data_dir();
-        let path = wal_index_path(file_name);
+        let paths = WalPathManager::default();
+        Self::new_in(&paths, file_name)
+    }
+
+    pub fn new_in(paths: &WalPathManager, file_name: &str) -> std::io::Result<Self> {
+        paths.ensure_root()?;
+        let path = paths.index_path(file_name);
         let store = path
             .exists()
             .then(|| fs::read(&path).ok())
@@ -917,6 +966,7 @@ pub struct Walrus {
     read_offset_index: Arc<RwLock<WalIndex>>,
     read_consistency: ReadConsistency,
     fsync_schedule: FsyncSchedule,
+    paths: Arc<WalPathManager>,
 }
 
 impl Walrus {
@@ -932,12 +982,38 @@ impl Walrus {
         mode: ReadConsistency,
         fsync_schedule: FsyncSchedule,
     ) -> std::io::Result<Self> {
+        let paths = Arc::new(WalPathManager::default());
+        Self::with_paths(paths, mode, fsync_schedule)
+    }
+
+    pub fn new_for_key(key: &str) -> std::io::Result<Self> {
+        Self::with_consistency_for_key(key, ReadConsistency::StrictlyAtOnce)
+    }
+
+    pub fn with_consistency_for_key(key: &str, mode: ReadConsistency) -> std::io::Result<Self> {
+        Self::with_consistency_and_schedule_for_key(key, mode, FsyncSchedule::Milliseconds(200))
+    }
+
+    pub fn with_consistency_and_schedule_for_key(
+        key: &str,
+        mode: ReadConsistency,
+        fsync_schedule: FsyncSchedule,
+    ) -> std::io::Result<Self> {
+        let paths = Arc::new(WalPathManager::for_key(key));
+        Self::with_paths(paths, mode, fsync_schedule)
+    }
+
+    fn with_paths(
+        paths: Arc<WalPathManager>,
+        mode: ReadConsistency,
+        fsync_schedule: FsyncSchedule,
+    ) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
 
         // Store the fsync schedule globally for SharedMmap::new to access
         let _ = GLOBAL_FSYNC_SCHEDULE.set(fsync_schedule);
 
-        let allocator = Arc::new(BlockAllocator::new()?);
+        let allocator = Arc::new(BlockAllocator::new(paths.clone())?);
         let reader = Arc::new(Reader::new());
         let (tx, rx) = mpsc::channel::<String>();
         let tx_arc = Arc::new(tx);
@@ -958,7 +1034,7 @@ impl Walrus {
             let del_rx = del_rx;
             let mut delete_pending = std::collections::HashSet::new();
 
-            // Create io_uring instance for batched fsync (only used with FD backend)
+            #[cfg(target_os = "linux")]
             let mut ring = io_uring::IoUring::new(2048).expect("Failed to create io_uring");
 
             loop {
@@ -1034,70 +1110,83 @@ impl Walrus {
                 }
 
                 // Phase 3: Flush operations
-                if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                    // FD backend: Use io_uring for batched fsync
-                    let mut fsync_batch = Vec::new();
+                #[cfg(target_os = "linux")]
+                {
+                    if USE_FD_BACKEND.load(Ordering::Relaxed) {
+                        // FD backend: Use io_uring for batched fsync
+                        let mut fsync_batch = Vec::new();
 
-                    for path in unique.iter() {
-                        if let Some(StorageImpl::Fd(fd_backend)) = pool.get(path) {
-                            let raw_fd = fd_backend.file.as_raw_fd();
-                            fsync_batch.push((raw_fd, path.clone()));
+                        for path in unique.iter() {
+                            if let Some(StorageImpl::Fd(fd_backend)) = pool.get(path) {
+                                let raw_fd = fd_backend.file.as_raw_fd();
+                                fsync_batch.push((raw_fd, path.clone()));
+                            }
                         }
-                    }
 
-                    if !fsync_batch.is_empty() {
-                        debug_print!("[flush] batching {} fsync operations", fsync_batch.len());
+                        if !fsync_batch.is_empty() {
+                            debug_print!("[flush] batching {} fsync operations", fsync_batch.len());
 
-                        // Push all fsync operations to submission queue
-                        for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
-                            let fd = io_uring::types::Fd(*raw_fd);
+                            // Push all fsync operations to submission queue
+                            for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
+                                let fd = io_uring::types::Fd(*raw_fd);
 
-                            let fsync_op =
-                                io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
+                                let fsync_op =
+                                    io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
 
-                            unsafe {
-                                if ring.submission().push(&fsync_op).is_err() {
-                                    // Submission queue full, submit current batch
-                                    ring.submit().expect("Failed to submit fsync batch");
-                                    ring.submission()
-                                        .push(&fsync_op)
-                                        .expect("Failed to push fsync op");
+                                unsafe {
+                                    if ring.submission().push(&fsync_op).is_err() {
+                                        // Submission queue full, submit current batch
+                                        ring.submit().expect("Failed to submit fsync batch");
+                                        ring.submission()
+                                            .push(&fsync_op)
+                                            .expect("Failed to push fsync op");
+                                    }
                                 }
                             }
-                        }
 
-                        // Single syscall to submit all fsync operations!
-                        match ring.submit_and_wait(fsync_batch.len()) {
-                            Ok(submitted) => {
-                                debug_print!(
-                                    "[flush] submitted {} fsync ops in one syscall",
-                                    submitted
-                                );
-                            }
-                            Err(e) => {
-                                debug_print!("[flush] failed to submit fsync batch: {}", e);
-                            }
-                        }
-
-                        // Process completions
-                        for _ in 0..fsync_batch.len() {
-                            if let Some(cqe) = ring.completion().next() {
-                                let idx = cqe.user_data() as usize;
-                                let result = cqe.result();
-
-                                if result < 0 {
-                                    let (_fd, path) = &fsync_batch[idx];
+                            // Single syscall to submit all fsync operations!
+                            match ring.submit_and_wait(fsync_batch.len()) {
+                                Ok(submitted) => {
                                     debug_print!(
-                                        "[flush] fsync error for {}: error code {}",
-                                        path,
-                                        result
+                                        "[flush] submitted {} fsync ops in one syscall",
+                                        submitted
                                     );
                                 }
+                                Err(e) => {
+                                    debug_print!("[flush] failed to submit fsync batch: {}", e);
+                                }
+                            }
+
+                            // Process completions
+                            for _ in 0..fsync_batch.len() {
+                                if let Some(cqe) = ring.completion().next() {
+                                    let idx = cqe.user_data() as usize;
+                                    let result = cqe.result();
+
+                                    if result < 0 {
+                                        let (_fd, path) = &fsync_batch[idx];
+                                        debug_print!(
+                                            "[flush] fsync error for {}: error code {}",
+                                            path,
+                                            result
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for path in unique.iter() {
+                            if let Some(storage) = pool.get_mut(path) {
+                                if let Err(e) = storage.flush() {
+                                    debug_print!("[flush] flush error for {}: {}", path, e);
+                                }
                             }
                         }
                     }
-                } else {
-                    // Mmap backend: Use existing storage.flush() method
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
                     for path in unique.iter() {
                         if let Some(storage) = pool.get_mut(path) {
                             if let Err(e) = storage.flush() {
@@ -1138,7 +1227,7 @@ impl Walrus {
             }
         });
 
-        let idx = WalIndex::new("read_offset_idx")?;
+        let idx = WalIndex::new_in(&paths, "read_offset_idx")?;
         let instance = Walrus {
             allocator,
             reader,
@@ -1147,6 +1236,7 @@ impl Walrus {
             read_offset_index: Arc::new(RwLock::new(idx)),
             read_consistency: mode,
             fsync_schedule,
+            paths,
         };
         instance.startup_chore()?;
         Ok(instance)
@@ -1345,151 +1435,175 @@ impl Walrus {
         );
 
         // Phase 2 & 3: io_uring preparation and submission (FD backend only)
-        let use_io_uring = USE_FD_BACKEND.load(Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            if USE_FD_BACKEND.load(Ordering::Relaxed) {
+                return Self::submit_batch_via_io_uring(
+                    &write_plan,
+                    batch,
+                    &mut revert_info,
+                    col_name,
+                    cur_offset,
+                    planning_offset,
+                    total_bytes,
+                );
+            }
+        }
 
-        if use_io_uring {
-            // io_uring path
-            let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
-            let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
+        // Fallback: use regular block.write() in a loop (mmap backend or non-Linux builds)
+        for (blk, offset, data_idx) in write_plan.iter() {
+            let data = batch[*data_idx];
+            let next_block_start = blk.offset + blk.limit;
+
+            if let Err(e) = blk.write(*offset, data, col_name, next_block_start) {
+                // Clean up any partially written headers up to and including the failed index
+                for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
+                    let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
+                }
+
+                // Flush zeros and rollback
+                let mut fsynced = std::collections::HashSet::new();
+                for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
+                    if fsynced.insert(w_blk.file_path.clone()) {
+                        let _ = w_blk.mmap.flush();
+                    }
+                }
+
+                *cur_offset = revert_info.original_offset;
+                for block_id in revert_info.allocated_block_ids {
+                    FileStateTracker::set_block_unlocked(block_id as usize);
+                }
+                return Err(e);
+            }
+        }
+
+        // Success - fsync touched files
+        let mut fsynced = std::collections::HashSet::new();
+        for (blk, _, _) in write_plan.iter() {
+            if !fsynced.contains(&blk.file_path) {
+                blk.mmap.flush()?;
+                fsynced.insert(blk.file_path.clone());
+            }
+        }
+
+        // NOW update the writer's offset to make data visible to readers
+        *cur_offset = planning_offset;
+
+        debug_print!(
+            "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
+            batch.len(),
+            total_bytes,
+            col_name
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn submit_batch_via_io_uring(
+        write_plan: &[(Block, u64, usize)],
+        batch: &[&[u8]],
+        revert_info: &mut BatchRevertInfo,
+        col_name: &str,
+        cur_offset: &mut u64,
+        planning_offset: u64,
+        total_bytes: usize,
+    ) -> std::io::Result<()> {
+        let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
+        let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("io_uring init failed: {}", e),
+            )
+        })?;
+        let mut buffers: Vec<Vec<u8>> = Vec::new();
+
+        for (blk, offset, data_idx) in write_plan.iter() {
+            let data = batch[*data_idx];
+            let next_block_start = blk.offset + blk.limit;
+
+            // Prepare metadata
+            let new_meta = Metadata {
+                read_size: data.len(),
+                owned_by: col_name.to_string(),
+                next_block_start,
+                checksum: checksum64(data),
+            };
+
+            let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("io_uring init failed: {}", e),
+                    format!("serialize metadata failed: {:?}", e),
                 )
             })?;
-            let mut buffers: Vec<Vec<u8>> = Vec::new();
 
-            for (blk, offset, data_idx) in write_plan.iter() {
-                let data = batch[*data_idx];
-                let next_block_start = blk.offset + blk.limit;
+            let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
+            meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
+            meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
+            meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
 
-                // Prepare metadata
-                let new_meta = Metadata {
-                    read_size: data.len(),
-                    owned_by: col_name.to_string(),
-                    next_block_start,
-                    checksum: checksum64(data),
-                };
+            let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
+            combined.extend_from_slice(&meta_buffer);
+            combined.extend_from_slice(data);
 
-                let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
+            let file_offset = blk.offset + offset;
+
+            // Get raw FD
+            let fd = if let StorageImpl::Fd(fd_backend) = &blk.mmap.storage {
+                io_uring::types::Fd(fd_backend.file.as_raw_fd())
+            } else {
+                // Rollback and fail
+                *cur_offset = revert_info.original_offset;
+                for block_id in revert_info.allocated_block_ids.iter() {
+                    FileStateTracker::set_block_unlocked(*block_id as usize);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "batch writes require FD backend",
+                ));
+            };
+
+            let write_op =
+                io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32)
+                    .offset(file_offset)
+                    .build()
+                    .user_data(*data_idx as u64);
+
+            buffers.push(combined);
+
+            unsafe {
+                ring.submission().push(&write_op).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("serialize metadata failed: {:?}", e),
+                        format!("io_uring push failed: {}", e),
                     )
                 })?;
-
-                let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-                meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
-                meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
-                meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-
-                let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-                combined.extend_from_slice(&meta_buffer);
-                combined.extend_from_slice(data);
-
-                let file_offset = blk.offset + offset;
-
-                // Get raw FD
-                let fd = if let StorageImpl::Fd(fd_backend) = &blk.mmap.storage {
-                    io_uring::types::Fd(fd_backend.file.as_raw_fd())
-                } else {
-                    // Rollback and fail
-                    *cur_offset = revert_info.original_offset;
-                    for block_id in revert_info.allocated_block_ids {
-                        FileStateTracker::set_block_unlocked(block_id as usize);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "batch writes require FD backend",
-                    ));
-                };
-
-                let write_op =
-                    io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32)
-                        .offset(file_offset)
-                        .build()
-                        .user_data(*data_idx as u64);
-
-                buffers.push(combined);
-
-                unsafe {
-                    ring.submission().push(&write_op).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("io_uring push failed: {}", e),
-                        )
-                    })?;
-                }
             }
+        }
 
-            debug_print!(
-                "[batch] submitting {} operations via io_uring",
-                write_plan.len()
-            );
+        debug_print!(
+            "[batch] submitting {} operations via io_uring",
+            write_plan.len()
+        );
 
-            // Phase 3: Atomic submission
-            match ring.submit_and_wait(write_plan.len()) {
-                Ok(_) => {
-                    let mut all_success = true;
-                    for _ in 0..write_plan.len() {
-                        if let Some(cqe) = ring.completion().next() {
-                            if cqe.result() < 0 {
-                                all_success = false;
-                                debug_print!(
-                                    "[batch] write failed for entry {}: error {}",
-                                    cqe.user_data(),
-                                    cqe.result()
-                                );
-                                break;
-                            }
+        // Phase 3: Atomic submission
+        match ring.submit_and_wait(write_plan.len()) {
+            Ok(_) => {
+                let mut all_success = true;
+                for _ in 0..write_plan.len() {
+                    if let Some(cqe) = ring.completion().next() {
+                        if cqe.result() < 0 {
+                            all_success = false;
+                            debug_print!(
+                                "[batch] write failed for entry {}: error {}",
+                                cqe.user_data(),
+                                cqe.result()
+                            );
+                            break;
                         }
                     }
-
-                    if !all_success {
-                        // Clean up garbage before rollback: zero headers for all planned entries
-                        for (blk, offset, _idx) in write_plan.iter() {
-                            let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
-                        }
-
-                        // Ensure zeros are persisted
-                        let mut fsynced = std::collections::HashSet::new();
-                        for (blk, _, _) in write_plan.iter() {
-                            if fsynced.insert(blk.file_path.clone()) {
-                                let _ = blk.mmap.flush();
-                            }
-                        }
-
-                        // Rollback
-                        *cur_offset = revert_info.original_offset;
-                        for block_id in revert_info.allocated_block_ids {
-                            FileStateTracker::set_block_unlocked(block_id as usize);
-                        }
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "batch write failed, rolled back",
-                        ));
-                    }
-
-                    // Success - fsync all touched files
-                    let mut fsynced = std::collections::HashSet::new();
-                    for (blk, _, _) in write_plan.iter() {
-                        if !fsynced.contains(&blk.file_path) {
-                            blk.mmap.flush()?;
-                            fsynced.insert(blk.file_path.clone());
-                        }
-                    }
-
-                    // NOW update the writer's offset to make data visible to readers
-                    *cur_offset = planning_offset;
-
-                    debug_print!(
-                        "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
-                        batch.len(),
-                        total_bytes,
-                        col_name
-                    );
-                    Ok(())
                 }
-                Err(e) => {
+
+                if !all_success {
                     // Clean up garbage before rollback: zero headers for all planned entries
                     for (blk, offset, _idx) in write_plan.iter() {
                         let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
@@ -1505,59 +1619,56 @@ impl Walrus {
 
                     // Rollback
                     *cur_offset = revert_info.original_offset;
-                    for block_id in revert_info.allocated_block_ids {
-                        FileStateTracker::set_block_unlocked(block_id as usize);
+                    for block_id in revert_info.allocated_block_ids.iter() {
+                        FileStateTracker::set_block_unlocked(*block_id as usize);
                     }
-                    Err(e)
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "batch write failed, rolled back",
+                    ));
                 }
-            }
-        } else {
-            // Fallback: use regular block.write() in a loop (mmap backend)
-            for (blk, offset, data_idx) in write_plan.iter() {
-                let data = batch[*data_idx];
-                let next_block_start = blk.offset + blk.limit;
 
-                if let Err(e) = blk.write(*offset, data, col_name, next_block_start) {
-                    // Clean up any partially written headers up to and including the failed index
-                    for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
-                        let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
+                // Success - fsync all touched files
+                let mut fsynced = std::collections::HashSet::new();
+                for (blk, _, _) in write_plan.iter() {
+                    if !fsynced.contains(&blk.file_path) {
+                        blk.mmap.flush()?;
+                        fsynced.insert(blk.file_path.clone());
                     }
-
-                    // Flush zeros and rollback
-                    let mut fsynced = std::collections::HashSet::new();
-                    for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
-                        if fsynced.insert(w_blk.file_path.clone()) {
-                            let _ = w_blk.mmap.flush();
-                        }
-                    }
-
-                    *cur_offset = revert_info.original_offset;
-                    for block_id in revert_info.allocated_block_ids {
-                        FileStateTracker::set_block_unlocked(block_id as usize);
-                    }
-                    return Err(e);
                 }
-            }
 
-            // Success - fsync touched files
-            let mut fsynced = std::collections::HashSet::new();
-            for (blk, _, _) in write_plan.iter() {
-                if !fsynced.contains(&blk.file_path) {
-                    blk.mmap.flush()?;
-                    fsynced.insert(blk.file_path.clone());
+                // NOW update the writer's offset to make data visible to readers
+                *cur_offset = planning_offset;
+
+                debug_print!(
+                    "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
+                    batch.len(),
+                    total_bytes,
+                    col_name
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Clean up garbage before rollback: zero headers for all planned entries
+                for (blk, offset, _idx) in write_plan.iter() {
+                    let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
                 }
+
+                // Ensure zeros are persisted
+                let mut fsynced = std::collections::HashSet::new();
+                for (blk, _, _) in write_plan.iter() {
+                    if fsynced.insert(blk.file_path.clone()) {
+                        let _ = blk.mmap.flush();
+                    }
+                }
+
+                // Rollback
+                *cur_offset = revert_info.original_offset;
+                for block_id in revert_info.allocated_block_ids.iter() {
+                    FileStateTracker::set_block_unlocked(*block_id as usize);
+                }
+                Err(e)
             }
-
-            // NOW update the writer's offset to make data visible to readers
-            *cur_offset = planning_offset;
-
-            debug_print!(
-                "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
-                batch.len(),
-                total_bytes,
-                col_name
-            );
-            Ok(())
         }
     }
 
@@ -2069,10 +2180,8 @@ impl Walrus {
         }
 
         // 3) Read ranges via io_uring (FD backend) or mmap
-        let use_io_uring = USE_FD_BACKEND.load(Ordering::Relaxed);
-        let buffers: Vec<Vec<u8>>;
-
-        if use_io_uring {
+        #[cfg(target_os = "linux")]
+        let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) {
             // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
             let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
@@ -2143,11 +2252,9 @@ impl Walrus {
                 }
             }
 
-            buffers = temp_buffers;
+            temp_buffers
         } else {
-            // mmap fallback: copy ranges
-            buffers = plan
-                .iter()
+            plan.iter()
                 .map(|read_plan| {
                     let size = (read_plan.end - read_plan.start) as usize;
                     let mut buffer = vec![0u8; size];
@@ -2155,8 +2262,20 @@ impl Walrus {
                     read_plan.blk.mmap.read(file_offset, &mut buffer);
                     buffer
                 })
-                .collect();
-        }
+                .collect()
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let buffers: Vec<Vec<u8>> = plan
+            .iter()
+            .map(|read_plan| {
+                let size = (read_plan.end - read_plan.start) as usize;
+                let mut buffer = vec![0u8; size];
+                let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
+                read_plan.blk.mmap.read(file_offset, &mut buffer);
+                buffer
+            })
+            .collect();
 
         // 4) Parse entries from buffers in plan order
         let mut entries = Vec::new();
@@ -2337,14 +2456,22 @@ impl Walrus {
 
     fn startup_chore(&self) -> std::io::Result<()> {
         // Minimal recovery: scan wal data dir, build reader chains, and rebuild trackers
-        let data_dir = wal_data_dir();
-        let dir = match fs::read_dir(&data_dir) {
+        let dir = match fs::read_dir(self.paths.root()) {
             Ok(d) => d,
             Err(_) => return Ok(()),
         };
         let mut files: Vec<String> = Vec::new();
-        for entry in dir.flatten() {
+        for entry in dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             let path = entry.path();
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    continue;
+                }
+            }
             if let Some(s) = path.to_str() {
                 // skip index files
                 if s.ends_with("_index.db") {
