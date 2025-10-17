@@ -7,7 +7,8 @@ use std::time::Duration;
 static TEST_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
-    let guard = TEST_LOCK.lock().unwrap();
+    // Recover from poisoned lock instead of panicking
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
 
@@ -669,57 +670,80 @@ fn test_chaos_readers_at_different_positions_during_batch() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+    // Test that batch writes are visible atomically to readers at different positions
+    // We'll create separate WAL instances to simulate different reader positions
+
+    // Write initial data
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::AtLeastOnce { persist_every: 1 },
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        // Pre-populate with 5 regular entries
+        for i in 0..5 {
+            let data = format!("pre_{}", i);
+            wal.append_for_topic("positioned_topic", data.as_bytes()).unwrap();
+        }
+    }
+
+    // Create reader at position 0
+    let wal1 = Walrus::with_consistency_and_schedule(
         ReadConsistency::AtLeastOnce { persist_every: 1 },
         FsyncSchedule::NoFsync,
     )
-    .unwrap());
+    .unwrap();
 
-    // Pre-populate with some entries
-    for i in 0..10 {
-        let data = format!("pre_{}", i);
-        wal.append_for_topic("positioned_topic", data.as_bytes()).unwrap();
+    // Create reader that consumes 3 entries (position 3)
+    let wal2 = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 1 },
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+    for _ in 0..3 {
+        wal2.read_next("positioned_topic").unwrap();
     }
 
-    // Position readers at different offsets
-    let reader1_wal = wal.clone();
-    let reader2_wal = wal.clone();
-    let reader3_wal = wal.clone();
-
-    // Reader 1: reads 0 entries (at beginning)
-    // Reader 2: reads 5 entries (in middle)
+    // Create reader that consumes all 5 entries (position 5)
+    let wal3 = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 1 },
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
     for _ in 0..5 {
-        reader2_wal.read_next("positioned_topic").unwrap();
-    }
-    // Reader 3: reads all 10 entries (at end)
-    for _ in 0..10 {
-        reader3_wal.read_next("positioned_topic").unwrap();
+        wal3.read_next("positioned_topic").unwrap();
     }
 
-    // Now write a batch
-    let batch: Vec<&[u8]> = vec![b"batch_1", b"batch_2", b"batch_3"];
-    wal.batch_append_for_topic("positioned_topic", &batch).unwrap();
+    // Now write a batch with 4 entries
+    let wal_writer = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 1 },
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+    let batch: Vec<&[u8]> = vec![b"batch_1", b"batch_2", b"batch_3", b"batch_4"];
+    wal_writer.batch_append_for_topic("positioned_topic", &batch).unwrap();
 
-    // Reader 1 should see all 10 pre + 3 batch = 13 entries
+    // Reader 1 (at position 0) should see all 5 pre + 4 batch = 9 entries
     let mut r1_count = 0;
-    while reader1_wal.read_next("positioned_topic").unwrap().is_some() {
+    while wal1.read_next("positioned_topic").unwrap().is_some() {
         r1_count += 1;
     }
-    assert_eq!(r1_count, 13);
+    assert_eq!(r1_count, 9);
 
-    // Reader 2 should see 5 pre + 3 batch = 8 entries
+    // Reader 2 (at position 3) should see 2 pre + 4 batch = 6 entries
     let mut r2_count = 0;
-    while reader2_wal.read_next("positioned_topic").unwrap().is_some() {
+    while wal2.read_next("positioned_topic").unwrap().is_some() {
         r2_count += 1;
     }
-    assert_eq!(r2_count, 8);
+    assert_eq!(r2_count, 6);
 
-    // Reader 3 should see only 3 batch entries
+    // Reader 3 (at position 5) should see only 4 batch entries
     let mut r3_count = 0;
-    while reader3_wal.read_next("positioned_topic").unwrap().is_some() {
+    while wal3.read_next("positioned_topic").unwrap().is_some() {
         r3_count += 1;
     }
-    assert_eq!(r3_count, 3);
+    assert_eq!(r3_count, 4);
 
     cleanup_test_env();
 }
