@@ -2028,8 +2028,11 @@ impl Walrus {
 
         // Hold lock across IO/parse for StrictlyAtOnce to avoid duplicate consumption
         let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce);
+        // Manage the guard explicitly to satisfy the borrow checker
+        let mut info_opt = Some(info);
         if !hold_lock_during_io {
-            drop(info); // Unlock before IO for AtLeastOnce
+            // Release lock for AtLeastOnce before IO
+            drop(info_opt.take().unwrap());
         }
 
         // 3) Read ranges via io_uring (FD backend) or mmap
@@ -2205,7 +2208,8 @@ impl Walrus {
             let mut target = PersistTarget::None;
 
             if hold_lock_during_io {
-                // We still hold the original write guard `info` here
+                // We still hold the original write guard here
+                let mut info = info_opt.take().expect("column lock should be held");
                 // Update position
                 if saw_tail {
                     info.cur_block_idx = chain_len_at_plan;
