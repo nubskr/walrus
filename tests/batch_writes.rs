@@ -1747,18 +1747,20 @@ fn test_rollback_file_state_tracking() {
 
     // Write enough data to span multiple blocks and potentially multiple files
     for batch_num in 0..20 {
-        let entries: Vec<&[u8]> = if batch_num % 5 == 0 {
+        if batch_num % 5 == 0 {
             // Every 5th batch is large to force block rotations
             let large_entry = vec![batch_num as u8; 15 * 1024 * 1024]; // 15MB
-            vec![large_entry.as_slice(); 3] // 45MB total
+            let entries: Vec<&[u8]> = vec![large_entry.as_slice(); 3]; // 45MB total
+            
+            // Some of these might fail due to concurrency, but that's expected
+            let _ = wal.batch_append_for_topic("file_state_test", &entries);
         } else {
             // Small batches
             let small_data = format!("batch_{}", batch_num);
-            vec![small_data.as_bytes(); 10]
-        };
-
-        // Some of these might fail due to concurrency, but that's expected
-        let _ = wal.batch_append_for_topic("file_state_test", &entries);
+            let entries: Vec<&[u8]> = vec![small_data.as_bytes(); 10];
+            
+            let _ = wal.batch_append_for_topic("file_state_test", &entries);
+        }
     }
 
     // After all the potential rollbacks, WAL should still work correctly
