@@ -842,6 +842,93 @@ fn test_rapid_fire_batch_reads() {
 // ============================================================================
 
 #[test]
+fn test_simple_deadlock_repro() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    println!("Starting simple deadlock reproduction test...");
+
+    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap());
+
+    let barrier = Arc::new(Barrier::new(3));
+
+    // Writer thread: writes data that will trigger sealing
+    let wal1 = wal.clone();
+    let barrier1 = barrier.clone();
+    let writer = thread::spawn(move || {
+        barrier1.wait();
+        println!("Writer starting...");
+        for i in 0..10 {
+            // Write large entries to force sealing
+            let data = vec![i as u8; 1024 * 1024]; // 1MB entries
+            match wal1.append_for_topic("deadlock_test", &data) {
+                Ok(_) => println!("Writer: wrote entry {}", i),
+                Err(e) => println!("Writer: error on entry {}: {:?}", i, e),
+            }
+        }
+        println!("Writer finished");
+    });
+
+    // Reader thread 1: continuous batch reads
+    let wal2 = wal.clone();
+    let barrier2 = barrier.clone();
+    let reader1 = thread::spawn(move || {
+        barrier2.wait();
+        println!("Reader 1 starting...");
+        for i in 0..20 {
+            match wal2.batch_read_for_topic("deadlock_test", 512 * 1024) {
+                Ok(batch) => println!("Reader 1: batch {} read {} entries", i, batch.len()),
+                Err(e) => println!("Reader 1: batch {} error: {:?}", i, e),
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        println!("Reader 1 finished");
+    });
+
+    // Reader thread 2: continuous single reads
+    let wal3 = wal.clone();
+    let barrier3 = barrier.clone();
+    let reader2 = thread::spawn(move || {
+        barrier3.wait();
+        println!("Reader 2 starting...");
+        for i in 0..50 {
+            match wal3.read_next("deadlock_test") {
+                Ok(Some(_)) => println!("Reader 2: read entry {}", i),
+                Ok(None) => println!("Reader 2: no entry at {}", i),
+                Err(e) => println!("Reader 2: error at {}: {:?}", i, e),
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        println!("Reader 2 finished");
+    });
+
+    // Wait for all threads with timeout
+    let timeout = std::time::Duration::from_secs(30);
+    
+    match writer.join() {
+        Ok(_) => println!("Writer joined successfully"),
+        Err(_) => println!("Writer panicked"),
+    }
+    
+    match reader1.join() {
+        Ok(_) => println!("Reader 1 joined successfully"),
+        Err(_) => println!("Reader 1 panicked"),
+    }
+    
+    match reader2.join() {
+        Ok(_) => println!("Reader 2 joined successfully"),
+        Err(_) => println!("Reader 2 panicked"),
+    }
+
+    cleanup_test_env();
+    println!("Simple deadlock test completed");
+}
+
+#[test]
 fn test_full_chaos_all_operations() {
     let _guard = setup_test_env();
     enable_fd_backend();
