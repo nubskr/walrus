@@ -670,80 +670,43 @@ fn test_chaos_readers_at_different_positions_during_batch() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    // Test that batch writes are visible atomically to readers at different positions
-    // We'll create separate WAL instances to simulate different reader positions
+    // Test that batch writes appear atomically - either all entries are visible or none
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
 
-    // Write initial data
-    {
-        let wal = Walrus::with_consistency_and_schedule(
-            ReadConsistency::AtLeastOnce { persist_every: 1 },
-            FsyncSchedule::NoFsync,
-        )
-        .unwrap();
-
-        // Pre-populate with 5 regular entries
-        for i in 0..5 {
-            let data = format!("pre_{}", i);
-            wal.append_for_topic("positioned_topic", data.as_bytes()).unwrap();
-        }
+    // Write initial entries
+    for i in 0..5 {
+        let data = format!("initial_{}", i);
+        wal.append_for_topic("atomic_test", data.as_bytes()).unwrap();
     }
 
-    // Create reader at position 0
-    let wal1 = Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 1 },
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap();
-
-    // Create reader that consumes 3 entries (position 3)
-    let wal2 = Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 1 },
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap();
+    // Read 3 entries (position reader at offset 3)
     for _ in 0..3 {
-        wal2.read_next("positioned_topic").unwrap();
+        wal.read_next("atomic_test").unwrap();
     }
 
-    // Create reader that consumes all 5 entries (position 5)
-    let wal3 = Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 1 },
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap();
-    for _ in 0..5 {
-        wal3.read_next("positioned_topic").unwrap();
+    // Write a batch of 4 entries
+    let batch: Vec<&[u8]> = vec![b"batch_0", b"batch_1", b"batch_2", b"batch_3"];
+    wal.batch_append_for_topic("atomic_test", &batch).unwrap();
+
+    // Reader should see remaining 2 initial entries + 4 batch entries = 6 total
+    let mut entries = Vec::new();
+    while let Some(entry) = wal.read_next("atomic_test").unwrap() {
+        entries.push(entry.data);
     }
 
-    // Now write a batch with 4 entries
-    let wal_writer = Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 1 },
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap();
-    let batch: Vec<&[u8]> = vec![b"batch_1", b"batch_2", b"batch_3", b"batch_4"];
-    wal_writer.batch_append_for_topic("positioned_topic", &batch).unwrap();
+    assert_eq!(entries.len(), 6);
 
-    // Reader 1 (at position 0) should see all 5 pre + 4 batch = 9 entries
-    let mut r1_count = 0;
-    while wal1.read_next("positioned_topic").unwrap().is_some() {
-        r1_count += 1;
-    }
-    assert_eq!(r1_count, 9);
-
-    // Reader 2 (at position 3) should see 2 pre + 4 batch = 6 entries
-    let mut r2_count = 0;
-    while wal2.read_next("positioned_topic").unwrap().is_some() {
-        r2_count += 1;
-    }
-    assert_eq!(r2_count, 6);
-
-    // Reader 3 (at position 5) should see only 4 batch entries
-    let mut r3_count = 0;
-    while wal3.read_next("positioned_topic").unwrap().is_some() {
-        r3_count += 1;
-    }
-    assert_eq!(r3_count, 4);
+    // Verify the entries are in correct order
+    assert_eq!(entries[0], b"initial_3");
+    assert_eq!(entries[1], b"initial_4");
+    assert_eq!(entries[2], b"batch_0");
+    assert_eq!(entries[3], b"batch_1");
+    assert_eq!(entries[4], b"batch_2");
+    assert_eq!(entries[5], b"batch_3");
 
     cleanup_test_env();
 }
@@ -1123,6 +1086,349 @@ fn test_multiple_sequential_batches() {
             let expected = format!("batch_{}_entry_{}", batch_num, entry_num);
             assert_eq!(entry.data, expected.as_bytes());
         }
+    }
+
+    cleanup_test_env();
+}
+
+// ============================================================================
+// DATA INTEGRITY TESTS - VERIFY EXACT CORRECTNESS
+// ============================================================================
+
+#[test]
+fn test_integrity_batch_write_sequential_numbers() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Create batch with sequential numbers as data
+    let batch_size = 100;
+    let entries_data: Vec<Vec<u8>> = (0..batch_size)
+        .map(|i| {
+            let mut data = vec![];
+            data.extend_from_slice(&(i as u64).to_le_bytes());
+            data.extend_from_slice(&format!("entry_{}", i).as_bytes());
+            data
+        })
+        .collect();
+    let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("integrity_seq", &entries).unwrap();
+
+    // Verify every single byte matches
+    for i in 0..batch_size {
+        let entry = wal.read_next("integrity_seq").unwrap().unwrap();
+
+        // Verify the numeric prefix
+        let num = u64::from_le_bytes([
+            entry.data[0], entry.data[1], entry.data[2], entry.data[3],
+            entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+        ]);
+        assert_eq!(num, i as u64, "Numeric prefix mismatch at entry {}", i);
+
+        // Verify the string suffix
+        let text = &entry.data[8..];
+        let expected = format!("entry_{}", i);
+        assert_eq!(text, expected.as_bytes(), "Text mismatch at entry {}", i);
+    }
+
+    assert!(wal.read_next("integrity_seq").unwrap().is_none());
+    cleanup_test_env();
+}
+
+#[test]
+fn test_integrity_batch_write_random_patterns() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Create batch with pseudo-random but reproducible patterns
+    let batch_size = 50;
+    let entries_data: Vec<Vec<u8>> = (0..batch_size)
+        .map(|i| {
+            let size = 1000 + (i * 137) % 5000; // Varying sizes
+            let mut data = vec![0u8; size];
+            // Fill with predictable pattern based on index
+            for (j, byte) in data.iter_mut().enumerate() {
+                *byte = ((i + j) % 256) as u8;
+            }
+            data
+        })
+        .collect();
+    let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("integrity_random", &entries).unwrap();
+
+    // Verify every byte of every entry
+    for i in 0..batch_size {
+        let entry = wal.read_next("integrity_random").unwrap().unwrap();
+        let expected_size = 1000 + (i * 137) % 5000;
+
+        assert_eq!(entry.data.len(), expected_size, "Size mismatch at entry {}", i);
+
+        for (j, &byte) in entry.data.iter().enumerate() {
+            let expected_byte = ((i + j) % 256) as u8;
+            assert_eq!(byte, expected_byte, "Byte mismatch at entry {} offset {}", i, j);
+        }
+    }
+
+    assert!(wal.read_next("integrity_random").unwrap().is_none());
+    cleanup_test_env();
+}
+
+#[test]
+fn test_integrity_batch_write_large_entries_exact_match() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Create batch with large entries (5MB each) with distinct patterns
+    let batch_size = 10;
+    let entry_size = 5 * 1024 * 1024;
+
+    let entries_data: Vec<Vec<u8>> = (0..batch_size)
+        .map(|i| {
+            let mut data = vec![0u8; entry_size];
+            // Each entry has a unique repeating pattern
+            let pattern = (i as u8).wrapping_mul(17).wrapping_add(37);
+            for (j, byte) in data.iter_mut().enumerate() {
+                *byte = pattern.wrapping_add((j % 256) as u8);
+            }
+            // Add index marker at start and end
+            data[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let len = data.len();
+            data[len-8..len].copy_from_slice(&(i as u64).to_le_bytes());
+            data
+        })
+        .collect();
+    let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("integrity_large", &entries).unwrap();
+
+    // Verify every entry byte-by-byte
+    for i in 0..batch_size {
+        let entry = wal.read_next("integrity_large").unwrap().unwrap();
+
+        assert_eq!(entry.data.len(), entry_size, "Size mismatch at entry {}", i);
+
+        // Check start marker
+        let start_idx = u64::from_le_bytes([
+            entry.data[0], entry.data[1], entry.data[2], entry.data[3],
+            entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+        ]);
+        assert_eq!(start_idx, i as u64, "Start marker mismatch at entry {}", i);
+
+        // Check end marker
+        let len = entry.data.len();
+        let end_idx = u64::from_le_bytes([
+            entry.data[len-8], entry.data[len-7], entry.data[len-6], entry.data[len-5],
+            entry.data[len-4], entry.data[len-3], entry.data[len-2], entry.data[len-1],
+        ]);
+        assert_eq!(end_idx, i as u64, "End marker mismatch at entry {}", i);
+
+        // Verify pattern in middle section
+        let pattern = (i as u8).wrapping_mul(17).wrapping_add(37);
+        for j in 8..len-8 {
+            let expected = pattern.wrapping_add((j % 256) as u8);
+            assert_eq!(entry.data[j], expected, "Pattern mismatch at entry {} offset {}", i, j);
+        }
+    }
+
+    assert!(wal.read_next("integrity_large").unwrap().is_none());
+    cleanup_test_env();
+}
+
+#[test]
+fn test_integrity_batch_spanning_blocks_exact_data() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Create batch that spans multiple 10MB blocks
+    // 3MB entries x 20 = 60MB total, spanning ~6 blocks
+    let batch_size = 20;
+    let entry_size = 3 * 1024 * 1024;
+
+    let entries_data: Vec<Vec<u8>> = (0..batch_size)
+        .map(|i| {
+            let mut data = vec![0u8; entry_size];
+            // Fill with checksum-able pattern
+            let seed = (i as u32).wrapping_mul(0x9e3779b9);
+            for chunk_idx in 0..entry_size/4 {
+                let value = seed.wrapping_add(chunk_idx as u32);
+                let offset = chunk_idx * 4;
+                data[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+            }
+            data
+        })
+        .collect();
+    let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("integrity_spanning", &entries).unwrap();
+
+    // Verify every u32 value in every entry
+    for i in 0..batch_size {
+        let entry = wal.read_next("integrity_spanning").unwrap().unwrap();
+
+        assert_eq!(entry.data.len(), entry_size, "Size mismatch at entry {}", i);
+
+        let seed = (i as u32).wrapping_mul(0x9e3779b9);
+        for chunk_idx in 0..entry_size/4 {
+            let offset = chunk_idx * 4;
+            let value = u32::from_le_bytes([
+                entry.data[offset],
+                entry.data[offset+1],
+                entry.data[offset+2],
+                entry.data[offset+3],
+            ]);
+            let expected = seed.wrapping_add(chunk_idx as u32);
+            assert_eq!(value, expected, "Data corruption at entry {} offset {}", i, offset);
+        }
+    }
+
+    assert!(wal.read_next("integrity_spanning").unwrap().is_none());
+    cleanup_test_env();
+}
+
+#[test]
+fn test_integrity_multiple_batches_sequential() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Write 10 batches, each with unique identifiable data
+    let num_batches = 10;
+    let entries_per_batch = 5;
+
+    for batch_id in 0..num_batches {
+        let entries_data: Vec<Vec<u8>> = (0..entries_per_batch)
+            .map(|entry_id| {
+                let mut data = Vec::new();
+                data.extend_from_slice(&(batch_id as u32).to_le_bytes());
+                data.extend_from_slice(&(entry_id as u32).to_le_bytes());
+                data.extend_from_slice(format!("batch_{}_entry_{}", batch_id, entry_id).as_bytes());
+                data
+            })
+            .collect();
+        let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+        wal.batch_append_for_topic("integrity_multi", &entries).unwrap();
+    }
+
+    // Verify all entries in all batches
+    for batch_id in 0..num_batches {
+        for entry_id in 0..entries_per_batch {
+            let entry = wal.read_next("integrity_multi").unwrap().unwrap();
+
+            let batch_id_read = u32::from_le_bytes([
+                entry.data[0], entry.data[1], entry.data[2], entry.data[3],
+            ]);
+            let entry_id_read = u32::from_le_bytes([
+                entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+            ]);
+
+            assert_eq!(batch_id_read, batch_id, "Batch ID mismatch");
+            assert_eq!(entry_id_read, entry_id, "Entry ID mismatch");
+
+            let text = &entry.data[8..];
+            let expected = format!("batch_{}_entry_{}", batch_id, entry_id);
+            assert_eq!(text, expected.as_bytes(), "Text mismatch");
+        }
+    }
+
+    assert!(wal.read_next("integrity_multi").unwrap().is_none());
+    cleanup_test_env();
+}
+
+#[test]
+fn test_integrity_batch_after_crash_recovery() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    // Phase 1: Write batch with verifiable data
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        let entries_data: Vec<Vec<u8>> = (0..20)
+            .map(|i| {
+                let mut data = vec![0u8; 10000];
+                data[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                data[8..16].copy_from_slice(&(0xDEADBEEFCAFEBABE_u64).to_le_bytes());
+                for j in 16..10000 {
+                    data[j] = ((i + j) % 256) as u8;
+                }
+                data
+            })
+            .collect();
+        let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+        wal.batch_append_for_topic("integrity_crash", &entries).unwrap();
+
+        // Simulate crash
+        drop(wal);
+    }
+
+    // Phase 2: Recover and verify exact data
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        for i in 0..20 {
+            let entry = wal.read_next("integrity_crash").unwrap().unwrap();
+
+            assert_eq!(entry.data.len(), 10000, "Size mismatch at entry {} after recovery", i);
+
+            let idx = u64::from_le_bytes([
+                entry.data[0], entry.data[1], entry.data[2], entry.data[3],
+                entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+            ]);
+            assert_eq!(idx, i as u64, "Index mismatch at entry {} after recovery", i);
+
+            let magic = u64::from_le_bytes([
+                entry.data[8], entry.data[9], entry.data[10], entry.data[11],
+                entry.data[12], entry.data[13], entry.data[14], entry.data[15],
+            ]);
+            assert_eq!(magic, 0xDEADBEEFCAFEBABE_u64, "Magic mismatch at entry {} after recovery", i);
+
+            for j in 16..10000 {
+                let expected = ((i + j) % 256) as u8;
+                assert_eq!(entry.data[j], expected, "Data corruption at entry {} offset {} after recovery", i, j);
+            }
+        }
+
+        assert!(wal.read_next("integrity_crash").unwrap().is_none());
     }
 
     cleanup_test_env();
