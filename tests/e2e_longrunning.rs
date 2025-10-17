@@ -1,22 +1,19 @@
+mod common;
+
+use common::TestEnv;
 use std::collections::HashMap;
-use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 use walrus_rust::ReadConsistency;
 use walrus_rust::wal::Walrus;
 
-fn cleanup_wal() {
-    let _ = fs::remove_dir_all("wal_files");
-    thread::sleep(Duration::from_millis(50));
+fn setup_env() -> TestEnv {
+    TestEnv::new()
 }
 
 #[test]
 fn e2e_sustained_mixed_workload() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let duration = Duration::from_secs(15); // Reduced duration for CI
@@ -112,17 +109,11 @@ fn e2e_sustained_mixed_workload() {
         "Data integrity validation failed: {} errors",
         validation_errors
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn e2e_realistic_application_simulation() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let duration = Duration::from_secs(20); // Reduced duration for CI
@@ -252,17 +243,11 @@ fn e2e_realistic_application_simulation() {
         "Data integrity validation failed: {} errors",
         validation_errors
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn e2e_recovery_and_persistence_marathon() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let total_cycles = 5;
     let entries_per_cycle = 1000;
@@ -350,17 +335,11 @@ fn e2e_recovery_and_persistence_marathon() {
         "Data integrity validation failed: {} errors",
         validation_errors
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn e2e_massive_data_throughput_test() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let duration = Duration::from_secs(25); // Reduced duration for CI
@@ -479,17 +458,11 @@ fn e2e_massive_data_throughput_test() {
         "Data integrity validation failed: {} errors",
         validation_errors
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn e2e_system_stress_and_stability() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let duration = Duration::from_secs(30); // Reduced duration for CI
@@ -610,17 +583,11 @@ fn e2e_system_stress_and_stability() {
         "Data integrity validation failed: {} errors",
         read_validation_errors
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn e2e_performance_benchmark() {
-    cleanup_wal();
-
-    unsafe {
-        std::env::set_var("WALRUS_QUIET", "1");
-    }
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -684,6 +651,4 @@ fn e2e_performance_benchmark() {
     );
 
     println!("Performance benchmark completed!");
-
-    cleanup_wal();
 }

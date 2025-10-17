@@ -1,26 +1,17 @@
-use walrus_rust::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
-use std::sync::{Arc, Barrier, Mutex};
+mod common;
+
+use common::{TestEnv, current_wal_dir};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
-// Global lock to serialize tests (prevents parallel test interference)
-static TEST_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
-
-fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
-    // Recover from poisoned lock instead of panicking
-    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
-
-    // Clean up old test directories
-    let _ = std::fs::remove_dir_all("wal_files");
-    std::fs::create_dir_all("wal_files").unwrap();
-
-    guard
+fn setup_test_env() -> TestEnv {
+    TestEnv::new()
 }
 
 fn cleanup_test_env() {
-    let _ = std::fs::remove_dir_all("wal_files");
+    let _ = std::fs::remove_dir_all(current_wal_dir());
 }
 
 // ============================================================================
@@ -113,8 +104,7 @@ fn test_batch_size_limit_enforcement() {
     // Each entry is 1GB, so 11 entries = 11GB (plus metadata)
     let one_gb = vec![0u8; 1024 * 1024 * 1024];
     let entries: Vec<&[u8]> = vec![
-        &one_gb, &one_gb, &one_gb, &one_gb, &one_gb,
-        &one_gb, &one_gb, &one_gb, &one_gb, &one_gb,
+        &one_gb, &one_gb, &one_gb, &one_gb, &one_gb, &one_gb, &one_gb, &one_gb, &one_gb, &one_gb,
         &one_gb, // 11th entry
     ];
 
@@ -136,11 +126,13 @@ fn test_concurrent_batch_writes_rejected() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let barrier = Arc::new(Barrier::new(2));
     let success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -197,11 +189,13 @@ fn test_regular_write_blocked_during_batch() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let barrier = Arc::new(Barrier::new(2));
     let batch_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -218,7 +212,9 @@ fn test_regular_write_blocked_during_batch() {
         barrier_clone.wait();
         batch_flag.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        wal_clone.batch_append_for_topic("test_topic", &entries).unwrap();
+        wal_clone
+            .batch_append_for_topic("test_topic", &entries)
+            .unwrap();
     });
 
     // Thread 2: Regular write (should be blocked)
@@ -367,11 +363,13 @@ fn test_chaos_interleaved_batch_and_regular_writes() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let num_threads = 10;
     let mut handles = vec![];
@@ -422,11 +420,13 @@ fn test_chaos_multiple_topics_concurrent_batches() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let num_topics = 5;
     let mut handles = vec![];
@@ -445,7 +445,9 @@ fn test_chaos_multiple_topics_concurrent_batches() {
 
                 let entries: Vec<&[u8]> = vec![e1.as_bytes(), e2.as_bytes(), e3.as_bytes()];
 
-                wal_clone.batch_append_for_topic(&topic_name, &entries).unwrap();
+                wal_clone
+                    .batch_append_for_topic(&topic_name, &entries)
+                    .unwrap();
 
                 thread::sleep(Duration::from_millis(5));
             }
@@ -481,11 +483,13 @@ fn test_chaos_batch_write_with_concurrent_readers() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 10 },
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::AtLeastOnce { persist_every: 10 },
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut handles = vec![];
@@ -588,7 +592,8 @@ fn test_chaos_batch_write_crash_recovery() {
 
         // Write more after recovery
         let entries2: Vec<&[u8]> = vec![b"after_crash_1", b"after_crash_2"];
-        wal.batch_append_for_topic("crash_topic", &entries2).unwrap();
+        wal.batch_append_for_topic("crash_topic", &entries2)
+            .unwrap();
 
         let e4 = wal.read_next("crash_topic").unwrap().unwrap();
         assert_eq!(e4.data, b"after_crash_1");
@@ -653,7 +658,8 @@ fn test_chaos_batch_writes_force_multiple_block_rotations() {
     let entry = vec![0xEE; 5 * 1024 * 1024];
     let entries: Vec<&[u8]> = (0..100).map(|_| entry.as_slice()).collect();
 
-    wal.batch_append_for_topic("rotation_topic", &entries).unwrap();
+    wal.batch_append_for_topic("rotation_topic", &entries)
+        .unwrap();
 
     // Verify all entries survived the rotations
     for _ in 0..100 {
@@ -680,7 +686,8 @@ fn test_chaos_readers_at_different_positions_during_batch() {
     // Write initial entries
     for i in 0..5 {
         let data = format!("initial_{}", i);
-        wal.append_for_topic("atomic_test", data.as_bytes()).unwrap();
+        wal.append_for_topic("atomic_test", data.as_bytes())
+            .unwrap();
     }
 
     // Read 3 entries (position reader at offset 3)
@@ -716,11 +723,13 @@ fn test_chaos_many_topics_racing_batch_and_regular() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let num_topics = 20;
     let mut handles = vec![];
@@ -785,7 +794,8 @@ fn test_chaos_sequential_batches_with_crashes() {
 
         let data = format!("cycle_{}", cycle);
         let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes()];
-        wal.batch_append_for_topic("crash_cycles", &entries).unwrap();
+        wal.batch_append_for_topic("crash_cycles", &entries)
+            .unwrap();
 
         // Simulate crash
         drop(wal);
@@ -826,9 +836,7 @@ fn test_chaos_batch_with_exactly_block_size_entries() {
     let metadata_overhead = 64;
     let exact_size = (10 * 1024 * 1024 - metadata_overhead) as usize;
 
-    let entries_data: Vec<Vec<u8>> = (0..5)
-        .map(|i| vec![i as u8; exact_size])
-        .collect();
+    let entries_data: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; exact_size]).collect();
     let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
     wal.batch_append_for_topic("exact_topic", &entries).unwrap();
@@ -848,11 +856,13 @@ fn test_chaos_hammering_same_topic_with_batches() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     let num_threads = 20;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -925,23 +935,22 @@ fn test_chaos_zero_length_entries_in_batch() {
     .unwrap();
 
     // Mix of zero-length and normal entries
-    let entries: Vec<&[u8]> = vec![
-        b"",
-        b"normal",
-        b"",
-        b"",
-        b"another",
-        b"",
-    ];
+    let entries: Vec<&[u8]> = vec![b"", b"normal", b"", b"", b"another", b""];
 
     wal.batch_append_for_topic("zero_topic", &entries).unwrap();
 
     // Verify all entries including empty ones
     assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"normal");
+    assert_eq!(
+        wal.read_next("zero_topic").unwrap().unwrap().data,
+        b"normal"
+    );
     assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
     assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"another");
+    assert_eq!(
+        wal.read_next("zero_topic").unwrap().unwrap().data,
+        b"another"
+    );
     assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
 
     cleanup_test_env();
@@ -1051,9 +1060,18 @@ fn test_batch_then_regular_write() {
     wal.append_for_topic("test_topic", b"regular").unwrap();
 
     // Verify order
-    assert_eq!(wal.read_next("test_topic").unwrap().unwrap().data, b"batch1");
-    assert_eq!(wal.read_next("test_topic").unwrap().unwrap().data, b"batch2");
-    assert_eq!(wal.read_next("test_topic").unwrap().unwrap().data, b"regular");
+    assert_eq!(
+        wal.read_next("test_topic").unwrap().unwrap().data,
+        b"batch1"
+    );
+    assert_eq!(
+        wal.read_next("test_topic").unwrap().unwrap().data,
+        b"batch2"
+    );
+    assert_eq!(
+        wal.read_next("test_topic").unwrap().unwrap().data,
+        b"regular"
+    );
 
     cleanup_test_env();
 }
@@ -1118,7 +1136,8 @@ fn test_integrity_batch_write_sequential_numbers() {
         .collect();
     let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-    wal.batch_append_for_topic("integrity_seq", &entries).unwrap();
+    wal.batch_append_for_topic("integrity_seq", &entries)
+        .unwrap();
 
     // Verify every single byte matches
     for i in 0..batch_size {
@@ -1126,8 +1145,14 @@ fn test_integrity_batch_write_sequential_numbers() {
 
         // Verify the numeric prefix
         let num = u64::from_le_bytes([
-            entry.data[0], entry.data[1], entry.data[2], entry.data[3],
-            entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+            entry.data[0],
+            entry.data[1],
+            entry.data[2],
+            entry.data[3],
+            entry.data[4],
+            entry.data[5],
+            entry.data[6],
+            entry.data[7],
         ]);
         assert_eq!(num, i as u64, "Numeric prefix mismatch at entry {}", i);
 
@@ -1167,18 +1192,28 @@ fn test_integrity_batch_write_random_patterns() {
         .collect();
     let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-    wal.batch_append_for_topic("integrity_random", &entries).unwrap();
+    wal.batch_append_for_topic("integrity_random", &entries)
+        .unwrap();
 
     // Verify every byte of every entry
     for i in 0..batch_size {
         let entry = wal.read_next("integrity_random").unwrap().unwrap();
         let expected_size = 1000 + (i * 137) % 5000;
 
-        assert_eq!(entry.data.len(), expected_size, "Size mismatch at entry {}", i);
+        assert_eq!(
+            entry.data.len(),
+            expected_size,
+            "Size mismatch at entry {}",
+            i
+        );
 
         for (j, &byte) in entry.data.iter().enumerate() {
             let expected_byte = ((i + j) % 256) as u8;
-            assert_eq!(byte, expected_byte, "Byte mismatch at entry {} offset {}", i, j);
+            assert_eq!(
+                byte, expected_byte,
+                "Byte mismatch at entry {} offset {}",
+                i, j
+            );
         }
     }
 
@@ -1212,13 +1247,14 @@ fn test_integrity_batch_write_large_entries_exact_match() {
             // Add index marker at start and end
             data[0..8].copy_from_slice(&(i as u64).to_le_bytes());
             let len = data.len();
-            data[len-8..len].copy_from_slice(&(i as u64).to_le_bytes());
+            data[len - 8..len].copy_from_slice(&(i as u64).to_le_bytes());
             data
         })
         .collect();
     let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-    wal.batch_append_for_topic("integrity_large", &entries).unwrap();
+    wal.batch_append_for_topic("integrity_large", &entries)
+        .unwrap();
 
     // Verify every entry byte-by-byte
     for i in 0..batch_size {
@@ -1228,24 +1264,40 @@ fn test_integrity_batch_write_large_entries_exact_match() {
 
         // Check start marker
         let start_idx = u64::from_le_bytes([
-            entry.data[0], entry.data[1], entry.data[2], entry.data[3],
-            entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+            entry.data[0],
+            entry.data[1],
+            entry.data[2],
+            entry.data[3],
+            entry.data[4],
+            entry.data[5],
+            entry.data[6],
+            entry.data[7],
         ]);
         assert_eq!(start_idx, i as u64, "Start marker mismatch at entry {}", i);
 
         // Check end marker
         let len = entry.data.len();
         let end_idx = u64::from_le_bytes([
-            entry.data[len-8], entry.data[len-7], entry.data[len-6], entry.data[len-5],
-            entry.data[len-4], entry.data[len-3], entry.data[len-2], entry.data[len-1],
+            entry.data[len - 8],
+            entry.data[len - 7],
+            entry.data[len - 6],
+            entry.data[len - 5],
+            entry.data[len - 4],
+            entry.data[len - 3],
+            entry.data[len - 2],
+            entry.data[len - 1],
         ]);
         assert_eq!(end_idx, i as u64, "End marker mismatch at entry {}", i);
 
         // Verify pattern in middle section
         let pattern = (i as u8).wrapping_mul(17).wrapping_add(37);
-        for j in 8..len-8 {
+        for j in 8..len - 8 {
             let expected = pattern.wrapping_add((j % 256) as u8);
-            assert_eq!(entry.data[j], expected, "Pattern mismatch at entry {} offset {}", i, j);
+            assert_eq!(
+                entry.data[j], expected,
+                "Pattern mismatch at entry {} offset {}",
+                i, j
+            );
         }
     }
 
@@ -1274,17 +1326,18 @@ fn test_integrity_batch_spanning_blocks_exact_data() {
             let mut data = vec![0u8; entry_size];
             // Fill with checksum-able pattern
             let seed = (i as u32).wrapping_mul(0x9e3779b9);
-            for chunk_idx in 0..entry_size/4 {
+            for chunk_idx in 0..entry_size / 4 {
                 let value = seed.wrapping_add(chunk_idx as u32);
                 let offset = chunk_idx * 4;
-                data[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+                data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
             data
         })
         .collect();
     let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-    wal.batch_append_for_topic("integrity_spanning", &entries).unwrap();
+    wal.batch_append_for_topic("integrity_spanning", &entries)
+        .unwrap();
 
     // Verify every u32 value in every entry
     for i in 0..batch_size {
@@ -1293,16 +1346,20 @@ fn test_integrity_batch_spanning_blocks_exact_data() {
         assert_eq!(entry.data.len(), entry_size, "Size mismatch at entry {}", i);
 
         let seed = (i as u32).wrapping_mul(0x9e3779b9);
-        for chunk_idx in 0..entry_size/4 {
+        for chunk_idx in 0..entry_size / 4 {
             let offset = chunk_idx * 4;
             let value = u32::from_le_bytes([
                 entry.data[offset],
-                entry.data[offset+1],
-                entry.data[offset+2],
-                entry.data[offset+3],
+                entry.data[offset + 1],
+                entry.data[offset + 2],
+                entry.data[offset + 3],
             ]);
             let expected = seed.wrapping_add(chunk_idx as u32);
-            assert_eq!(value, expected, "Data corruption at entry {} offset {}", i, offset);
+            assert_eq!(
+                value, expected,
+                "Data corruption at entry {} offset {}",
+                i, offset
+            );
         }
     }
 
@@ -1337,7 +1394,8 @@ fn test_integrity_multiple_batches_sequential() {
             .collect();
         let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-        wal.batch_append_for_topic("integrity_multi", &entries).unwrap();
+        wal.batch_append_for_topic("integrity_multi", &entries)
+            .unwrap();
     }
 
     // Verify all entries in all batches
@@ -1345,12 +1403,10 @@ fn test_integrity_multiple_batches_sequential() {
         for entry_id in 0..entries_per_batch {
             let entry = wal.read_next("integrity_multi").unwrap().unwrap();
 
-            let batch_id_read = u32::from_le_bytes([
-                entry.data[0], entry.data[1], entry.data[2], entry.data[3],
-            ]);
-            let entry_id_read = u32::from_le_bytes([
-                entry.data[4], entry.data[5], entry.data[6], entry.data[7],
-            ]);
+            let batch_id_read =
+                u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
+            let entry_id_read =
+                u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
 
             assert_eq!(batch_id_read, batch_id, "Batch ID mismatch");
             assert_eq!(entry_id_read, entry_id, "Entry ID mismatch");
@@ -1391,7 +1447,8 @@ fn test_integrity_batch_after_crash_recovery() {
             .collect();
         let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
 
-        wal.batch_append_for_topic("integrity_crash", &entries).unwrap();
+        wal.batch_append_for_topic("integrity_crash", &entries)
+            .unwrap();
 
         // Simulate crash
         drop(wal);
@@ -1408,23 +1465,52 @@ fn test_integrity_batch_after_crash_recovery() {
         for i in 0..20 {
             let entry = wal.read_next("integrity_crash").unwrap().unwrap();
 
-            assert_eq!(entry.data.len(), 10000, "Size mismatch at entry {} after recovery", i);
+            assert_eq!(
+                entry.data.len(),
+                10000,
+                "Size mismatch at entry {} after recovery",
+                i
+            );
 
             let idx = u64::from_le_bytes([
-                entry.data[0], entry.data[1], entry.data[2], entry.data[3],
-                entry.data[4], entry.data[5], entry.data[6], entry.data[7],
+                entry.data[0],
+                entry.data[1],
+                entry.data[2],
+                entry.data[3],
+                entry.data[4],
+                entry.data[5],
+                entry.data[6],
+                entry.data[7],
             ]);
-            assert_eq!(idx, i as u64, "Index mismatch at entry {} after recovery", i);
+            assert_eq!(
+                idx, i as u64,
+                "Index mismatch at entry {} after recovery",
+                i
+            );
 
             let magic = u64::from_le_bytes([
-                entry.data[8], entry.data[9], entry.data[10], entry.data[11],
-                entry.data[12], entry.data[13], entry.data[14], entry.data[15],
+                entry.data[8],
+                entry.data[9],
+                entry.data[10],
+                entry.data[11],
+                entry.data[12],
+                entry.data[13],
+                entry.data[14],
+                entry.data[15],
             ]);
-            assert_eq!(magic, 0xDEADBEEFCAFEBABE_u64, "Magic mismatch at entry {} after recovery", i);
+            assert_eq!(
+                magic, 0xDEADBEEFCAFEBABE_u64,
+                "Magic mismatch at entry {} after recovery",
+                i
+            );
 
             for j in 16..10000 {
                 let expected = ((i + j) % 256) as u8;
-                assert_eq!(entry.data[j], expected, "Data corruption at entry {} offset {} after recovery", i, j);
+                assert_eq!(
+                    entry.data[j], expected,
+                    "Data corruption at entry {} offset {} after recovery",
+                    i, j
+                );
             }
         }
 
@@ -1457,10 +1543,14 @@ fn test_stress_large_batch_1000_entries() {
 
     println!("[stress] Writing batch of 1GB...");
     let start = std::time::Instant::now();
-    wal.batch_append_for_topic("stress_topic", &entries).unwrap();
+    wal.batch_append_for_topic("stress_topic", &entries)
+        .unwrap();
     let duration = start.elapsed();
 
-    println!("[stress] Batch write of 1000x1MB entries took: {:?}", duration);
+    println!(
+        "[stress] Batch write of 1000x1MB entries took: {:?}",
+        duration
+    );
 
     println!("[stress] Verifying all 1000 entries...");
     // Verify all entries
@@ -1499,7 +1589,8 @@ fn test_stress_many_small_batches() {
         }
         let data = format!("batch_{}", i);
         let entries: Vec<&[u8]> = (0..10).map(|_| data.as_bytes()).collect();
-        wal.batch_append_for_topic("stress_topic", &entries).unwrap();
+        wal.batch_append_for_topic("stress_topic", &entries)
+            .unwrap();
     }
 
     let duration = start.elapsed();
@@ -1526,15 +1617,17 @@ fn test_rollback_data_becomes_invisible_to_readers() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     // Write some initial data
     wal.append_for_topic("rollback_test", b"initial").unwrap();
-    
+
     // Read it to establish baseline
     let initial = wal.read_next("rollback_test").unwrap().unwrap();
     assert_eq!(initial.data, b"initial");
@@ -1542,54 +1635,60 @@ fn test_rollback_data_becomes_invisible_to_readers() {
     // Try concurrent batch writes with smaller batches to reduce memory pressure
     let barrier = Arc::new(Barrier::new(2)); // Reduced to 2 threads
     let mut handles = vec![];
-    
+
     for i in 0..2 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        
+
         let handle = thread::spawn(move || {
             // Smaller batch to reduce io_uring memory usage
             let entry = vec![i as u8; 5 * 1024 * 1024]; // 5MB instead of 30MB
             let entries: Vec<&[u8]> = (0..3).map(|_| entry.as_slice()).collect(); // 3 entries instead of 10
-            
+
             barrier_clone.wait();
             wal_clone.batch_append_for_topic("rollback_test", &entries)
         });
-        
+
         handles.push(handle);
     }
 
     let mut successes = 0;
     let mut rollbacks = 0;
-    
+
     for handle in handles {
         match handle.join().unwrap() {
             Ok(_) => successes += 1,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => rollbacks += 1,
             Err(e) => {
                 // Handle other errors (like io_uring memory issues) gracefully
-                println!("Batch write error (expected in resource-constrained tests): {:?}", e);
+                println!(
+                    "Batch write error (expected in resource-constrained tests): {:?}",
+                    e
+                );
                 rollbacks += 1;
             }
         }
     }
-    
+
     // At least one should be blocked/fail, and at most one should succeed
     assert!(successes <= 1, "At most one batch should succeed");
     assert!(rollbacks >= 1, "At least one batch should be blocked/fail");
-    
+
     // Count all remaining entries (should be 3 from successful batch, if any succeeded)
     let mut count = 0;
     while wal.read_next("rollback_test").unwrap().is_some() {
         count += 1;
     }
-    
+
     if successes == 1 {
-        assert_eq!(count, 3, "Should read exactly 3 entries from the successful batch");
+        assert_eq!(
+            count, 3,
+            "Should read exactly 3 entries from the successful batch"
+        );
     } else {
         assert_eq!(count, 0, "Should read no entries if no batch succeeded");
     }
-    
+
     cleanup_test_env();
 }
 
@@ -1605,23 +1704,35 @@ fn test_rollback_allows_data_overwrite() {
     .unwrap();
 
     // Write initial data
-    wal.append_for_topic("overwrite_test", b"before_batch").unwrap();
-    
+    wal.append_for_topic("overwrite_test", b"before_batch")
+        .unwrap();
+
     // Consume it
     let entry = wal.read_next("overwrite_test").unwrap().unwrap();
     assert_eq!(entry.data, b"before_batch");
 
     // Write a successful batch
     let entries: Vec<&[u8]> = vec![b"batch1", b"batch2"];
-    wal.batch_append_for_topic("overwrite_test", &entries).unwrap();
-    
+    wal.batch_append_for_topic("overwrite_test", &entries)
+        .unwrap();
+
     // Verify the batch data is readable
-    assert_eq!(wal.read_next("overwrite_test").unwrap().unwrap().data, b"batch1");
-    assert_eq!(wal.read_next("overwrite_test").unwrap().unwrap().data, b"batch2");
-    
+    assert_eq!(
+        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        b"batch1"
+    );
+    assert_eq!(
+        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        b"batch2"
+    );
+
     // Write more data after the batch
-    wal.append_for_topic("overwrite_test", b"after_batch").unwrap();
-    assert_eq!(wal.read_next("overwrite_test").unwrap().unwrap().data, b"after_batch");
+    wal.append_for_topic("overwrite_test", b"after_batch")
+        .unwrap();
+    assert_eq!(
+        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        b"after_batch"
+    );
 
     cleanup_test_env();
 }
@@ -1631,11 +1742,13 @@ fn test_rollback_block_state_consistency() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     // This test verifies that block locking state is properly reverted
     let num_threads = 3; // Further reduced to avoid io_uring memory issues
@@ -1645,31 +1758,34 @@ fn test_rollback_block_state_consistency() {
     for i in 0..num_threads {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        
+
         let handle = thread::spawn(move || {
             // Smaller batch to reduce memory pressure
             let entry = vec![i as u8; 2 * 1024 * 1024]; // 2MB per entry
             let entries: Vec<&[u8]> = (0..3).map(|_| entry.as_slice()).collect(); // 3 entries
-            
+
             barrier_clone.wait();
-            
+
             // Try batch write - some will succeed, some will be blocked and "rolled back"
             wal_clone.batch_append_for_topic("block_state_test", &entries)
         });
-        
+
         handles.push(handle);
     }
 
     let mut successes = 0;
     let mut failures = 0;
-    
+
     for handle in handles {
         match handle.join().unwrap() {
             Ok(_) => successes += 1,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => failures += 1,
             Err(e) => {
                 // Handle other errors gracefully (like io_uring memory issues)
-                println!("Batch write error (expected in resource-constrained tests): {:?}", e);
+                println!(
+                    "Batch write error (expected in resource-constrained tests): {:?}",
+                    e
+                );
                 failures += 1;
             }
         }
@@ -1678,18 +1794,22 @@ fn test_rollback_block_state_consistency() {
     // Should have at most one success and some failures
     assert!(successes <= 1, "At most one batch should succeed");
     assert!(failures >= 1, "At least one batch should fail/be blocked");
-    
+
     // After all operations, WAL should still be in consistent state
     // Try a new batch write - should succeed
     let test_batch: Vec<&[u8]> = vec![b"consistency_check"];
-    wal.batch_append_for_topic("block_state_test", &test_batch).unwrap();
-    
+    wal.batch_append_for_topic("block_state_test", &test_batch)
+        .unwrap();
+
     // Should be able to read some data (from successful batches + our test)
     let mut count = 0;
     while wal.read_next("block_state_test").unwrap().is_some() {
         count += 1;
     }
-    assert!(count > 0, "Should have some readable entries after rollbacks");
+    assert!(
+        count > 0,
+        "Should have some readable entries after rollbacks"
+    );
 
     cleanup_test_env();
 }
@@ -1706,9 +1826,11 @@ fn test_rollback_preserves_existing_data() {
     .unwrap();
 
     // Write some data that should survive rollbacks
-    for i in 0..5 { // Reduced from 10 to 5
+    for i in 0..5 {
+        // Reduced from 10 to 5
         let data = format!("stable_entry_{}", i);
-        wal.append_for_topic("rollback_preserve", data.as_bytes()).unwrap();
+        wal.append_for_topic("rollback_preserve", data.as_bytes())
+            .unwrap();
     }
 
     // Read ALL entries to establish that they exist
@@ -1725,10 +1847,10 @@ fn test_rollback_preserves_existing_data() {
     // This tests that rollbacks don't corrupt the overall WAL state
     let entry_data = vec![0xFF; 5 * 1024 * 1024]; // 5MB entry
     let entries: Vec<&[u8]> = vec![entry_data.as_slice(); 2]; // Just 2 entries
-    
+
     // This might succeed or fail due to resource constraints - both are valid
     let batch_result = wal.batch_append_for_topic("rollback_preserve_batch", &entries);
-    
+
     match batch_result {
         Ok(_) => {
             println!("Batch write succeeded");
@@ -1737,10 +1859,16 @@ fn test_rollback_preserves_existing_data() {
             while wal.read_next("rollback_preserve_batch").unwrap().is_some() {
                 batch_count += 1;
             }
-            assert_eq!(batch_count, 2, "Should read 2 entries from successful batch");
+            assert_eq!(
+                batch_count, 2,
+                "Should read 2 entries from successful batch"
+            );
         }
         Err(e) => {
-            println!("Batch write failed (expected in resource-constrained tests): {:?}", e);
+            println!(
+                "Batch write failed (expected in resource-constrained tests): {:?}",
+                e
+            );
             // If it failed, there should be no entries to read
             assert!(wal.read_next("rollback_preserve_batch").unwrap().is_none());
         }
@@ -1749,9 +1877,10 @@ fn test_rollback_preserves_existing_data() {
     // Original data on original topic should still be fully consumed
     // (we already read all 5 entries above)
     assert!(wal.read_next("rollback_preserve").unwrap().is_none());
-    
+
     // Write new data to the original topic to verify it still works
-    wal.append_for_topic("rollback_preserve", b"after_rollbacks").unwrap();
+    wal.append_for_topic("rollback_preserve", b"after_rollbacks")
+        .unwrap();
     let entry = wal.read_next("rollback_preserve").unwrap().unwrap();
     assert_eq!(entry.data, b"after_rollbacks");
 
@@ -1772,25 +1901,27 @@ fn test_rollback_file_state_tracking() {
 
     // Write enough data to span multiple blocks and potentially multiple files
     // Using sequential writes to avoid io_uring memory issues
-    for batch_num in 0..15 { // Reduced from 20
+    for batch_num in 0..15 {
+        // Reduced from 20
         if batch_num % 5 == 0 {
             // Every 5th batch is large to force block rotations
             let large_entry = vec![batch_num as u8; 15 * 1024 * 1024]; // 15MB
             let entries: Vec<&[u8]> = vec![large_entry.as_slice(); 3]; // 45MB total
-            
+
             let _ = wal.batch_append_for_topic("file_state_test", &entries);
         } else {
             // Small batches
             let small_data = format!("batch_{}", batch_num);
             let entries: Vec<&[u8]> = vec![small_data.as_bytes(); 10];
-            
+
             let _ = wal.batch_append_for_topic("file_state_test", &entries);
         }
     }
 
     // After all writes, WAL should still work correctly
     let final_batch: Vec<&[u8]> = vec![b"final_entry"];
-    wal.batch_append_for_topic("file_state_test", &final_batch).unwrap();
+    wal.batch_append_for_topic("file_state_test", &final_batch)
+        .unwrap();
 
     // Should be able to read at least the final entry
     let mut found_final = false;
@@ -1801,7 +1932,10 @@ fn test_rollback_file_state_tracking() {
         }
         total_count += 1;
     }
-    assert!(found_final, "Should find the final entry after all operations");
+    assert!(
+        found_final,
+        "Should find the final entry after all operations"
+    );
     assert!(total_count > 0, "Should have read some entries");
 
     cleanup_test_env();

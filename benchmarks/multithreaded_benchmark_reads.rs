@@ -12,7 +12,7 @@ use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 // Function to get system memory information including dirty pages
 fn get_memory_info() -> (u64, u64, f64) {
     // Returns (total_memory_kb, dirty_pages_kb, dirty_ratio)
-    
+
     #[cfg(target_os = "macos")]
     {
         // On macOS, we can get memory info from vm_stat and sysctl
@@ -25,13 +25,13 @@ fn get_memory_info() -> (u64, u64, f64) {
         };
         (total_memory, dirty_pages, dirty_ratio)
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         // On Linux, read from /proc/meminfo
         get_linux_memory_info()
     }
-    
+
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         // Fallback for other systems
@@ -42,11 +42,8 @@ fn get_memory_info() -> (u64, u64, f64) {
 #[cfg(target_os = "macos")]
 fn get_macos_total_memory() -> u64 {
     use std::process::Command;
-    
-    if let Ok(output) = Command::new("sysctl")
-        .args(&["-n", "hw.memsize"])
-        .output()
-    {
+
+    if let Ok(output) = Command::new("sysctl").args(&["-n", "hw.memsize"]).output() {
         if let Ok(memsize_str) = String::from_utf8(output.stdout) {
             if let Ok(memsize_bytes) = memsize_str.trim().parse::<u64>() {
                 return memsize_bytes / 1024; // Convert to KB
@@ -59,7 +56,7 @@ fn get_macos_total_memory() -> u64 {
 #[cfg(target_os = "macos")]
 fn get_macos_dirty_pages() -> u64 {
     use std::process::Command;
-    
+
     if let Ok(output) = Command::new("vm_stat").output() {
         if let Ok(vm_stat_str) = String::from_utf8(output.stdout) {
             // Parse vm_stat output to find dirty pages
@@ -83,7 +80,7 @@ fn get_macos_dirty_pages() -> u64 {
 fn get_linux_memory_info() -> (u64, u64, f64) {
     let mut total_memory = 0u64;
     let mut dirty_pages = 0u64;
-    
+
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
             if line.starts_with("MemTotal:") {
@@ -97,13 +94,13 @@ fn get_linux_memory_info() -> (u64, u64, f64) {
             }
         }
     }
-    
+
     let dirty_ratio = if total_memory > 0 {
         (dirty_pages as f64 / total_memory as f64) * 100.0
     } else {
         0.0
     };
-    
+
     (total_memory, dirty_pages, dirty_ratio)
 }
 
@@ -216,8 +213,12 @@ fn parse_duration_string(duration_str: &str) -> Option<Duration> {
 }
 
 fn print_usage() {
-    println!("Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> cargo test multithreaded_benchmark_reads");
-    println!("   or: cargo test multithreaded_benchmark_reads -- --fsync <schedule> --duration <duration>");
+    println!(
+        "Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> cargo test multithreaded_benchmark_reads"
+    );
+    println!(
+        "   or: cargo test multithreaded_benchmark_reads -- --fsync <schedule> --duration <duration>"
+    );
     println!();
     println!("Fsync Schedule Options:");
     println!("  sync-each    Fsync after every write (slowest, most durable)");
@@ -243,9 +244,13 @@ fn print_usage() {
     println!("  Default: 1m write, 1m read");
     println!();
     println!("Examples:");
-    println!("  WALRUS_FSYNC=sync-each WALRUS_DURATION=30s cargo test multithreaded_benchmark_reads");
+    println!(
+        "  WALRUS_FSYNC=sync-each WALRUS_DURATION=30s cargo test multithreaded_benchmark_reads"
+    );
     println!("  WALRUS_FSYNC=no-fsync WALRUS_DURATION=1m cargo test multithreaded_benchmark_reads");
-    println!("  WALRUS_WRITE_DURATION=2m WALRUS_READ_DURATION=1m cargo test multithreaded_benchmark_reads");
+    println!(
+        "  WALRUS_WRITE_DURATION=2m WALRUS_READ_DURATION=1m cargo test multithreaded_benchmark_reads"
+    );
     println!("  cargo test multithreaded_benchmark_reads -- --fsync no-fsync --duration 1m");
     println!("  make bench-reads-sync  # Uses Makefile convenience targets");
     println!();
@@ -281,10 +286,16 @@ fn multithreaded_read_benchmark() {
     let (write_duration, read_duration) = parse_duration();
 
     println!("=== Multi-threaded WAL Read Benchmark ===");
-    println!("Configuration: 10 threads, {:.0}s write phase + {:.0}s read phase", 
-             write_duration.as_secs(), read_duration.as_secs());
+    println!(
+        "Configuration: 10 threads, {:.0}s write phase + {:.0}s read phase",
+        write_duration.as_secs(),
+        read_duration.as_secs()
+    );
     println!("Fsync schedule: {:?}", fsync_schedule);
-    println!("Write duration: {:?} (15% ramp-up), Read duration: {:?}", write_duration, read_duration);
+    println!(
+        "Write duration: {:?} (15% ramp-up), Read duration: {:?}",
+        write_duration, read_duration
+    );
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -371,7 +382,17 @@ fn multithreaded_read_benchmark() {
             writeln!(
                 csv_file,
                 "{},{:.2},{},{:.0},{:.0},{:.0},{:.0},{},{},{},{:.2}",
-                timestamp, 0.0, "write", 0.0, 0.0, 0.0, 0.0, 0, 0, initial_dirty_kb, initial_dirty_ratio
+                timestamp,
+                0.0,
+                "write",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0,
+                0,
+                initial_dirty_kb,
+                initial_dirty_ratio
             )
             .expect("Failed to write initial CSV entry");
             csv_file.flush().expect("Failed to flush CSV");
@@ -397,7 +418,17 @@ fn multithreaded_read_benchmark() {
                         writeln!(
                             csv_file,
                             "{},{:.2},{},{:.0},{:.0},{:.0},{:.0},{},{},{},{:.2}",
-                            timestamp, 0.0, "read", 0.0, 0.0, 0.0, 0.0, current_writes, 0, phase_dirty_kb, phase_dirty_ratio
+                            timestamp,
+                            0.0,
+                            "read",
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            current_writes,
+                            0,
+                            phase_dirty_kb,
+                            phase_dirty_ratio
                         )
                         .expect("Failed to write initial CSV entry");
                         csv_file.flush().expect("Failed to flush CSV");

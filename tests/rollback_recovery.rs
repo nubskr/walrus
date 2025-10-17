@@ -1,21 +1,17 @@
-use walrus_rust::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
-use std::sync::{Arc, Barrier, Mutex};
-use std::thread;
+mod common;
+
+use common::{TestEnv, current_wal_dir};
 use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
-// Global lock to serialize tests (prevents parallel test interference)
-static TEST_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
-
-fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
-    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
-    let _ = std::fs::remove_dir_all("wal_files");
-    std::fs::create_dir_all("wal_files").unwrap();
-    guard
+fn setup_test_env() -> TestEnv {
+    TestEnv::new()
 }
 
 fn cleanup_test_env() {
-    let _ = std::fs::remove_dir_all("wal_files");
+    let _ = std::fs::remove_dir_all(current_wal_dir());
 }
 
 // Helper to calculate entry offsets (PREFIX_META_SIZE + data length)
@@ -51,7 +47,7 @@ fn test_zeroed_header_stops_block_scanning() {
 
     // Phase 2: Manually zero the header of entry_2 (simulates rollback cleanup)
     {
-        let wal_files: Vec<_> = std::fs::read_dir("wal_files")
+        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
@@ -86,23 +82,35 @@ fn test_zeroed_header_stops_block_scanning() {
         .unwrap();
 
         // Should only recover entries 0 and 1 (before the zeroed header)
-        let e0 = wal.read_next("zero_test").unwrap()
+        let e0 = wal
+            .read_next("zero_test")
+            .unwrap()
             .expect("Should read entry_0");
         assert_eq!(e0.data, b"entry_0", "First entry should be entry_0");
 
-        let e1 = wal.read_next("zero_test").unwrap()
+        let e1 = wal
+            .read_next("zero_test")
+            .unwrap()
             .expect("Should read entry_1");
         assert_eq!(e1.data, b"entry_1", "Second entry should be entry_1");
 
         // Should not see entries 2, 3, 4 (they're after the zeroed header)
         let e2 = wal.read_next("zero_test").unwrap();
-        assert!(e2.is_none(), "Should not read entry_2 or beyond (zeroed header stops scan)");
+        assert!(
+            e2.is_none(),
+            "Should not read entry_2 or beyond (zeroed header stops scan)"
+        );
 
         // Verify WAL is still usable for new writes
         wal.append_for_topic("zero_test", b"new_entry").unwrap();
-        let new = wal.read_next("zero_test").unwrap()
+        let new = wal
+            .read_next("zero_test")
+            .unwrap()
             .expect("Should read new entry after recovery");
-        assert_eq!(new.data, b"new_entry", "New writes should work after recovery");
+        assert_eq!(
+            new.data, b"new_entry",
+            "New writes should work after recovery"
+        );
     }
 
     cleanup_test_env();
@@ -113,11 +121,13 @@ fn test_concurrent_rollback_cleanup() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     // Concurrent batch writes - only one succeeds, rest roll back and zero headers
     let num_threads = 5;
@@ -156,43 +166,63 @@ fn test_concurrent_rollback_cleanup() {
     }
 
     assert_eq!(successes, 1, "Exactly one batch should succeed");
-    assert_eq!(rollbacks, num_threads - 1, "All other batches should roll back");
+    assert_eq!(
+        rollbacks,
+        num_threads - 1,
+        "All other batches should roll back"
+    );
 
     // Verify only the winner's data is visible
     let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
     while let Some(entry) = wal.read_next("rollback_cleanup").unwrap() {
         assert_eq!(entry.data.len(), 512 * 1024, "Entry size should be 512KB");
-        assert_eq!(entry.data[0], winner, "All entries should be from winner thread");
+        assert_eq!(
+            entry.data[0], winner,
+            "All entries should be from winner thread"
+        );
         count += 1;
     }
 
-    assert_eq!(count, 3, "Should read exactly 3 entries from successful batch");
+    assert_eq!(
+        count, 3,
+        "Should read exactly 3 entries from successful batch"
+    );
 
     cleanup_test_env();
 }
-
 
 #[test]
 fn test_rollback_with_block_spanning() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
-    )
-    .unwrap());
+    let wal = Arc::new(
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap(),
+    );
 
     // Write initial data to fill most of first block (10MB blocks)
     let large_data = vec![0xAA; 8 * 1024 * 1024]; // 8MB
     wal.append_for_topic("spanning_test", &large_data).unwrap();
 
     // Read it to establish position
-    let entry = wal.read_next("spanning_test").unwrap()
+    let entry = wal
+        .read_next("spanning_test")
+        .unwrap()
         .expect("Should read initial 8MB entry");
-    assert_eq!(entry.data.len(), 8 * 1024 * 1024, "Initial entry should be 8MB");
-    assert_eq!(entry.data[0], 0xAA, "Initial entry should have 0xAA pattern");
+    assert_eq!(
+        entry.data.len(),
+        8 * 1024 * 1024,
+        "Initial entry should be 8MB"
+    );
+    assert_eq!(
+        entry.data[0], 0xAA,
+        "Initial entry should have 0xAA pattern"
+    );
 
     // Concurrent batches that span multiple blocks (remaining ~2MB + need 18MB = spans 2 blocks)
     let num_threads = 3;
@@ -244,7 +274,6 @@ fn test_rollback_with_block_spanning() {
     cleanup_test_env();
 }
 
-
 #[test]
 fn test_recovery_preserves_data_before_zeroed_headers() {
     let _guard = setup_test_env();
@@ -270,7 +299,7 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
 
     // Phase 2: Zero the header of the large entry (simulates mid-batch rollback)
     {
-        let wal_files: Vec<_> = std::fs::read_dir("wal_files")
+        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
@@ -302,19 +331,30 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         .unwrap();
 
         // Should recover first entry (before zeroed header)
-        let e1 = wal.read_next("preserve_test").unwrap()
+        let e1 = wal
+            .read_next("preserve_test")
+            .unwrap()
             .expect("Should read small_1");
         assert_eq!(e1.data, b"small_1", "First entry should be small_1");
 
         // Should not see the large entry (zeroed header) or small_2 (after zeroed header)
         let e2 = wal.read_next("preserve_test").unwrap();
-        assert!(e2.is_none(), "Should not read past zeroed header (preserves data before, blocks garbage after)");
+        assert!(
+            e2.is_none(),
+            "Should not read past zeroed header (preserves data before, blocks garbage after)"
+        );
 
         // WAL should still be usable for new writes after encountering zeroed header
-        wal.append_for_topic("preserve_test", b"new_after_recovery").unwrap();
-        let new_entry = wal.read_next("preserve_test").unwrap()
+        wal.append_for_topic("preserve_test", b"new_after_recovery")
+            .unwrap();
+        let new_entry = wal
+            .read_next("preserve_test")
+            .unwrap()
             .expect("Should read new entry");
-        assert_eq!(new_entry.data, b"new_after_recovery", "New writes should work after recovery");
+        assert_eq!(
+            new_entry.data, b"new_after_recovery",
+            "New writes should work after recovery"
+        );
     }
 
     cleanup_test_env();

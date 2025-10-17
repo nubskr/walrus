@@ -6,7 +6,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -55,6 +55,20 @@ fn checksum64(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+fn wal_data_dir() -> PathBuf {
+    std::env::var_os("WALRUS_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("wal_files"))
+}
+
+fn ensure_wal_data_dir() -> std::io::Result<()> {
+    fs::create_dir_all(wal_data_dir())
+}
+
+fn wal_index_path(file_name: &str) -> PathBuf {
+    wal_data_dir().join(format!("{}_index.db", file_name))
 }
 
 // FD-based backend for storage
@@ -297,11 +311,13 @@ impl Block {
 }
 
 fn make_new_file() -> std::io::Result<String> {
+    ensure_wal_data_dir()?;
     let file_name = now_millis_str();
-    let file_path = format!("wal_files/{}", file_name);
-    let f = std::fs::File::create(&file_path)?;
+    let dir = wal_data_dir();
+    let path = dir.join(&file_name);
+    let f = std::fs::File::create(&path)?;
     f.set_len(MAX_FILE_SIZE)?;
-    Ok(file_path)
+    Ok(path.to_string_lossy().into_owned())
 }
 
 // has block metas to give out
@@ -312,7 +328,7 @@ struct BlockAllocator {
 
 impl BlockAllocator {
     pub fn new() -> std::io::Result<Self> {
-        std::fs::create_dir_all("wal_files").ok();
+        let _ = ensure_wal_data_dir();
         let file1 = make_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
         debug_print!(
@@ -817,11 +833,9 @@ pub struct WalIndex {
 
 impl WalIndex {
     pub fn new(file_name: &str) -> std::io::Result<Self> {
-        // let tmp_path = format!("{}", );
-        fs::create_dir_all("./wal_files").ok();
-        let path = format!("./wal_files/{}_index.db", file_name);
-
-        let store = Path::new(&path)
+        let _ = ensure_wal_data_dir();
+        let path = wal_index_path(file_name);
+        let store = path
             .exists()
             .then(|| fs::read(&path).ok())
             .flatten()
@@ -838,7 +852,7 @@ impl WalIndex {
 
         Ok(Self {
             store,
-            path: path.to_string(),
+            path: path.to_string_lossy().into_owned(),
         })
     }
 
@@ -1038,7 +1052,8 @@ impl Walrus {
                         for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
                             let fd = io_uring::types::Fd(*raw_fd);
 
-                            let fsync_op = io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
+                            let fsync_op =
+                                io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
 
                             unsafe {
                                 if ring.submission().push(&fsync_op).is_err() {
@@ -1172,11 +1187,7 @@ impl Walrus {
         writer.write(raw_bytes)
     }
 
-    pub fn batch_append_for_topic(
-        &self,
-        col_name: &str,
-        batch: &[&[u8]],
-    ) -> std::io::Result<()> {
+    pub fn batch_append_for_topic(&self, col_name: &str, batch: &[&[u8]]) -> std::io::Result<()> {
         // RAII guard to ensure batch flag is released
         struct BatchGuard<'a> {
             flag: &'a AtomicBool,
@@ -1317,7 +1328,8 @@ impl Walrus {
 
                 // Allocate new block
                 // SAFETY: We hold locks, so this writer has exclusive ownership
-                let new_block = unsafe { self.allocator.alloc_block(need.max(DEFAULT_BLOCK_SIZE))? };
+                let new_block =
+                    unsafe { self.allocator.alloc_block(need.max(DEFAULT_BLOCK_SIZE))? };
                 debug_print!("[batch] allocated new block_id={}", new_block.id);
 
                 revert_info.allocated_block_ids.push(new_block.id);
@@ -1339,7 +1351,10 @@ impl Walrus {
             // io_uring path
             let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
             let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e))
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("io_uring init failed: {}", e),
+                )
             })?;
             let mut buffers: Vec<Vec<u8>> = Vec::new();
 
@@ -1388,14 +1403,11 @@ impl Walrus {
                     ));
                 };
 
-                let write_op = io_uring::opcode::Write::new(
-                    fd,
-                    combined.as_ptr(),
-                    combined.len() as u32,
-                )
-                .offset(file_offset)
-                .build()
-                .user_data(*data_idx as u64);
+                let write_op =
+                    io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32)
+                        .offset(file_offset)
+                        .build()
+                        .user_data(*data_idx as u64);
 
                 buffers.push(combined);
 
@@ -1810,7 +1822,10 @@ impl Walrus {
                         let new_off = tail_off + consumed as u64;
                         // Reacquire column lock to update in-memory progress, then decide persistence
                         let mut info = info_arc.write().map_err(|_| {
-                            std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "col info write lock poisoned",
+                            )
                         })?;
                         info.tail_block_id = active_block.id;
                         info.tail_offset = new_off;
@@ -1879,7 +1894,11 @@ impl Walrus {
         }
     }
 
-    pub fn batch_read_for_topic(&self, col_name: &str, max_bytes: usize) -> std::io::Result<Vec<Entry>> {
+    pub fn batch_read_for_topic(
+        &self,
+        col_name: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
             blk: Block,
@@ -2057,7 +2076,10 @@ impl Walrus {
             // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
             let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e))
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("io_uring init failed: {}", e),
+                )
             })?;
 
             let mut temp_buffers: Vec<Vec<u8>> = vec![Vec::new(); plan.len()];
@@ -2112,7 +2134,10 @@ impl Walrus {
                     if (got as usize) != expected_sizes[plan_idx] {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            format!("short read: got {} bytes, expected {}", got, expected_sizes[plan_idx]),
+                            format!(
+                                "short read: got {} bytes, expected {}",
+                                got, expected_sizes[plan_idx]
+                            ),
                         ));
                     }
                 }
@@ -2121,13 +2146,16 @@ impl Walrus {
             buffers = temp_buffers;
         } else {
             // mmap fallback: copy ranges
-            buffers = plan.iter().map(|read_plan| {
-                let size = (read_plan.end - read_plan.start) as usize;
-                let mut buffer = vec![0u8; size];
-                let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
-                read_plan.blk.mmap.read(file_offset, &mut buffer);
-                buffer
-            }).collect();
+            buffers = plan
+                .iter()
+                .map(|read_plan| {
+                    let size = (read_plan.end - read_plan.start) as usize;
+                    let mut buffer = vec![0u8; size];
+                    let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
+                    read_plan.blk.mmap.read(file_offset, &mut buffer);
+                    buffer
+                })
+                .collect();
         }
 
         // 4) Parse entries from buffers in plan order
@@ -2150,7 +2178,8 @@ impl Walrus {
                     break; // Not enough data for header
                 }
 
-                let meta_len = (buffer[buf_offset] as usize) | ((buffer[buf_offset + 1] as usize) << 8);
+                let meta_len =
+                    (buffer[buf_offset] as usize) | ((buffer[buf_offset + 1] as usize) << 8);
 
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
                     // Invalid or zeroed header - stop parsing this block
@@ -2197,7 +2226,9 @@ impl Walrus {
                 }
 
                 // Add to results
-                entries.push(Entry { data: data_slice.to_vec() });
+                entries.push(Entry {
+                    data: data_slice.to_vec(),
+                });
                 total_data_bytes = next_total;
                 entries_parsed += 1;
 
@@ -2220,7 +2251,11 @@ impl Walrus {
         // 5) Commit progress
         if entries_parsed > 0 {
             // Prepare persistence target while holding the appropriate lock
-            enum PersistTarget { Tail { blk_id: u64, off: u64 }, Sealed { idx: u64, off: u64 }, None }
+            enum PersistTarget {
+                Tail { blk_id: u64, off: u64 },
+                Sealed { idx: u64, off: u64 },
+                None,
+            }
             let mut target = PersistTarget::None;
 
             if hold_lock_during_io {
@@ -2233,12 +2268,18 @@ impl Walrus {
                     info.tail_block_id = final_tail_block_id;
                     info.tail_offset = final_tail_offset;
                     // StrictlyAtOnce: persist immediately
-                    target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
+                    target = PersistTarget::Tail {
+                        blk_id: final_tail_block_id,
+                        off: final_tail_offset,
+                    };
                 } else {
                     info.cur_block_idx = final_block_idx;
                     info.cur_block_offset = final_block_offset;
                     // StrictlyAtOnce: persist immediately
-                    target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
+                    target = PersistTarget::Sealed {
+                        idx: final_block_idx as u64,
+                        off: final_block_offset,
+                    };
                 }
                 // Release before persisting index
                 drop(info);
@@ -2254,7 +2295,9 @@ impl Walrus {
                     info2.tail_offset = final_tail_offset;
                     if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
                         // Clamp contribution so a single call can't reach the threshold
-                        let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
+                        let room = persist_every
+                            .saturating_sub(1)
+                            .saturating_sub(info2.reads_since_persist);
                         let add = entries_parsed.min(room);
                         info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
                         // target remains None here to avoid persisting to end in one batch
@@ -2263,7 +2306,9 @@ impl Walrus {
                     info2.cur_block_idx = final_block_idx;
                     info2.cur_block_offset = final_block_offset;
                     if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                        let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
+                        let room = persist_every
+                            .saturating_sub(1)
+                            .saturating_sub(info2.reads_since_persist);
                         let add = entries_parsed.min(room);
                         info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
                     }
@@ -2291,8 +2336,9 @@ impl Walrus {
     }
 
     fn startup_chore(&self) -> std::io::Result<()> {
-        // Minimal recovery: scan wal_files, build reader chains, and rebuild trackers
-        let dir = match fs::read_dir("./wal_files") {
+        // Minimal recovery: scan wal data dir, build reader chains, and rebuild trackers
+        let data_dir = wal_data_dir();
+        let dir = match fs::read_dir(&data_dir) {
             Ok(d) => d,
             Err(_) => return Ok(()),
         };

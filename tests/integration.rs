@@ -1,3 +1,6 @@
+mod common;
+
+use common::{TestEnv, current_wal_dir};
 use std::fs;
 use std::sync::Arc;
 use std::thread;
@@ -5,15 +8,12 @@ use std::time::Duration;
 use walrus_rust::ReadConsistency;
 use walrus_rust::wal::Walrus;
 
-fn cleanup_wal() {
-    let _ = fs::remove_dir_all("wal_files");
-    thread::sleep(Duration::from_millis(10));
-    // Ensure debug logging stays quiet for tests
-    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
+fn setup_test_env() -> TestEnv {
+    TestEnv::new()
 }
 
 fn first_data_file() -> String {
-    let mut files: Vec<_> = fs::read_dir("./wal_files").unwrap().flatten().collect();
+    let mut files: Vec<_> = fs::read_dir(current_wal_dir()).unwrap().flatten().collect();
     files.sort_by_key(|e| e.file_name());
     let p = files
         .into_iter()
@@ -25,7 +25,7 @@ fn first_data_file() -> String {
 
 #[test]
 fn integration_basic_write_read_cycle() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -41,13 +41,11 @@ fn integration_basic_write_read_cycle() {
     assert_eq!(entry2.data, b"Second message");
 
     assert!(wal.read_next("test_topic").unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_multiple_topics() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -71,13 +69,11 @@ fn integration_multiple_topics() {
     assert!(wal.read_next("logs").unwrap().is_none());
     assert!(wal.read_next("metrics").unwrap().is_none());
     assert!(wal.read_next("events").unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_empty_data_handling() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -88,13 +84,11 @@ fn integration_empty_data_handling() {
     wal.append_for_topic("single_byte", &[42]).unwrap();
     let single_entry = wal.read_next("single_byte").unwrap().unwrap();
     assert_eq!(single_entry.data, &[42]);
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_binary_data() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -103,13 +97,11 @@ fn integration_binary_data() {
 
     let entry = wal.read_next("binary").unwrap().unwrap();
     assert_eq!(entry.data, binary_data);
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_utf8_strings() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -132,13 +124,11 @@ fn integration_utf8_strings() {
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, *expected);
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_medium_sized_data() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -156,13 +146,11 @@ fn integration_medium_sized_data() {
         let entry = wal.read_next(&topic).unwrap().unwrap();
         assert_eq!(entry.data, expected);
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_sequential_writes_and_reads() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "sequential";
@@ -180,13 +168,11 @@ fn integration_sequential_writes_and_reads() {
     }
 
     assert!(wal.read_next(topic).unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_interleaved_write_read() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "interleaved";
@@ -210,13 +196,11 @@ fn integration_interleaved_write_read() {
     assert_eq!(entry4.data, b"Message 4");
 
     assert!(wal.read_next(topic).unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_multiple_topics_stress() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let num_topics = 5;
@@ -240,13 +224,11 @@ fn integration_multiple_topics_stress() {
         }
         assert!(wal.read_next(&topic).unwrap().is_none());
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_concurrent_writes() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Arc::new(Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap());
     let num_threads = 3;
@@ -283,13 +265,11 @@ fn integration_concurrent_writes() {
         }
         assert!(wal.read_next(&topic).unwrap().is_none());
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_topic_isolation() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -309,13 +289,11 @@ fn integration_topic_isolation() {
 
     assert_eq!(wal.read_next("topic_c").unwrap().unwrap().data, b"C1");
     assert!(wal.read_next("topic_c").unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_nonexistent_topic() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -325,13 +303,11 @@ fn integration_nonexistent_topic() {
     assert!(wal.read_next("different").unwrap().is_none());
 
     assert_eq!(wal.read_next("existing").unwrap().unwrap().data, b"data");
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_write_after_exhaustion() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "exhaustion_test";
@@ -346,13 +322,11 @@ fn integration_write_after_exhaustion() {
     assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"second");
     assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"third");
     assert!(wal.read_next(topic).unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_large_topic_names() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -372,13 +346,11 @@ fn integration_large_topic_names() {
         wal.read_next(&very_long_topic).unwrap().unwrap().data,
         b"very long topic data"
     );
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_memory_pressure_test() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let num_topics = 100;
@@ -411,13 +383,11 @@ fn integration_memory_pressure_test() {
             );
         }
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_file_rollover_stress() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "rollover_stress";
@@ -449,13 +419,11 @@ fn integration_file_rollover_stress() {
             );
         }
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_corruption_detection_comprehensive() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "corruption_test";
@@ -493,13 +461,11 @@ fn integration_corruption_detection_comprehensive() {
             }
         }
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_extreme_topic_count() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let num_topics = 5000; // Extreme number of topics
@@ -542,13 +508,11 @@ fn integration_extreme_topic_count() {
         let actual_payload = String::from_utf8(entry.data[8..].to_vec()).unwrap();
         assert_eq!(actual_payload, expected_payload);
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_mixed_size_stress() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "mixed_sizes";
@@ -579,13 +543,11 @@ fn integration_mixed_size_stress() {
             );
         }
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_persistence_stress_with_validation() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -665,13 +627,11 @@ fn integration_persistence_stress_with_validation() {
             assert!(wal.read_next(&topic).unwrap().is_none());
         }
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_data_pattern_stress() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -716,13 +676,11 @@ fn integration_data_pattern_stress() {
             pattern_name
         );
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn integration_special_topic_names() {
-    cleanup_wal();
+    let _env = setup_test_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -746,13 +704,11 @@ fn integration_special_topic_names() {
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn exactly_once_delivery_guarantee() {
-    cleanup_wal();
+    let _env = setup_test_env();
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     for i in 0..10 {
@@ -769,6 +725,4 @@ fn exactly_once_delivery_guarantee() {
     for i in 5..10 {
         assert_eq!(wal2.read_next("exactly_once").unwrap().unwrap().data, &[i]);
     }
-
-    cleanup_wal();
 }

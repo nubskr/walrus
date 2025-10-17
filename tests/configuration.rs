@@ -1,3 +1,6 @@
+mod common;
+
+use common::{TestEnv, current_wal_dir};
 use std::fs;
 use std::sync::Arc;
 use std::thread;
@@ -5,42 +8,15 @@ use std::time::Duration;
 use std::time::Instant;
 use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
-fn cleanup_wal() {
-    // Aggressive cleanup to ensure complete removal
-    for attempt in 0..10 {
-        if std::path::Path::new("wal_files").exists() {
-            // Try to remove all files first
-            if let Ok(entries) = fs::read_dir("wal_files") {
-                for entry in entries.flatten() {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-            // Then remove the directory
-            let _ = fs::remove_dir_all("wal_files");
-        }
-
-        thread::sleep(Duration::from_millis(100));
-
-        // Check if cleanup was successful
-        if !std::path::Path::new("wal_files").exists() {
-            break;
-        }
-
-        if attempt == 9 {
-            panic!("Failed to cleanup wal_files directory after 10 attempts");
-        }
-    }
-
-    // Ensure directory is recreated
-    let _ = fs::create_dir_all("wal_files");
-    thread::sleep(Duration::from_millis(100));
-    // Silence debug logging during tests
-    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
+fn setup_env() -> TestEnv {
+    let env = TestEnv::new();
+    thread::sleep(Duration::from_millis(50));
+    env
 }
 
 #[test]
 fn test_strictly_at_once_consistency() {
-    cleanup_wal();
+    let _env = setup_env();
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("test", b"msg1").unwrap();
     wal.append_for_topic("test", b"msg2").unwrap();
@@ -52,23 +28,19 @@ fn test_strictly_at_once_consistency() {
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let entry2 = wal2.read_next("test").unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_at_least_once_consistency() {
-    cleanup_wal();
+    let _env = setup_env();
 
     // Test that AtLeastOnce mode can be created successfully
     let _wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_fsync_schedule() {
-    cleanup_wal();
+    let _env = setup_env();
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
         FsyncSchedule::Milliseconds(1000),
@@ -77,12 +49,11 @@ fn test_fsync_schedule() {
     wal.append_for_topic("test", b"data").unwrap();
     let entry = wal.read_next("test").unwrap().unwrap();
     assert_eq!(entry.data, b"data");
-    cleanup_wal();
 }
 
 #[test]
 fn test_fsync_schedule_sync_each() {
-    cleanup_wal();
+    let _env = setup_env();
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
         FsyncSchedule::SyncEach,
@@ -105,13 +76,11 @@ fn test_fsync_schedule_sync_each() {
 
     // Verify no more entries
     assert!(wal.read_next("sync_each_test").unwrap().is_none());
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_constructors() {
-    cleanup_wal();
+    let _env = setup_env();
     let wal1 = Walrus::new().unwrap();
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 5 }).unwrap();
     let wal3 = Walrus::with_consistency_and_schedule(
@@ -123,13 +92,11 @@ fn test_constructors() {
     wal1.append_for_topic("test", b"data1").unwrap();
     wal2.append_for_topic("test", b"data2").unwrap();
     wal3.append_for_topic("test", b"data3").unwrap();
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_crash_recovery_strictly_at_once() {
-    cleanup_wal();
+    let _env = setup_env();
 
     {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -161,13 +128,11 @@ fn test_crash_recovery_strictly_at_once() {
 
         assert!(wal.read_next("recovery_test").unwrap().is_none());
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_crash_recovery_at_least_once() {
-    cleanup_wal();
+    let _env = setup_env();
 
     {
         let wal =
@@ -207,13 +172,11 @@ fn test_crash_recovery_at_least_once() {
         let entry4 = wal.read_next("recovery_test").unwrap().unwrap();
         assert_eq!(entry4.data, b"at_least_once_msg_4");
     }
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_multiple_topics_different_consistency_behavior() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 2 }).unwrap();
 
@@ -230,13 +193,11 @@ fn test_multiple_topics_different_consistency_behavior() {
 
     assert_eq!(wal2.read_next("topic_a").unwrap().unwrap().data, b"a1");
     assert_eq!(wal2.read_next("topic_b").unwrap().unwrap().data, b"b1");
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_configuration_with_concurrent_operations() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -283,13 +244,11 @@ fn test_configuration_with_concurrent_operations() {
     }
 
     assert_eq!(read_count, 10);
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_persist_every_zero_clamping() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 0 }).unwrap();
 
@@ -304,13 +263,11 @@ fn test_persist_every_zero_clamping() {
 
     let entry2 = wal2.read_next("test").unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_log_file_deletion_with_fast_fsync() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
@@ -328,7 +285,8 @@ fn test_log_file_deletion_with_fast_fsync() {
     wal.append_for_topic("deletion_test", &large_data_2)
         .unwrap();
 
-    let files_after_writes = std::fs::read_dir("wal_files")
+    let wal_dir = current_wal_dir();
+    let files_after_writes = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -362,7 +320,8 @@ fn test_log_file_deletion_with_fast_fsync() {
 
     for i in 1..=12 {
         thread::sleep(Duration::from_secs(5));
-        let current_files = std::fs::read_dir("wal_files")
+        let wal_dir = current_wal_dir();
+        let current_files = std::fs::read_dir(&wal_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -379,7 +338,8 @@ fn test_log_file_deletion_with_fast_fsync() {
         }
     }
 
-    let files_after_read = std::fs::read_dir("wal_files")
+    let wal_dir = current_wal_dir();
+    let files_after_read = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -415,12 +375,11 @@ fn test_log_file_deletion_with_fast_fsync() {
     assert_eq!(entry2.data[0], 0xBB); // Verify it's the second entry
 
     println!("Test completed successfully!");
-    cleanup_wal();
 }
 
 #[test]
 fn test_log_file_deletion_with_large_data() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
@@ -450,8 +409,9 @@ fn test_log_file_deletion_with_large_data() {
 
     assert!(wal.read_next("large_deletion_test").unwrap().is_none());
 
-    let files_before = if std::path::Path::new("wal_files").exists() {
-        std::fs::read_dir("wal_files")
+    let wal_dir = current_wal_dir();
+    let files_before = if wal_dir.exists() {
+        std::fs::read_dir(&wal_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -469,8 +429,9 @@ fn test_log_file_deletion_with_large_data() {
     drop(wal);
     thread::sleep(Duration::from_secs(3));
 
-    let files_after = if std::path::Path::new("wal_files").exists() {
-        std::fs::read_dir("wal_files")
+    let wal_dir = current_wal_dir();
+    let files_after = if wal_dir.exists() {
+        std::fs::read_dir(&wal_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -484,13 +445,11 @@ fn test_log_file_deletion_with_large_data() {
     };
 
     println!("Large data test - Files after: {}", files_after);
-
-    cleanup_wal();
 }
 
 #[test]
 fn test_file_state_tracking() {
-    cleanup_wal();
+    let _env = setup_env();
 
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
@@ -503,8 +462,9 @@ fn test_file_state_tracking() {
         wal.append_for_topic("state_test", msg.as_bytes()).unwrap();
     }
 
-    assert!(std::path::Path::new("wal_files").exists());
-    let files_exist = std::fs::read_dir("wal_files")
+    let wal_dir = current_wal_dir();
+    assert!(wal_dir.exists());
+    let files_exist = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .any(|entry| {
@@ -520,7 +480,7 @@ fn test_file_state_tracking() {
         assert_eq!(entry.data, expected.as_bytes());
     }
 
-    let files_still_exist = std::fs::read_dir("wal_files")
+    let files_still_exist = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .any(|entry| {
@@ -540,6 +500,4 @@ fn test_file_state_tracking() {
     }
 
     assert!(wal.read_next("state_test").unwrap().is_none());
-
-    cleanup_wal();
 }
