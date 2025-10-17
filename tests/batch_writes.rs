@@ -547,6 +547,447 @@ fn test_chaos_batch_write_with_concurrent_readers() {
     cleanup_test_env();
 }
 
+#[test]
+fn test_chaos_batch_write_crash_recovery() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    // Phase 1: Write batch and "crash" (drop WAL)
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        let entries: Vec<&[u8]> = vec![b"before_crash_1", b"before_crash_2", b"before_crash_3"];
+        wal.batch_append_for_topic("crash_topic", &entries).unwrap();
+
+        // Simulate crash by dropping wal without graceful shutdown
+        drop(wal);
+    }
+
+    // Phase 2: Recover and verify
+    {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        // Should be able to read the batch that was written before crash
+        let e1 = wal.read_next("crash_topic").unwrap().unwrap();
+        assert_eq!(e1.data, b"before_crash_1");
+
+        let e2 = wal.read_next("crash_topic").unwrap().unwrap();
+        assert_eq!(e2.data, b"before_crash_2");
+
+        let e3 = wal.read_next("crash_topic").unwrap().unwrap();
+        assert_eq!(e3.data, b"before_crash_3");
+
+        // Write more after recovery
+        let entries2: Vec<&[u8]> = vec![b"after_crash_1", b"after_crash_2"];
+        wal.batch_append_for_topic("crash_topic", &entries2).unwrap();
+
+        let e4 = wal.read_next("crash_topic").unwrap().unwrap();
+        assert_eq!(e4.data, b"after_crash_1");
+
+        let e5 = wal.read_next("crash_topic").unwrap().unwrap();
+        assert_eq!(e5.data, b"after_crash_2");
+    }
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_alternating_tiny_and_huge_batches() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    for round in 0..10 {
+        // Tiny batch
+        let tiny: Vec<&[u8]> = vec![b"t"];
+        wal.batch_append_for_topic("alternating", &tiny).unwrap();
+
+        // Huge batch (10MB per entry, 5 entries = 50MB)
+        let huge_entry = vec![0xAB; 10 * 1024 * 1024];
+        let huge: Vec<&[u8]> = (0..5).map(|_| huge_entry.as_slice()).collect();
+        wal.batch_append_for_topic("alternating", &huge).unwrap();
+    }
+
+    // Verify all entries
+    for round in 0..10 {
+        let tiny_entry = wal.read_next("alternating").unwrap().unwrap();
+        assert_eq!(tiny_entry.data, b"t");
+
+        for _ in 0..5 {
+            let huge_entry = wal.read_next("alternating").unwrap().unwrap();
+            assert_eq!(huge_entry.data.len(), 10 * 1024 * 1024);
+            assert_eq!(huge_entry.data[0], 0xAB);
+        }
+    }
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_batch_writes_force_multiple_block_rotations() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Each entry is 5MB, 100 entries = 500MB
+    // With 10MB blocks, this should rotate through ~50 blocks
+    let entry = vec![0xEE; 5 * 1024 * 1024];
+    let entries: Vec<&[u8]> = (0..100).map(|_| entry.as_slice()).collect();
+
+    wal.batch_append_for_topic("rotation_topic", &entries).unwrap();
+
+    // Verify all entries survived the rotations
+    for _ in 0..100 {
+        let e = wal.read_next("rotation_topic").unwrap().unwrap();
+        assert_eq!(e.data.len(), 5 * 1024 * 1024);
+        assert_eq!(e.data[0], 0xEE);
+    }
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_readers_at_different_positions_during_batch() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 1 },
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap());
+
+    // Pre-populate with some entries
+    for i in 0..10 {
+        let data = format!("pre_{}", i);
+        wal.append_for_topic("positioned_topic", data.as_bytes()).unwrap();
+    }
+
+    // Position readers at different offsets
+    let reader1_wal = wal.clone();
+    let reader2_wal = wal.clone();
+    let reader3_wal = wal.clone();
+
+    // Reader 1: reads 0 entries (at beginning)
+    // Reader 2: reads 5 entries (in middle)
+    for _ in 0..5 {
+        reader2_wal.read_next("positioned_topic").unwrap();
+    }
+    // Reader 3: reads all 10 entries (at end)
+    for _ in 0..10 {
+        reader3_wal.read_next("positioned_topic").unwrap();
+    }
+
+    // Now write a batch
+    let batch: Vec<&[u8]> = vec![b"batch_1", b"batch_2", b"batch_3"];
+    wal.batch_append_for_topic("positioned_topic", &batch).unwrap();
+
+    // Reader 1 should see all 10 pre + 3 batch = 13 entries
+    let mut r1_count = 0;
+    while reader1_wal.read_next("positioned_topic").unwrap().is_some() {
+        r1_count += 1;
+    }
+    assert_eq!(r1_count, 13);
+
+    // Reader 2 should see 5 pre + 3 batch = 8 entries
+    let mut r2_count = 0;
+    while reader2_wal.read_next("positioned_topic").unwrap().is_some() {
+        r2_count += 1;
+    }
+    assert_eq!(r2_count, 8);
+
+    // Reader 3 should see only 3 batch entries
+    let mut r3_count = 0;
+    while reader3_wal.read_next("positioned_topic").unwrap().is_some() {
+        r3_count += 1;
+    }
+    assert_eq!(r3_count, 3);
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_many_topics_racing_batch_and_regular() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap());
+
+    let num_topics = 20;
+    let mut handles = vec![];
+
+    // Each topic gets 2 threads: one doing batch writes, one doing regular writes
+    for topic_id in 0..num_topics {
+        // Batch writer thread
+        let wal_clone = wal.clone();
+        let h1 = thread::spawn(move || {
+            let topic = format!("race_topic_{}", topic_id);
+            for batch_num in 0..20 {
+                let data = format!("t{}_b{}", topic_id, batch_num);
+                let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes(), data.as_bytes()];
+                let _ = wal_clone.batch_append_for_topic(&topic, &entries);
+                thread::sleep(Duration::from_micros(100));
+            }
+        });
+
+        // Regular writer thread
+        let wal_clone = wal.clone();
+        let h2 = thread::spawn(move || {
+            let topic = format!("race_topic_{}", topic_id);
+            for entry_num in 0..20 {
+                let data = format!("t{}_r{}", topic_id, entry_num);
+                let _ = wal_clone.append_for_topic(&topic, data.as_bytes());
+                thread::sleep(Duration::from_micros(100));
+            }
+        });
+
+        handles.push(h1);
+        handles.push(h2);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Verify each topic has some entries (no corruption)
+    for topic_id in 0..num_topics {
+        let topic = format!("race_topic_{}", topic_id);
+        let mut count = 0;
+        while wal.read_next(&topic).unwrap().is_some() {
+            count += 1;
+        }
+        assert!(count > 0, "Topic {} should have entries", topic_id);
+    }
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_sequential_batches_with_crashes() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    for cycle in 0..5 {
+        let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .unwrap();
+
+        let data = format!("cycle_{}", cycle);
+        let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes()];
+        wal.batch_append_for_topic("crash_cycles", &entries).unwrap();
+
+        // Simulate crash
+        drop(wal);
+    }
+
+    // Final recovery: should see all 5 cycles × 2 entries = 10 entries
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    for cycle in 0..5 {
+        let expected = format!("cycle_{}", cycle);
+        for _ in 0..2 {
+            let entry = wal.read_next("crash_cycles").unwrap().unwrap();
+            assert_eq!(entry.data, expected.as_bytes());
+        }
+    }
+
+    assert!(wal.read_next("crash_cycles").unwrap().is_none());
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_batch_with_exactly_block_size_entries() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Create entries that exactly match block size (10MB - metadata overhead)
+    let metadata_overhead = 64;
+    let exact_size = (10 * 1024 * 1024 - metadata_overhead) as usize;
+
+    let entries_data: Vec<Vec<u8>> = (0..5)
+        .map(|i| vec![i as u8; exact_size])
+        .collect();
+    let entries: Vec<&[u8]> = entries_data.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("exact_topic", &entries).unwrap();
+
+    // Each entry should force a new block
+    for i in 0..5 {
+        let entry = wal.read_next("exact_topic").unwrap().unwrap();
+        assert_eq!(entry.data.len(), exact_size);
+        assert_eq!(entry.data[0], i as u8);
+    }
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_hammering_same_topic_with_batches() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap());
+
+    let num_threads = 20;
+    let barrier = Arc::new(Barrier::new(num_threads));
+    let mut handles = vec![];
+
+    for thread_id in 0..num_threads {
+        let wal_clone = wal.clone();
+        let barrier_clone = barrier.clone();
+
+        let handle = thread::spawn(move || {
+            barrier_clone.wait(); // Synchronize start
+
+            let mut success_count = 0;
+            let mut blocked_count = 0;
+
+            for _ in 0..10 {
+                let data = format!("thread_{}", thread_id);
+                let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes()];
+
+                match wal_clone.batch_append_for_topic("hammered_topic", &entries) {
+                    Ok(_) => success_count += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => blocked_count += 1,
+                    Err(e) => panic!("Unexpected error: {}", e),
+                }
+
+                thread::sleep(Duration::from_micros(50));
+            }
+
+            (success_count, blocked_count)
+        });
+
+        handles.push(handle);
+    }
+
+    let mut total_success = 0;
+    let mut total_blocked = 0;
+
+    for handle in handles {
+        let (success, blocked) = handle.join().unwrap();
+        total_success += success;
+        total_blocked += blocked;
+    }
+
+    // Should have some successes and some blocks
+    assert!(total_success > 0, "Expected some successful batch writes");
+    assert!(total_blocked > 0, "Expected some blocked batch writes");
+    assert_eq!(total_success + total_blocked, num_threads * 10);
+
+    // Count actual entries written
+    let mut count = 0;
+    while wal.read_next("hammered_topic").unwrap().is_some() {
+        count += 1;
+    }
+
+    // Should have 2 entries per successful batch
+    assert_eq!(count, total_success * 2);
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_zero_length_entries_in_batch() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    // Mix of zero-length and normal entries
+    let entries: Vec<&[u8]> = vec![
+        b"",
+        b"normal",
+        b"",
+        b"",
+        b"another",
+        b"",
+    ];
+
+    wal.batch_append_for_topic("zero_topic", &entries).unwrap();
+
+    // Verify all entries including empty ones
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"normal");
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"another");
+    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
+
+    cleanup_test_env();
+}
+
+#[test]
+fn test_chaos_batch_interspersed_with_frequent_fsync() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::SyncEach, // Fsync after every write
+    )
+    .unwrap();
+
+    // This tests that batch writes work even with aggressive fsyncing
+    for i in 0..10 {
+        let data = format!("batch_{}", i);
+        let entries: Vec<&[u8]> = vec![data.as_bytes(); 5];
+        wal.batch_append_for_topic("fsync_topic", &entries).unwrap();
+    }
+
+    // Verify all 50 entries
+    let mut count = 0;
+    while wal.read_next("fsync_topic").unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 50);
+
+    cleanup_test_env();
+}
+
 // ============================================================================
 // EDGE CASE TESTS
 // ============================================================================
