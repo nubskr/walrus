@@ -1,4 +1,4 @@
-use walrus_wal::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
+use walrus_rust::{enable_fd_backend, FsyncSchedule, ReadConsistency, Walrus};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +8,7 @@ fn setup_test_env() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos());
-    std::env::set_var("WALRUS_QUIET", "1");
+    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
 
     // Clean up old test directories
     let _ = std::fs::remove_dir_all("wal_files");
@@ -529,7 +529,7 @@ fn test_chaos_batch_write_with_concurrent_readers() {
                     thread::sleep(Duration::from_millis(5));
                 }
             }
-            read_count
+            // Return nothing to match writer thread type
         });
 
         handles.push(handle);
