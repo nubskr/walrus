@@ -10,7 +10,7 @@ fn setup_test_env() -> std::sync::MutexGuard<'static, ()> {
     // Recover from poisoned lock instead of panicking
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    std::env::set_var("WALRUS_QUIET", "1");
+    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
 
     // Clean up old test directories
     let _ = std::fs::remove_dir_all("wal_files");

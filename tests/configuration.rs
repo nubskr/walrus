@@ -35,7 +35,7 @@ fn cleanup_wal() {
     let _ = fs::create_dir_all("wal_files");
     thread::sleep(Duration::from_millis(100));
     // Silence debug logging during tests
-    std::env::set_var("WALRUS_QUIET", "1");
+    unsafe { std::env::set_var("WALRUS_QUIET", "1"); }
 }
 
 #[test]
