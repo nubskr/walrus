@@ -458,6 +458,7 @@ struct Writer {
     publisher: Arc<mpsc::Sender<String>>,
     current_offset: Mutex<u64>,
     fsync_schedule: FsyncSchedule,
+    is_batch_writing: AtomicBool,
 }
 
 impl Writer {
@@ -477,10 +478,19 @@ impl Writer {
             publisher,
             current_offset: Mutex::new(0),
             fsync_schedule,
+            is_batch_writing: AtomicBool::new(false),
         }
     }
 
     pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        // Check if batch write is in progress
+        if self.is_batch_writing.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "batch write in progress for this topic",
+            ));
+        }
+
         let mut block = self.current_block.lock().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
         })?;
@@ -1135,6 +1145,335 @@ impl Walrus {
             }
         };
         writer.write(raw_bytes)
+    }
+
+    pub fn batch_append_for_topic(
+        &self,
+        col_name: &str,
+        batch: &[&[u8]],
+    ) -> std::io::Result<()> {
+        // RAII guard to ensure batch flag is released
+        struct BatchGuard<'a> {
+            flag: &'a AtomicBool,
+        }
+        impl<'a> Drop for BatchGuard<'a> {
+            fn drop(&mut self) {
+                self.flag.store(false, Ordering::Release);
+                debug_print!("[batch] released batch_writing flag");
+            }
+        }
+
+        // Revert info for rollback
+        struct BatchRevertInfo {
+            original_block_id: u64,
+            original_offset: u64,
+            allocated_block_ids: Vec<u64>,
+        }
+
+        // Phase 0: Validate batch size
+        let total_bytes: u64 = batch
+            .iter()
+            .map(|data| (PREFIX_META_SIZE as u64) + (data.len() as u64))
+            .sum();
+
+        const MAX_BATCH_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+        if total_bytes > MAX_BATCH_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch exceeds 10GB limit",
+            ));
+        }
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Get or create writer
+        let writer = {
+            if let Some(w) = {
+                let map = self.writers.read().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+                })?;
+                map.get(col_name).cloned()
+            } {
+                w
+            } else {
+                let mut map = self.writers.write().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
+                })?;
+                if let Some(w) = map.get(col_name).cloned() {
+                    w
+                } else {
+                    // SAFETY: The returned block will be held by this writer only
+                    let initial_block = unsafe { self.allocator.get_next_available_block()? };
+                    let w = Arc::new(Writer::new(
+                        self.allocator.clone(),
+                        initial_block,
+                        self.reader.clone(),
+                        col_name.to_string(),
+                        self.fsync_tx.clone(),
+                        self.fsync_schedule,
+                    ));
+                    map.insert(col_name.to_string(), w.clone());
+                    w
+                }
+            }
+        };
+
+        // Try to acquire batch write flag
+        if writer
+            .is_batch_writing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another batch write already in progress",
+            ));
+        }
+
+        // Ensure we release the flag even if we panic
+        let _guard = BatchGuard {
+            flag: &writer.is_batch_writing,
+        };
+
+        debug_print!(
+            "[batch] START: col={}, entries={}, total_bytes={}",
+            col_name,
+            batch.len(),
+            total_bytes
+        );
+
+        // Phase 1: Pre-allocation & Planning
+        let mut block = writer.current_block.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+        })?;
+        let mut cur_offset = writer.current_offset.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+        })?;
+
+        let mut revert_info = BatchRevertInfo {
+            original_block_id: block.id,
+            original_offset: *cur_offset,
+            allocated_block_ids: Vec::new(),
+        };
+
+        // Build write plan: (Block, in_block_offset, batch_index)
+        let mut write_plan: Vec<(Block, u64, usize)> = Vec::new();
+        let mut batch_idx = 0;
+
+        while batch_idx < batch.len() {
+            let data = batch[batch_idx];
+            let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
+            let available = block.limit - *cur_offset;
+
+            if available >= need {
+                // Fits in current block
+                write_plan.push((block.clone(), *cur_offset, batch_idx));
+                *cur_offset += need;
+                batch_idx += 1;
+            } else {
+                // Need to seal and allocate new block
+                debug_print!(
+                    "[batch] sealing block_id={}, used={}, need={}, limit={}",
+                    block.id,
+                    *cur_offset,
+                    need,
+                    block.limit
+                );
+                FileStateTracker::set_block_unlocked(block.id as usize);
+                let mut sealed = block.clone();
+                sealed.used = *cur_offset;
+                sealed.mmap.flush()?;
+                let _ = self.reader.append_block_to_chain(col_name, sealed);
+
+                // Allocate new block
+                // SAFETY: We hold locks, so this writer has exclusive ownership
+                let new_block = unsafe { self.allocator.alloc_block(need.max(DEFAULT_BLOCK_SIZE))? };
+                debug_print!("[batch] allocated new block_id={}", new_block.id);
+
+                revert_info.allocated_block_ids.push(new_block.id);
+                *block = new_block;
+                *cur_offset = 0;
+            }
+        }
+
+        debug_print!(
+            "[batch] planning complete: {} write operations across {} blocks",
+            write_plan.len(),
+            revert_info.allocated_block_ids.len() + 1
+        );
+
+        // Phase 2 & 3: io_uring preparation and submission (FD backend only)
+        let use_io_uring = USE_FD_BACKEND.load(Ordering::Relaxed);
+
+        if use_io_uring {
+            // io_uring path
+            let mut ring = io_uring::IoUring::new(write_plan.len() + 64).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e))
+            })?;
+            let mut buffers: Vec<Vec<u8>> = Vec::new();
+
+            for (blk, offset, data_idx) in write_plan.iter() {
+                let data = batch[*data_idx];
+                let next_block_start = blk.offset + blk.limit;
+
+                // Prepare metadata
+                let new_meta = Metadata {
+                    read_size: data.len(),
+                    owned_by: col_name.to_string(),
+                    next_block_start,
+                    checksum: checksum64(data),
+                };
+
+                let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("serialize metadata failed: {:?}", e),
+                    )
+                })?;
+
+                let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
+                meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
+                meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
+                meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
+
+                let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
+                combined.extend_from_slice(&meta_buffer);
+                combined.extend_from_slice(data);
+
+                let file_offset = blk.offset + offset;
+
+                // Get raw FD
+                let fd = if let StorageImpl::Fd(fd_backend) = &blk.mmap.storage {
+                    io_uring::types::Fd(fd_backend.file.as_raw_fd())
+                } else {
+                    // Rollback and fail
+                    *cur_offset = revert_info.original_offset;
+                    for block_id in revert_info.allocated_block_ids {
+                        FileStateTracker::set_block_unlocked(block_id as usize);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "batch writes require FD backend",
+                    ));
+                };
+
+                let write_op = io_uring::opcode::Write::new(
+                    fd,
+                    combined.as_ptr(),
+                    combined.len() as u32,
+                )
+                .offset(file_offset)
+                .build()
+                .user_data(*data_idx as u64);
+
+                buffers.push(combined);
+
+                unsafe {
+                    ring.submission().push(&write_op).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("io_uring push failed: {}", e),
+                        )
+                    })?;
+                }
+            }
+
+            debug_print!(
+                "[batch] submitting {} operations via io_uring",
+                write_plan.len()
+            );
+
+            // Phase 3: Atomic submission
+            match ring.submit_and_wait(write_plan.len()) {
+                Ok(_) => {
+                    let mut all_success = true;
+                    for _ in 0..write_plan.len() {
+                        if let Some(cqe) = ring.completion().next() {
+                            if cqe.result() < 0 {
+                                all_success = false;
+                                debug_print!(
+                                    "[batch] write failed for entry {}: error {}",
+                                    cqe.user_data(),
+                                    cqe.result()
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    if !all_success {
+                        // Rollback
+                        *cur_offset = revert_info.original_offset;
+                        for block_id in revert_info.allocated_block_ids {
+                            FileStateTracker::set_block_unlocked(block_id as usize);
+                        }
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "batch write failed, rolled back",
+                        ));
+                    }
+
+                    // Success - fsync all touched files
+                    let mut fsynced = std::collections::HashSet::new();
+                    for (blk, _, _) in write_plan.iter() {
+                        if !fsynced.contains(&blk.file_path) {
+                            blk.mmap.flush()?;
+                            fsynced.insert(blk.file_path.clone());
+                        }
+                    }
+
+                    debug_print!(
+                        "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
+                        batch.len(),
+                        total_bytes,
+                        col_name
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // Rollback
+                    *cur_offset = revert_info.original_offset;
+                    for block_id in revert_info.allocated_block_ids {
+                        FileStateTracker::set_block_unlocked(block_id as usize);
+                    }
+                    Err(e)
+                }
+            }
+        } else {
+            // Fallback: use regular block.write() in a loop (mmap backend)
+            for (blk, offset, data_idx) in write_plan.iter() {
+                let data = batch[*data_idx];
+                let next_block_start = blk.offset + blk.limit;
+
+                if let Err(e) = blk.write(*offset, data, col_name, next_block_start) {
+                    // Rollback on error
+                    *cur_offset = revert_info.original_offset;
+                    for block_id in revert_info.allocated_block_ids {
+                        FileStateTracker::set_block_unlocked(block_id as usize);
+                    }
+                    return Err(e);
+                }
+            }
+
+            // Success - fsync touched files
+            let mut fsynced = std::collections::HashSet::new();
+            for (blk, _, _) in write_plan.iter() {
+                if !fsynced.contains(&blk.file_path) {
+                    blk.mmap.flush()?;
+                    fsynced.insert(blk.file_path.clone());
+                }
+            }
+
+            debug_print!(
+                "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
+                batch.len(),
+                total_bytes,
+                col_name
+            );
+            Ok(())
+        }
     }
 
     pub fn read_next(&self, col_name: &str) -> std::io::Result<Option<Entry>> {
