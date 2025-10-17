@@ -319,7 +319,7 @@ fn test_batch_read_mixed_entry_sizes() {
 
     // Read in small batches (budget will cut off at different entry boundaries)
     let mut total_entries = 0;
-    let mut total_bytes = 0;
+    let mut _total_bytes = 0;
 
     loop {
         let batch = wal.batch_read_for_topic("mixed_sizes", 600000).unwrap();
@@ -334,7 +334,7 @@ fn test_batch_read_mixed_entry_sizes() {
                 global_idx, sizes[global_idx], entry.data.len());
             assert_eq!(entry.data[0], global_idx as u8,
                 "Entry {} pattern mismatch", global_idx);
-            total_bytes += entry.data.len();
+            _total_bytes += entry.data.len();
         }
 
         total_entries += batch.len();
@@ -757,13 +757,14 @@ fn test_full_chaos_all_operations() {
     .unwrap());
 
     let barrier = Arc::new(Barrier::new(8));
-    let mut handles = vec![];
+    let mut writer_handles = vec![];
+    let mut reader_handles = vec![];
 
     // 2 single-entry writers
     for writer_id in 0..2 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        handles.push(thread::spawn(move || {
+        writer_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             for i in 0..200 {
                 let data = format!("single_w{}_e{}", writer_id, i);
@@ -779,7 +780,7 @@ fn test_full_chaos_all_operations() {
     for writer_id in 2..4 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        handles.push(thread::spawn(move || {
+        writer_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             for batch_num in 0..20 {
                 let entries: Vec<Vec<u8>> = (0..15)
@@ -796,7 +797,7 @@ fn test_full_chaos_all_operations() {
     for reader_id in 4..6 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        handles.push(thread::spawn(move || {
+        reader_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             thread::sleep(std::time::Duration::from_millis(20));
             let mut count = 0;
@@ -815,7 +816,7 @@ fn test_full_chaos_all_operations() {
     for reader_id in 6..8 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
-        handles.push(thread::spawn(move || {
+        reader_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             thread::sleep(std::time::Duration::from_millis(30));
             let mut count = 0;
@@ -834,20 +835,17 @@ fn test_full_chaos_all_operations() {
     let mut total_written = 0;
     let mut total_read = 0;
 
-    for (i, handle) in handles.into_iter().enumerate() {
-        let result = handle.join().unwrap();
-        if i < 4 {
-            // Writers
-            if i < 2 {
-                total_written += 200; // single writers
-            } else {
-                total_written += 20 * 15; // batch writers
-            }
-        } else {
-            // Readers
-            let (_, count) = result;
-            total_read += count;
-        }
+    // Wait for writers
+    for handle in writer_handles {
+        handle.join().unwrap();
+    }
+    total_written += 200 * 2; // 2 single writers, 200 entries each
+    total_written += 20 * 15 * 2; // 2 batch writers, 20 batches * 15 entries each
+
+    // Wait for readers
+    for handle in reader_handles {
+        let (_, count) = handle.join().unwrap();
+        total_read += count;
     }
 
     println!("Chaos test: wrote {}, read {}", total_written, total_read);
