@@ -2150,9 +2150,9 @@ impl Walrus {
                     break; // Incomplete entry
                 }
 
-                // Check budget
-                if total_data_bytes + data_size > max_bytes {
-                    // Would exceed budget - stop here
+                // Check budget: always allow at least one entry, even if it exceeds the budget
+                if total_data_bytes > 0 && total_data_bytes + data_size > max_bytes {
+                    // Would exceed budget - stop here (but only after at least one entry)
                     break;
                 }
 
