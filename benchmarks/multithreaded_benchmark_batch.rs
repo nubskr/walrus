@@ -294,7 +294,7 @@ fn multithreaded_batch_benchmark() {
 
     println!("=== Multi-threaded WAL Batch Benchmark ===");
     println!(
-        "Configuration: 16 threads, {:.0}s write phase only, batch size: {} entries/batch",
+        "Configuration: 2 threads, {:.0}s write phase only, batch size: {} entries/batch",
         write_duration.as_secs(),
         batch_size
     );
@@ -312,7 +312,7 @@ fn multithreaded_batch_benchmark() {
         )
         .expect("Failed to create Walrus"),
     );
-    let num_threads = 16; // Scaled up to 16 threads with smaller entries
+    let num_threads = 2; // Scaled down to 2 threads with massive entries
 
     // Shared counters for statistics
     let total_batches = Arc::new(AtomicU64::new(0));
@@ -494,8 +494,8 @@ fn multithreaded_batch_benchmark() {
                 let mut batch_bytes = 0usize;
 
                 for _ in 0..batch_size_local {
-                    // Fixed entry size of 50KB
-                    let size = 50 * 1024; // 50KB
+                    // Fixed entry size of 20MB
+                    let size = 20 * 1024 * 1024; // 20MB
                     let data = vec![(counter % 256) as u8; size];
                     batch_data.push(data);
                     batch_bytes += size;

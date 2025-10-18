@@ -1311,18 +1311,18 @@ impl Walrus {
         }
 
         // Phase 0: Validate batch size
+        const MAX_BATCH_ENTRIES: usize = 2000;
+        if batch.len() > MAX_BATCH_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch exceeds 2000 entry limit",
+            ));
+        }
+
         let total_bytes: u64 = batch
             .iter()
             .map(|data| (PREFIX_META_SIZE as u64) + (data.len() as u64))
             .sum();
-
-        const MAX_BATCH_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB
-        if total_bytes > MAX_BATCH_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "batch exceeds 10GB limit",
-            ));
-        }
 
         if batch.is_empty() {
             return Ok(());
