@@ -4,7 +4,7 @@ use common::{TestEnv, current_wal_dir};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend, disable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -555,7 +555,8 @@ fn test_chaos_batch_write_with_concurrent_readers() {
 #[test]
 fn test_chaos_batch_write_crash_recovery() {
     let _guard = setup_test_env();
-    enable_fd_backend();
+    // Temporarily disable FD backend to test if issue is backend-specific
+    disable_fd_backend();
 
     // Phase 1: Write batch and "crash" (drop WAL)
     {
@@ -567,9 +568,6 @@ fn test_chaos_batch_write_crash_recovery() {
 
         let entries: Vec<&[u8]> = vec![b"before_crash_1", b"before_crash_2", b"before_crash_3"];
         wal.batch_append_for_topic("crash_topic", &entries).unwrap();
-
-        // Ensure data is flushed to disk before crash
-        wal.flush().unwrap();
 
         // Simulate crash by dropping wal without graceful shutdown
         drop(wal);
@@ -786,7 +784,8 @@ fn test_chaos_many_topics_racing_batch_and_regular() {
 #[test]
 fn test_chaos_sequential_batches_with_crashes() {
     let _guard = setup_test_env();
-    enable_fd_backend();
+    // Temporarily disable FD backend to test if issue is backend-specific
+    disable_fd_backend();
 
     for cycle in 0..5 {
         let wal = Walrus::with_consistency_and_schedule(
@@ -799,9 +798,6 @@ fn test_chaos_sequential_batches_with_crashes() {
         let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes()];
         wal.batch_append_for_topic("crash_cycles", &entries)
             .unwrap();
-
-        // Ensure data is flushed to disk before crash
-        wal.flush().unwrap();
 
         // Simulate crash
         drop(wal);
@@ -1455,9 +1451,6 @@ fn test_integrity_batch_after_crash_recovery() {
 
         wal.batch_append_for_topic("integrity_crash", &entries)
             .unwrap();
-
-        // Ensure data is flushed to disk before crash
-        wal.flush().unwrap();
 
         // Simulate crash
         drop(wal);

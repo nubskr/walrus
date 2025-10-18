@@ -23,6 +23,11 @@ pub fn enable_fd_backend() {
     USE_FD_BACKEND.store(true, Ordering::Relaxed);
 }
 
+// Public function to disable FD backend (use mmap instead)
+pub fn disable_fd_backend() {
+    USE_FD_BACKEND.store(false, Ordering::Relaxed);
+}
+
 // Macro to conditionally print debug messages
 macro_rules! debug_print {
     ($($arg:tt)*) => {
