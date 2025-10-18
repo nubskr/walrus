@@ -173,8 +173,8 @@ fn parse_batch_size() -> usize {
         }
     }
 
-    // Default batch size (halved again)
-    2047
+        // Default batch size (exactly at 2000 entry limit)
+        2000
 }
 
 fn parse_duration() -> Duration {
