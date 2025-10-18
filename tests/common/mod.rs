@@ -1,7 +1,8 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Macro for test output that respects WALRUS_QUIET
@@ -23,8 +24,53 @@ macro_rules! test_eprintln {
     };
 }
 
-static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct ThreadKeyState {
+    active: Option<String>,
+    last: Option<String>,
+}
+
+thread_local! {
+    static THREAD_KEYS: RefCell<ThreadKeyState> = RefCell::new(ThreadKeyState::default());
+}
+
+fn ensure_base_dir() -> PathBuf {
+    BASE_DIR
+        .get_or_init(|| {
+            let unique = format!(
+                "walrus-test-run-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("failed to create walrus test root");
+            unsafe {
+                std::env::set_var("WALRUS_QUIET", "1");
+                std::env::set_var("WALRUS_DATA_DIR", &dir);
+            }
+            dir
+        })
+        .clone()
+}
+
+fn next_namespace_key(counter: u64) -> String {
+    format!(
+        "test-key-{:x}-{:x}-{:x}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        counter
+    )
+}
 
 #[allow(dead_code)]
 pub fn sanitize_key(key: &str) -> String {
@@ -58,81 +104,60 @@ fn checksum64(data: &[u8]) -> u64 {
 }
 
 pub struct TestEnv {
-    _guard: MutexGuard<'static, ()>,
+    key: String,
     dir: PathBuf,
 }
 
 impl TestEnv {
     pub fn new() -> Self {
-        let guard = TEST_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let unique = format!(
-            "walrus-test-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            counter
-        );
-        let dir = std::env::temp_dir().join(unique);
-
-        let namespace_key = format!(
-            "test-key-{:x}-{:x}-{:x}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            counter
-        );
-
-        unsafe {
-            std::env::set_var("WALRUS_QUIET", "1");
-            std::env::set_var("WALRUS_DATA_DIR", dir.as_os_str());
-            if std::env::var_os("WALRUS_INSTANCE_KEY").is_none() {
-                std::env::set_var("WALRUS_INSTANCE_KEY", &namespace_key);
-            }
-        }
+        let base = ensure_base_dir();
+        let key = next_namespace_key(counter);
+        let dir = base.join(sanitize_key(&key));
 
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).expect("failed to create per-test walrus dir");
 
-        Self { _guard: guard, dir }
+        THREAD_KEYS.with(|state| {
+            let mut st = state.borrow_mut();
+            st.active = Some(key.clone());
+            st.last = Some(key.clone());
+        });
+        walrus_rust::wal::__set_thread_namespace_for_tests(&key);
+
+        Self { key, dir }
     }
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
-        unsafe {
-            if matches!(
-                std::env::var("WALRUS_QUIET"),
-                Err(std::env::VarError::NotPresent)
-            ) {
-                std::env::remove_var("WALRUS_INSTANCE_KEY");
+        THREAD_KEYS.with(|state| {
+            let mut st = state.borrow_mut();
+            if st.active.as_deref() == Some(self.key.as_str()) {
+                st.active = None;
             }
-        }
+            st.last = Some(self.key.clone());
+        });
+        walrus_rust::wal::__clear_thread_namespace_for_tests();
     }
 }
 
 pub fn current_wal_dir() -> PathBuf {
-    let mut base = std::env::var_os("WALRUS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("wal_files"));
-    if let Some(key) = std::env::var_os("WALRUS_INSTANCE_KEY") {
-        base.push(sanitize_key(&key.to_string_lossy()));
-    }
+    let mut base = ensure_base_dir();
+    let key = THREAD_KEYS.with(|state| {
+        let st = state.borrow();
+        st.active
+            .as_ref()
+            .or(st.last.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    });
+    base.push(sanitize_key(&key));
     base
 }
 
 #[allow(dead_code)]
 pub fn wal_root_dir() -> PathBuf {
-    std::env::var_os("WALRUS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("wal_files"))
+    ensure_base_dir()
 }
