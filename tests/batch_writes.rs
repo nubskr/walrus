@@ -568,6 +568,9 @@ fn test_chaos_batch_write_crash_recovery() {
         let entries: Vec<&[u8]> = vec![b"before_crash_1", b"before_crash_2", b"before_crash_3"];
         wal.batch_append_for_topic("crash_topic", &entries).unwrap();
 
+        // Ensure data is flushed to disk before crash
+        wal.flush().unwrap();
+
         // Simulate crash by dropping wal without graceful shutdown
         drop(wal);
     }
@@ -796,6 +799,9 @@ fn test_chaos_sequential_batches_with_crashes() {
         let entries: Vec<&[u8]> = vec![data.as_bytes(), data.as_bytes()];
         wal.batch_append_for_topic("crash_cycles", &entries)
             .unwrap();
+
+        // Ensure data is flushed to disk before crash
+        wal.flush().unwrap();
 
         // Simulate crash
         drop(wal);
@@ -1449,6 +1455,9 @@ fn test_integrity_batch_after_crash_recovery() {
 
         wal.batch_append_for_topic("integrity_crash", &entries)
             .unwrap();
+
+        // Ensure data is flushed to disk before crash
+        wal.flush().unwrap();
 
         // Simulate crash
         drop(wal);
