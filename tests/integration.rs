@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 use walrus_rust::ReadConsistency;
 use walrus_rust::wal::Walrus;
+use walrus_rust::FsyncSchedule;
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -467,7 +468,10 @@ fn integration_corruption_detection_comprehensive() {
 fn integration_extreme_topic_count() {
     let _env = setup_test_env();
 
-    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal = Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::SyncEach,
+    ).unwrap();
     let num_topics = 5000; // Extreme number of topics
 
     for topic_id in 0..num_topics {
