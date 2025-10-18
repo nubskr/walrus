@@ -53,7 +53,7 @@ bench-writes:
 		echo "Using custom fsync schedule: $(FSYNC)"; \
 		WALRUS_FSYNC=$(FSYNC) cargo test --test multithreaded_benchmark_writes -- --nocapture; \
 	else \
-		cargo test --test multithreaded_benchmark_writes -- --nocapture; \
+		cargo test --release --test multithreaded_benchmark_writes -- --nocapture; \
 	fi
 
 bench-reads:
@@ -62,7 +62,7 @@ bench-reads:
 		echo "Using custom fsync schedule: $(FSYNC)"; \
 		WALRUS_FSYNC=$(FSYNC) cargo test --test multithreaded_benchmark_reads -- --nocapture; \
 	else \
-		cargo test --test multithreaded_benchmark_reads -- --nocapture; \
+		cargo test --release --test multithreaded_benchmark_reads -- --nocapture; \
 	fi
 
 bench-scaling:
@@ -77,43 +77,43 @@ bench-scaling:
 		echo "Using custom thread range: $(THREADS)"; \
 		WALRUS_THREADS=$(THREADS) cargo test --test scaling_benchmark -- --nocapture; \
 	else \
-		cargo test --test scaling_benchmark -- --nocapture; \
+		cargo test --release --test scaling_benchmark -- --nocapture; \
 	fi
 
 # Sync variants (fsync after each write)
 bench-writes-sync:
 	@echo "Running write benchmark with sync-each (fsync after every write)..."
-	WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
+	WALRUS_FSYNC=sync-each cargo test --release --test multithreaded_benchmark_writes -- --nocapture
 
 bench-reads-sync:
 	@echo "Running read benchmark with sync-each (fsync after every write)..."
-	WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_reads -- --nocapture
+	WALRUS_FSYNC=sync-each cargo test --release --test multithreaded_benchmark_reads -- --nocapture
 
 bench-scaling-sync:
 	@echo "Running scaling benchmark with sync-each (fsync after every write)..."
 	@if [ -n "$(THREADS)" ]; then \
 		echo "Using custom thread range: $(THREADS)"; \
-		WALRUS_FSYNC=sync-each WALRUS_THREADS=$(THREADS) cargo test --test scaling_benchmark -- --nocapture; \
+		WALRUS_FSYNC=sync-each WALRUS_THREADS=$(THREADS) cargo test --release --test scaling_benchmark -- --nocapture; \
 	else \
-		WALRUS_FSYNC=sync-each cargo test --test scaling_benchmark -- --nocapture; \
+		WALRUS_FSYNC=sync-each cargo test --release --test scaling_benchmark -- --nocapture; \
 	fi
 
 # Fast variants (100ms fsync interval)
 bench-writes-fast:
 	@echo "Running write benchmark with 100ms fsync interval..."
-	WALRUS_FSYNC=100ms cargo test --test multithreaded_benchmark_writes -- --nocapture
+	WALRUS_FSYNC=100ms cargo test --release --test multithreaded_benchmark_writes -- --nocapture
 
 bench-reads-fast:
 	@echo "Running read benchmark with 100ms fsync interval..."
-	WALRUS_FSYNC=100ms cargo test --test multithreaded_benchmark_reads -- --nocapture
+	WALRUS_FSYNC=100ms cargo test --release --test multithreaded_benchmark_reads -- --nocapture
 
 bench-scaling-fast:
 	@echo "Running scaling benchmark with 100ms fsync interval..."
 	@if [ -n "$(THREADS)" ]; then \
 		echo "Using custom thread range: $(THREADS)"; \
-		WALRUS_FSYNC=100ms WALRUS_THREADS=$(THREADS) cargo test --test scaling_benchmark -- --nocapture; \
+		WALRUS_FSYNC=100ms WALRUS_THREADS=$(THREADS) cargo test --release --test scaling_benchmark -- --nocapture; \
 	else \
-		WALRUS_FSYNC=100ms cargo test --test scaling_benchmark -- --nocapture; \
+		WALRUS_FSYNC=100ms cargo test --release --test scaling_benchmark -- --nocapture; \
 	fi
 
 # Visualization targets
@@ -190,7 +190,7 @@ bench-batch-scaling:
 		if [ -n "$(FSYNC)" ]; then export WALRUS_FSYNC="$(FSYNC)"; fi; \
 		if [ -n "$(THREADS)" ]; then export WALRUS_THREADS="$(THREADS)"; fi; \
 		if [ -n "$(BATCH)" ]; then export WALRUS_BATCH_SIZE="$(BATCH)"; fi; \
-		cargo test --test batch_scaling_benchmark -- --nocapture \
+		cargo test --release --test batch_scaling_benchmark -- --nocapture \
 	'
 show-batch-scaling:
 	@echo "Showing batch scaling benchmark results..."
