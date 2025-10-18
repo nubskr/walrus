@@ -504,6 +504,8 @@ fn multithreaded_read_benchmark() {
 
     // Spawn worker threads (each does both writing and reading)
     let mut handles = Vec::new();
+    let stagger_interval = Duration::from_millis(200);
+
     for thread_id in 0..num_threads {
         let wal_clone = Arc::clone(&wal);
         let total_writes_clone = Arc::clone(&total_writes);
@@ -519,6 +521,8 @@ fn multithreaded_read_benchmark() {
         let topic = topics[thread_id].clone();
 
         let handle = thread::spawn(move || {
+            thread::sleep(stagger_interval * thread_id as u32);
+
             // WRITE PHASE
             write_start_barrier_clone.wait();
 
