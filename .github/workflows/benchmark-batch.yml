@@ -12,7 +12,7 @@ env:
   WALRUS_QUIET: "1"
   WALRUS_FSYNC: "500"
   WALRUS_DURATION: "2m"
-  WALRUS_BATCH_SIZE: "100"
+  WALRUS_BATCH_SIZE: "5000000"
 
 jobs:
   batch-benchmark:
@@ -44,7 +44,7 @@ jobs:
           echo "  - Read consistency: 5000 (persist_every) - configured in benchmark code"
           echo "  - Threads: 10"
           echo "  - Duration: 2m"
-          echo "  - Batch size: 100 entries per batch"
+          echo "  - Batch size: 5,000,000 entries per batch"
           echo "  - Uses batch_append_for_topic() for atomic batch writes"
           echo ""
           RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_batch -- --test-threads=1 --nocapture

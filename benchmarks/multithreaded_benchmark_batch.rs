@@ -155,7 +155,7 @@ fn parse_batch_size() -> usize {
     // Check environment variable first
     if let Ok(batch_env) = env::var("WALRUS_BATCH_SIZE") {
         if let Ok(size) = batch_env.parse::<usize>() {
-            if size > 0 && size <= 10000 {
+            if size > 0 && size <= 10000000 {
                 return size;
             }
         }
@@ -166,7 +166,7 @@ fn parse_batch_size() -> usize {
     for i in 0..args.len() {
         if args[i] == "--batch-size" && i + 1 < args.len() {
             if let Ok(size) = args[i + 1].parse::<usize>() {
-                if size > 0 && size <= 10000 {
+                if size > 0 && size <= 10000000 {
                     return size;
                 }
             }
@@ -174,7 +174,7 @@ fn parse_batch_size() -> usize {
     }
 
     // Default batch size
-    100
+    5000000
 }
 
 fn parse_duration() -> Duration {
@@ -240,7 +240,7 @@ fn print_usage() {
     println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
     println!();
     println!("Batch Size Options:");
-    println!("  <number>     Number of entries per batch (1-10000, default: 100)");
+    println!("  <number>     Number of entries per batch (1-10000000, default: 5000000)");
     println!();
     println!("Duration Options:");
     println!("  <number>s    Duration in seconds (e.g., 30s, 120s)");
