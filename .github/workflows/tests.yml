@@ -1,0 +1,44 @@
+name: Full Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  run-all-tests:
+    runs-on: self-hosted
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target:
+          - batch_read
+          - batch_writes
+          - configuration
+          - e2e_longrunning
+          - integration
+          - rollback_recovery
+          - unit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run tests (${{ matrix.test-target }})
+        run: RUSTFLAGS=-Awarnings cargo test --test ${{ matrix.test-target }} -- --test-threads=1 --nocapture
