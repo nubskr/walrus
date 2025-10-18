@@ -561,7 +561,7 @@ fn test_chaos_batch_write_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,
+            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
         .unwrap();
 
@@ -788,7 +788,7 @@ fn test_chaos_sequential_batches_with_crashes() {
     for cycle in 0..5 {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,
+            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
         .unwrap();
 
@@ -1430,7 +1430,7 @@ fn test_integrity_batch_after_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,
+            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
         .unwrap();
 
