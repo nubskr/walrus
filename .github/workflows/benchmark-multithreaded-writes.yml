@@ -1,12 +1,13 @@
-name: Benchmark - Multithreaded Writes
+# COMMENTED OUT - Only running batch benchmark for now
+# name: Benchmark - Multithreaded Writes
 
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-    # Allow manual triggering
+# on:
+#   push:
+#     branches: [ main, master ]
+#   pull_request:
+#     branches: [ main, master ]
+#   workflow_dispatch:
+#     # Allow manual triggering
 
 env:
   WALRUS_QUIET: "1"

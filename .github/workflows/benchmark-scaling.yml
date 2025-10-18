@@ -1,12 +1,13 @@
-name: Benchmark - Scaling
+# COMMENTED OUT - Only running batch benchmark for now
+# name: Benchmark - Scaling
 
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-    # Allow manual triggering
+# on:
+#   push:
+#     branches: [ main, master ]
+#   pull_request:
+#     branches: [ main, master ]
+#   workflow_dispatch:
+#     # Allow manual triggering
 
 env:
   WALRUS_QUIET: "1"
