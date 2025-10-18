@@ -494,8 +494,8 @@ fn multithreaded_batch_benchmark() {
                 let mut batch_bytes = 0usize;
 
                 for _ in 0..batch_size_local {
-                    // Fixed entry size of 10KB
-                    let size = 10 * 1024; // 10KB
+                    // Fixed entry size of 50KB
+                    let size = 50 * 1024; // 50KB
                     let data = vec![(counter % 256) as u8; size];
                     batch_data.push(data);
                     batch_bytes += size;
