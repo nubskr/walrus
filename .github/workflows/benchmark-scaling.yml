@@ -1,0 +1,59 @@
+name: Benchmark - Scaling
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  WALRUS_QUIET: "1"
+  WALRUS_FSYNC: "500"
+  WALRUS_THREADS: "10"
+
+jobs:
+  scaling-benchmark:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run Scaling Benchmark
+        run: |
+          echo "Running scaling benchmark with:"
+          echo "  - Fsync schedule: 500ms"
+          echo "  - Read consistency: 5000 (persist_every) - configured in benchmark code"
+          echo "  - Thread range: 1-10"
+          echo "  - Duration per test: 30s"
+          echo ""
+          RUSTFLAGS=-Awarnings cargo test --test scaling_benchmark scaling_benchmark -- --test-threads=1 --nocapture
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scaling-benchmark-results
+          path: |
+            scaling_results.csv
+            scaling_results_live.csv
+            show_scaling_graph.py
+            live_scaling_plot.py
+          retention-days: 30

@@ -1,0 +1,58 @@
+name: Benchmark - Multithreaded Reads
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  WALRUS_QUIET: "1"
+  WALRUS_FSYNC: "500"
+  WALRUS_WRITE_DURATION: "1m"
+  WALRUS_READ_DURATION: "1m"
+
+jobs:
+  multithreaded-reads-benchmark:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run Multithreaded Reads Benchmark
+        run: |
+          echo "Running multithreaded reads benchmark with:"
+          echo "  - Fsync schedule: 500ms"
+          echo "  - Read consistency: 5000 (persist_every)"
+          echo "  - Threads: 10"
+          echo "  - Write duration: 1m"
+          echo "  - Read duration: 1m"
+          echo ""
+          RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_reads multithreaded_read_benchmark -- --test-threads=1 --nocapture
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: multithreaded-reads-benchmark-results
+          path: |
+            read_benchmark_throughput.csv
+          retention-days: 30
