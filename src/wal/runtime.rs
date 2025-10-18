@@ -1,383 +1,24 @@
-use memmap2::MmapMut;
+use crate::wal::block::{Block, Entry, Metadata};
+use crate::wal::config::{
+    DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_ALLOC, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES,
+    MAX_FILE_SIZE, PREFIX_META_SIZE, USE_FD_BACKEND, checksum64, debug_print,
+};
+use crate::wal::paths::WalPathManager;
+use crate::wal::storage::{
+    SharedMmap, SharedMmapKeeper, StorageImpl, open_storage_for_path, set_fsync_schedule,
+};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
-use std::time::SystemTime;
-
-// Global flag to choose backend
-static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
-
-// Public function to enable FD backend
-pub fn enable_fd_backend() {
-    USE_FD_BACKEND.store(true, Ordering::Relaxed);
-}
-
-// Public function to disable FD backend (use mmap instead)
-pub fn disable_fd_backend() {
-    USE_FD_BACKEND.store(false, Ordering::Relaxed);
-}
-
-// Macro to conditionally print debug messages
-macro_rules! debug_print {
-    ($($arg:tt)*) => {
-        if std::env::var("WALRUS_QUIET").is_err() {
-            println!($($arg)*);
-        }
-    };
-}
-
-const DEFAULT_BLOCK_SIZE: u64 = 10 * 1024 * 1024; // 10mb
-const BLOCKS_PER_FILE: u64 = 100;
-const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
-const PREFIX_META_SIZE: usize = 64;
-const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
-const MAX_BATCH_ENTRIES: usize = 2000;
-const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total payload limit
-
-fn now_millis_str() -> String {
-    let ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_millis();
-    ms.to_string()
-}
-
-fn checksum64(data: &[u8]) -> u64 {
-    // FNV-1a 64-bit checksum
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET;
-    for &b in data {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-fn wal_data_dir() -> PathBuf {
-    std::env::var_os("WALRUS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("wal_files"))
-}
-
-fn sanitize_namespace(key: &str) -> String {
-    let mut sanitized: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.trim_matches('_').is_empty() {
-        sanitized = format!("ns_{:x}", checksum64(key.as_bytes()));
-    }
-    sanitized
-}
-
-#[derive(Debug, Clone)]
-struct WalPathManager {
-    root: PathBuf,
-}
-
-impl WalPathManager {
-    fn default() -> Self {
-        let mut root = wal_data_dir();
-        if let Ok(key) = std::env::var("WALRUS_INSTANCE_KEY") {
-            root.push(sanitize_namespace(&key));
-        }
-        Self { root }
-    }
-
-    fn for_key(key: &str) -> Self {
-        let mut root = wal_data_dir();
-        root.push(sanitize_namespace(key));
-        Self { root }
-    }
-
-    fn ensure_root(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.root)
-    }
-
-    fn index_path(&self, file_name: &str) -> PathBuf {
-        self.root.join(format!("{}_index.db", file_name))
-    }
-
-    fn create_new_file(&self) -> std::io::Result<String> {
-        self.ensure_root()?;
-        let file_name = now_millis_str();
-        let path = self.root.join(&file_name);
-        let f = std::fs::File::create(&path)?;
-        f.set_len(MAX_FILE_SIZE)?;
-
-        // Sync file metadata (size, etc.) to disk
-        f.sync_all()?;
-
-        // CRITICAL for Linux: Sync parent directory to ensure directory entry is durable
-        // Without this, the file might exist but not be visible in directory listing after crash
-        let dir = std::fs::File::open(&self.root)?;
-        dir.sync_all()?;
-
-        Ok(path.to_string_lossy().into_owned())
-    }
-
-    fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-// FD-based backend for storage
-#[derive(Debug)]
-struct FdBackend {
-    file: std::fs::File,
-    len: usize,
-}
-
-impl FdBackend {
-    fn new(path: &str, use_o_sync: bool) -> std::io::Result<Self> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-
-        #[cfg(unix)]
-        if use_o_sync {
-            opts.custom_flags(libc::O_SYNC);
-        }
-
-        let file = opts.open(path)?;
-        let metadata = file.metadata()?;
-        let len = metadata.len() as usize;
-
-        Ok(Self { file, len })
-    }
-
-    fn write(&self, offset: usize, data: &[u8]) {
-        use std::os::unix::fs::FileExt;
-        // pwrite doesn't move the file cursor
-        let _ = self.file.write_at(data, offset as u64);
-    }
-
-    fn read(&self, offset: usize, dest: &mut [u8]) {
-        use std::os::unix::fs::FileExt;
-        // pread doesn't move the file cursor
-        let _ = self.file.read_at(dest, offset as u64);
-    }
-
-    fn flush(&self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-// Storage backend abstraction
-#[derive(Debug)]
-enum StorageImpl {
-    Mmap(MmapMut),
-    Fd(FdBackend),
-}
-
-impl StorageImpl {
-    fn write(&self, offset: usize, data: &[u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset <= mmap.len());
-                debug_assert!(mmap.len() - offset >= data.len());
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut u8;
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-                }
-            }
-            StorageImpl::Fd(fd) => {
-                fd.write(offset, data);
-            }
-        }
-    }
-
-    fn read(&self, offset: usize, dest: &mut [u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset + dest.len() <= mmap.len());
-                let src = &mmap[offset..offset + dest.len()];
-                dest.copy_from_slice(src);
-            }
-            StorageImpl::Fd(fd) => {
-                fd.read(offset, dest);
-            }
-        }
-    }
-
-    fn flush(&self) -> std::io::Result<()> {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.flush(),
-            StorageImpl::Fd(fd) => fd.flush(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.len(),
-            StorageImpl::Fd(fd) => fd.len(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Entry {
-    pub data: Vec<u8>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug)]
-#[archive(check_bytes)]
-struct Metadata {
-    read_size: usize,
-    owned_by: String,
-    next_block_start: u64,
-    checksum: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Block {
-    id: u64,
-    file_path: String,
-    offset: u64,
-    limit: u64,
-    mmap: Arc<SharedMmap>,
-    used: u64,
-}
-
-impl Block {
-    fn write(
-        &self,
-        in_block_offset: u64,
-        data: &[u8],
-        owned_by: &str,
-        next_block_start: u64,
-    ) -> std::io::Result<()> {
-        debug_assert!(
-            in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit
-        );
-
-        let new_meta = Metadata {
-            read_size: data.len(),
-            owned_by: owned_by.to_string(),
-            next_block_start,
-            checksum: checksum64(data),
-        };
-
-        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("serialize metadata failed: {:?}", e),
-            )
-        })?;
-        if meta_bytes.len() > PREFIX_META_SIZE - 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "metadata too large",
-            ));
-        }
-
-        let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-        // Store actual length in first 2 bytes (little endian)
-        meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
-        meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
-        // Copy actual metadata starting at byte 2
-        meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-
-        // Combine and write
-        let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-        combined.extend_from_slice(&meta_buffer);
-        combined.extend_from_slice(data);
-
-        let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &combined);
-        Ok(())
-    }
-
-    fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
-        let mut meta_buffer = vec![0; PREFIX_META_SIZE];
-        let file_offset = self.offset + in_block_offset;
-        self.mmap.read(file_offset as usize, &mut meta_buffer);
-
-        // Read the actual metadata length from first 2 bytes
-        let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
-
-        if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid metadata length: {}", meta_len),
-            ));
-        }
-
-        // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
-        let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
-        aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
-
-        // SAFETY: `aligned` contains bytes we just read from our own file format.
-        // We bounded `meta_len` to PREFIX_META_SIZE and copy into an `AlignedVec`,
-        // which satisfies alignment requirements of rkyv.
-        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "failed to deserialize metadata",
-            )
-        })?;
-        let actual_entry_size = meta.read_size;
-
-        // Read the actual data
-        let new_offset = file_offset + PREFIX_META_SIZE as u64;
-        let mut ret_buffer = vec![0; actual_entry_size];
-        self.mmap.read(new_offset as usize, &mut ret_buffer);
-
-        // Verify checksum
-        let expected = meta.checksum;
-        if checksum64(&ret_buffer) != expected {
-            debug_print!(
-                "[reader] checksum mismatch; skipping corrupted entry at offset={} in file={}, block_id={}",
-                in_block_offset,
-                self.file_path,
-                self.id
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "checksum mismatch, data corruption detected",
-            ));
-        }
-
-        let consumed = PREFIX_META_SIZE + actual_entry_size;
-        Ok((Entry { data: ret_buffer }, consumed))
-    }
-
-    fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
-        // Zero a small region within this block; used to invalidate headers on rollback
-        // Caller ensures size is reasonable (typically PREFIX_META_SIZE)
-        let len = size as usize;
-        if len == 0 {
-            return Ok(());
-        }
-        let zeros = vec![0u8; len];
-        let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &zeros);
-        Ok(())
-    }
-}
 
 // has block metas to give out
 struct BlockAllocator {
@@ -654,129 +295,6 @@ impl Writer {
 }
 
 #[derive(Debug)]
-struct SharedMmap {
-    storage: StorageImpl,
-    last_touched_at: AtomicU64,
-}
-
-// SAFETY: `SharedMmap` provides interior mutability only via methods that
-// enforce bounds and perform atomic timestamp updates; the underlying
-// storage supports concurrent reads and explicit flushes.
-unsafe impl Sync for SharedMmap {}
-// SAFETY: The struct holds storage that is safe to move between threads;
-// timestamps are atomics, so sending is sound.
-unsafe impl Send for SharedMmap {}
-
-// Store the fsync schedule globally for SharedMmap::new to access
-static GLOBAL_FSYNC_SCHEDULE: OnceLock<FsyncSchedule> = OnceLock::new();
-
-impl SharedMmap {
-    pub fn new(path: &str) -> std::io::Result<Arc<Self>> {
-        let storage = if USE_FD_BACKEND.load(Ordering::Relaxed) {
-            // Check if we should use O_SYNC
-            let use_o_sync = GLOBAL_FSYNC_SCHEDULE
-                .get()
-                .map(|s| matches!(s, FsyncSchedule::SyncEach))
-                .unwrap_or(false);
-
-            StorageImpl::Fd(FdBackend::new(path, use_o_sync)?)
-        } else {
-            let file = OpenOptions::new().read(true).write(true).open(path)?;
-            // SAFETY: `file` is opened read/write and lives for the duration of this
-            // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
-            let mmap = unsafe { MmapMut::map_mut(&file)? };
-            StorageImpl::Mmap(mmap)
-        };
-
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
-        Ok(Arc::new(Self {
-            storage,
-            last_touched_at: AtomicU64::new(now_ms),
-        }))
-    }
-
-    pub fn write(&self, offset: usize, data: &[u8]) {
-        // Bounds check before raw copy to maintain memory safety
-        debug_assert!(offset <= self.storage.len());
-        debug_assert!(self.storage.len() - offset >= data.len());
-
-        self.storage.write(offset, data);
-
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
-        self.last_touched_at.store(now_ms, Ordering::Relaxed);
-    }
-
-    pub fn read(&self, offset: usize, dest: &mut [u8]) {
-        debug_assert!(offset + dest.len() <= self.storage.len());
-        self.storage.read(offset, dest);
-    }
-
-    pub fn len(&self) -> usize {
-        self.storage.len()
-    }
-
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.storage.flush()
-    }
-}
-
-struct SharedMmapKeeper {
-    data: HashMap<String, Arc<SharedMmap>>,
-}
-
-impl SharedMmapKeeper {
-    fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-        }
-    }
-
-    // Fast path: many readers concurrently
-    fn get_mmap_arc_read(path: &str) -> Option<Arc<SharedMmap>> {
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
-        let keeper = keeper_lock.read().ok()?;
-        keeper.data.get(path).cloned()
-    }
-
-    // Read-mostly accessor that escalates to write lock only on miss
-    fn get_mmap_arc(path: &str) -> std::io::Result<Arc<SharedMmap>> {
-        if let Some(existing) = Self::get_mmap_arc_read(path) {
-            return Ok(existing);
-        }
-
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
-
-        // Double-check with a fresh read lock to avoid unnecessary write lock
-        {
-            let keeper = keeper_lock.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned")
-            })?;
-            if let Some(existing) = keeper.data.get(path) {
-                return Ok(existing.clone());
-            }
-        }
-
-        let mut keeper = keeper_lock.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned")
-        })?;
-        if let Some(existing) = keeper.data.get(path) {
-            return Ok(existing.clone());
-        }
-        let mmap_arc = SharedMmap::new(path)?;
-        keeper.data.insert(path.to_string(), mmap_arc.clone());
-        Ok(mmap_arc)
-    }
-}
-
-#[derive(Debug)]
 struct ColReaderInfo {
     chain: Vec<Block>,
     cur_block_idx: usize,
@@ -974,13 +492,6 @@ pub enum ReadConsistency {
     AtLeastOnce { persist_every: u32 },
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum FsyncSchedule {
-    Milliseconds(u64),
-    SyncEach, // fsync after every single entry
-    NoFsync,  // disable fsyncing entirely (maximum throughput, no durability)
-}
-
 pub struct Walrus {
     allocator: Arc<BlockAllocator>,
     reader: Arc<Reader>,
@@ -1034,7 +545,7 @@ impl Walrus {
         debug_print!("[walrus] new");
 
         // Store the fsync schedule globally for SharedMmap::new to access
-        let _ = GLOBAL_FSYNC_SCHEDULE.set(fsync_schedule);
+        set_fsync_schedule(fsync_schedule);
 
         let allocator = Arc::new(BlockAllocator::new(paths.clone())?);
         let reader = Arc::new(Reader::new());
@@ -1055,7 +566,7 @@ impl Walrus {
             let mut pool = pool;
             let tick = tick;
             let del_rx = del_rx;
-            let mut delete_pending = std::collections::HashSet::new();
+            let mut delete_pending = HashSet::new();
 
             #[cfg(target_os = "linux")]
             let mut ring = io_uring::IoUring::new(2048).expect("Failed to create io_uring");
@@ -1064,7 +575,7 @@ impl Walrus {
                 thread::sleep(Duration::from_millis(sleep_millis));
 
                 // Phase 1: Collect unique paths to flush
-                let mut unique = std::collections::HashSet::new();
+                let mut unique = HashSet::new();
                 while let Ok(path) = rx.try_recv() {
                     unique.insert(path);
                 }
@@ -1076,57 +587,18 @@ impl Walrus {
                 // Phase 2: Open/map files if needed
                 for path in unique.iter() {
                     // Skip if file doesn't exist
-                    if !std::path::Path::new(&path).exists() {
+                    if !Path::new(&path).exists() {
                         debug_print!("[flush] file does not exist, skipping: {}", path);
                         continue;
                     }
 
                     if !pool.contains_key(path) {
-                        if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                            // FD backend path
-                            let use_o_sync = GLOBAL_FSYNC_SCHEDULE
-                                .get()
-                                .map(|s| matches!(s, FsyncSchedule::SyncEach))
-                                .unwrap_or(false);
-
-                            match FdBackend::new(&path, use_o_sync) {
-                                Ok(fd) => {
-                                    pool.insert(path.clone(), StorageImpl::Fd(fd));
-                                }
-                                Err(e) => {
-                                    debug_print!(
-                                        "[flush] failed to create FD backend for {}: {}",
-                                        path,
-                                        e
-                                    );
-                                }
+                        match open_storage_for_path(path) {
+                            Ok(storage) => {
+                                pool.insert(path.clone(), storage);
                             }
-                        } else {
-                            // Mmap backend path (unchanged)
-                            match OpenOptions::new().read(true).write(true).open(&path) {
-                                Ok(file) => {
-                                    // SAFETY: The file is opened read/write and lives at least until
-                                    // the created mapping is inserted into `pool`, which owns it.
-                                    match unsafe { MmapMut::map_mut(&file) } {
-                                        Ok(mmap) => {
-                                            pool.insert(path.clone(), StorageImpl::Mmap(mmap));
-                                        }
-                                        Err(e) => {
-                                            debug_print!(
-                                                "[flush] failed to create memory map for {}: {}",
-                                                path,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug_print!(
-                                        "[flush] failed to open file for flushing {}: {}",
-                                        path,
-                                        e
-                                    );
-                                }
+                            Err(e) => {
+                                debug_print!("[flush] failed to open storage for {}: {}", path, e);
                             }
                         }
                     }
@@ -1140,9 +612,11 @@ impl Walrus {
                         let mut fsync_batch = Vec::new();
 
                         for path in unique.iter() {
-                            if let Some(StorageImpl::Fd(fd_backend)) = pool.get(path) {
-                                let raw_fd = fd_backend.file.as_raw_fd();
-                                fsync_batch.push((raw_fd, path.clone()));
+                            if let Some(storage) = pool.get(path) {
+                                if let Some(fd_backend) = storage.as_fd() {
+                                    let raw_fd = fd_backend.file().as_raw_fd();
+                                    fsync_batch.push((raw_fd, path.clone()));
+                                }
                             }
                         }
 
@@ -1492,7 +966,7 @@ impl Walrus {
                 }
 
                 // Flush zeros and rollback
-                let mut fsynced = std::collections::HashSet::new();
+                let mut fsynced = HashSet::new();
                 for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
                     if fsynced.insert(w_blk.file_path.clone()) {
                         let _ = w_blk.mmap.flush();
@@ -1508,7 +982,7 @@ impl Walrus {
         }
 
         // Success - fsync touched files
-        let mut fsynced = std::collections::HashSet::new();
+        let mut fsynced = HashSet::new();
         for (blk, _, _) in write_plan.iter() {
             if !fsynced.contains(&blk.file_path) {
                 blk.mmap.flush()?;
@@ -1578,8 +1052,8 @@ impl Walrus {
             let file_offset = blk.offset + offset;
 
             // Get raw FD
-            let fd = if let StorageImpl::Fd(fd_backend) = &blk.mmap.storage {
-                io_uring::types::Fd(fd_backend.file.as_raw_fd())
+            let fd = if let Some(fd_backend) = blk.mmap.storage().as_fd() {
+                io_uring::types::Fd(fd_backend.file().as_raw_fd())
             } else {
                 // Rollback and fail
                 *cur_offset = revert_info.original_offset;
@@ -1653,7 +1127,7 @@ impl Walrus {
                     }
 
                     // Ensure zeros are persisted
-                    let mut fsynced = std::collections::HashSet::new();
+                    let mut fsynced = HashSet::new();
                     for (blk, _, _) in write_plan.iter() {
                         if fsynced.insert(blk.file_path.clone()) {
                             let _ = blk.mmap.flush();
@@ -1672,7 +1146,7 @@ impl Walrus {
                 }
 
                 // Success - fsync all touched files
-                let mut fsynced = std::collections::HashSet::new();
+                let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if !fsynced.contains(&blk.file_path) {
                         blk.mmap.flush()?;
@@ -1698,7 +1172,7 @@ impl Walrus {
                 }
 
                 // Ensure zeros are persisted
-                let mut fsynced = std::collections::HashSet::new();
+                let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if fsynced.insert(blk.file_path.clone()) {
                         let _ = blk.mmap.flush();
@@ -2262,8 +1736,8 @@ impl Walrus {
                 let mut buffer = vec![0u8; size];
                 let file_offset = read_plan.blk.offset + read_plan.start;
 
-                let fd = if let StorageImpl::Fd(fd_backend) = &read_plan.blk.mmap.storage {
-                    io_uring::types::Fd(fd_backend.file.as_raw_fd())
+                let fd = if let Some(fd_backend) = read_plan.blk.mmap.storage().as_fd() {
+                    io_uring::types::Fd(fd_backend.file().as_raw_fd())
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -2561,7 +2035,7 @@ impl Walrus {
 
         // synthetic block ids btw
         let mut next_block_id: usize = 1;
-        let mut seen_files = std::collections::HashSet::new();
+        let mut seen_files = HashSet::new();
 
         for file_path in files.iter() {
             let mmap = match SharedMmapKeeper::get_mmap_arc(file_path) {
