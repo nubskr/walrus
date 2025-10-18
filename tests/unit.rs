@@ -5,6 +5,8 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use walrus_rust::ReadConsistency;
 use walrus_rust::wal::{Entry, WalIndex, Walrus};
+use std::thread;
+use std::time::Duration;
 
 fn setup_wal_env() -> TestEnv {
     TestEnv::new()
@@ -89,6 +91,9 @@ fn persists_read_offsets_across_restart() {
     wal.append_for_topic("t", b"a").unwrap();
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"a");
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+    thread::sleep(Duration::from_millis(50));
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t").unwrap().unwrap().data, b"b");
     assert!(wal2.read_next("t").unwrap().is_none());
