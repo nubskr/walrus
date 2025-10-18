@@ -495,7 +495,7 @@ fn multithreaded_batch_benchmark() {
 
                 for _ in 0..batch_size_local {
                     // Random entry size between 500B and 1KB
-                    let size = 500 + (counter % 524); // 500B to 1023B (~1KB)
+                    let size = 500 + ((counter % 524) as usize); // 500B to 1023B (~1KB)
                     let data = vec![(counter % 256) as u8; size];
                     batch_data.push(data);
                     batch_bytes += size;
