@@ -174,7 +174,7 @@ fn parse_batch_size() -> usize {
     }
 
     // Default batch size (halved again)
-    8190
+    2047
 }
 
 fn parse_duration() -> Duration {
@@ -240,7 +240,7 @@ fn print_usage() {
     println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
     println!();
     println!("Batch Size Options:");
-    println!("  <number>     Number of entries per batch (1-10000000, default: 8190)");
+    println!("  <number>     Number of entries per batch (1-10000000, default: 2047)");
     println!();
     println!("Duration Options:");
     println!("  <number>s    Duration in seconds (e.g., 30s, 120s)");
