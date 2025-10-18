@@ -173,8 +173,8 @@ fn parse_batch_size() -> usize {
         }
     }
 
-    // Default batch size (halved for smaller batches)
-    450
+    // Default batch size
+    32760
 }
 
 fn parse_duration() -> Duration {
@@ -240,7 +240,7 @@ fn print_usage() {
     println!("  <number>     Async fsync every N milliseconds (e.g., 500)");
     println!();
     println!("Batch Size Options:");
-    println!("  <number>     Number of entries per batch (1-10000000, default: 450)");
+    println!("  <number>     Number of entries per batch (1-10000000, default: 32760)");
     println!();
     println!("Duration Options:");
     println!("  <number>s    Duration in seconds (e.g., 30s, 120s)");
@@ -494,8 +494,8 @@ fn multithreaded_batch_benchmark() {
                 let mut batch_bytes = 0usize;
 
                 for _ in 0..batch_size_local {
-                    // Fixed entry size of 1MB
-                    let size = 1024 * 1024; // 1MB
+                    // Fixed entry size of 100KB
+                    let size = 100 * 1024; // 100KB
                     let data = vec![(counter % 256) as u8; size];
                     batch_data.push(data);
                     batch_bytes += size;
