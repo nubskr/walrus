@@ -3,6 +3,7 @@ mod common;
 use common::{TestEnv, current_wal_dir};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
@@ -640,6 +641,10 @@ fn test_batch_read_with_zeroed_headers() {
         }
 
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Phase 2: Manually zero headers of entries 10-15 (simulates partial rollback)
