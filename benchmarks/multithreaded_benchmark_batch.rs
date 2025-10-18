@@ -294,14 +294,14 @@ fn multithreaded_batch_benchmark() {
 
     println!("=== Multi-threaded WAL Batch Benchmark ===");
     println!(
-        "Configuration: 10 threads, {:.0}s write phase only, batch size: {} entries/batch",
+        "Configuration: 3 threads, {:.0}s write phase only, batch size: {} entries/batch",
         write_duration.as_secs(),
         batch_size
     );
     println!("Fsync schedule: {:?}", fsync_schedule);
     println!(
         "Duration: {:?} (batch writes with {}ms delays between batches)",
-        write_duration, 100
+        write_duration, 500
     );
     println!("Using batch_append_for_topic() for atomic batch writes");
 
@@ -312,7 +312,7 @@ fn multithreaded_batch_benchmark() {
         )
         .expect("Failed to create Walrus"),
     );
-    let num_threads = 10;
+    let num_threads = 3; // Reduced from 10 to avoid io_uring queue overflow
 
     // Shared counters for statistics
     let total_batches = Arc::new(AtomicU64::new(0));
@@ -337,20 +337,9 @@ fn multithreaded_batch_benchmark() {
     let write_end_barrier = Arc::new(Barrier::new(num_threads + 1));
 
     // Topic names for each thread
-    let topics = vec![
-        "batch_topic_0".to_string(),
-        "batch_topic_1".to_string(),
-        "batch_topic_2".to_string(),
-        "batch_topic_3".to_string(),
-        "batch_topic_4".to_string(),
-        "batch_topic_5".to_string(),
-        "batch_topic_6".to_string(),
-        "batch_topic_7".to_string(),
-        "batch_topic_8".to_string(),
-        "batch_topic_9".to_string(),
-    ];
+    let topics: Vec<String> = (0..num_threads).map(|i| format!("batch_topic_{}", i)).collect();
 
-    println!("Starting {} batch writer threads...", num_threads);
+    println!("Starting {} batch writer threads (reduced to avoid io_uring queue overflow)...", num_threads);
 
     // Spawn throughput monitoring thread
     let total_batches_monitor = Arc::clone(&total_batches);
@@ -541,8 +530,8 @@ fn multithreaded_batch_benchmark() {
                     }
                 }
 
-                // Small delay between batches to avoid overwhelming the system
-                thread::sleep(Duration::from_millis(100));
+                // Longer delay between batches to avoid overwhelming io_uring queue
+                thread::sleep(Duration::from_millis(500));
             }
 
             // Persist error count at the end

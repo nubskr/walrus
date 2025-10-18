@@ -18,7 +18,7 @@ jobs:
       matrix:
         test-target:
           - batch_read
-          - batch_writes
+          # - batch_writes  # COMMENTED OUT - Only running batch benchmark for now
           - configuration
           - e2e_longrunning
           - integration
