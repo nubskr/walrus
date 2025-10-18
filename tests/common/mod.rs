@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 pub fn sanitize_key(key: &str) -> String {
     let mut sanitized: String = key
         .chars()
@@ -25,6 +26,7 @@ pub fn sanitize_key(key: &str) -> String {
     sanitized
 }
 
+#[allow(dead_code)]
 fn checksum64(data: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x00000100000001B3;
@@ -102,6 +104,7 @@ pub fn current_wal_dir() -> PathBuf {
     base
 }
 
+#[allow(dead_code)]
 pub fn wal_root_dir() -> PathBuf {
     std::env::var_os("WALRUS_DATA_DIR")
         .map(PathBuf::from)

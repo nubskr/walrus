@@ -778,6 +778,13 @@ struct Reader {
     data: RwLock<HashMap<String, Arc<RwLock<ColReaderInfo>>>>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct BatchRevertInfo {
+    original_block_id: u64,
+    original_offset: u64,
+    allocated_block_ids: Vec<u64>,
+}
+
 impl Reader {
     fn new() -> Self {
         Self {
@@ -881,7 +888,7 @@ impl WalIndex {
         Self::new_in(&paths, file_name)
     }
 
-    pub fn new_in(paths: &WalPathManager, file_name: &str) -> std::io::Result<Self> {
+    fn new_in(paths: &WalPathManager, file_name: &str) -> std::io::Result<Self> {
         paths.ensure_root()?;
         let path = paths.index_path(file_name);
         let store = path
@@ -1289,13 +1296,6 @@ impl Walrus {
             }
         }
 
-        // Revert info for rollback
-        struct BatchRevertInfo {
-            original_block_id: u64,
-            original_offset: u64,
-            allocated_block_ids: Vec<u64>,
-        }
-
         // Phase 0: Validate batch size
         let total_bytes: u64 = batch
             .iter()
@@ -1436,6 +1436,14 @@ impl Walrus {
 
         // Phase 2 & 3: io_uring preparation and submission (FD backend only)
         #[cfg(target_os = "linux")]
+        let total_bytes_usize = usize::try_from(total_bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch is too large to fit into addressable memory",
+            )
+        })?;
+
+        #[cfg(target_os = "linux")]
         {
             if USE_FD_BACKEND.load(Ordering::Relaxed) {
                 return Self::submit_batch_via_io_uring(
@@ -1443,9 +1451,9 @@ impl Walrus {
                     batch,
                     &mut revert_info,
                     col_name,
-                    cur_offset,
+                    &mut *cur_offset,
                     planning_offset,
-                    total_bytes,
+                    total_bytes_usize,
                 );
             }
         }
