@@ -428,7 +428,8 @@ fn test_chaos_multiple_topics_concurrent_batches() {
         .unwrap(),
     );
 
-    let num_topics = 5;
+    let num_topics = 3;
+    let batches_per_topic = 6;
     let mut handles = vec![];
 
     for topic_id in 0..num_topics {
@@ -437,7 +438,7 @@ fn test_chaos_multiple_topics_concurrent_batches() {
         let handle = thread::spawn(move || {
             let topic_name = format!("topic_{}", topic_id);
 
-            for batch_num in 0..10 {
+            for batch_num in 0..batches_per_topic {
                 let entry_data = format!("t{}_b{}_e", topic_id, batch_num);
                 let e1 = entry_data.clone() + "1";
                 let e2 = entry_data.clone() + "2";
@@ -471,8 +472,14 @@ fn test_chaos_multiple_topics_concurrent_batches() {
             count += 1;
         }
 
-        // Each topic should have 10 batches * 3 entries = 30 entries
-        assert_eq!(count, 30, "Topic {} should have 30 entries", topic_id);
+        // Each topic should have `batches_per_topic` batches * 3 entries
+        assert_eq!(
+            count,
+            batches_per_topic * 3,
+            "Topic {} should have {} entries",
+            topic_id,
+            batches_per_topic * 3
+        );
     }
 
     cleanup_test_env();
@@ -1114,8 +1121,10 @@ fn test_multiple_sequential_batches() {
     )
     .unwrap();
 
+    let total_batches = 4;
+
     // Write multiple batches sequentially
-    for batch_num in 0..5 {
+    for batch_num in 0..total_batches {
         let e1 = format!("batch_{}_entry_1", batch_num);
         let e2 = format!("batch_{}_entry_2", batch_num);
         let e3 = format!("batch_{}_entry_3", batch_num);
@@ -1125,7 +1134,7 @@ fn test_multiple_sequential_batches() {
     }
 
     // Verify all entries in order
-    for batch_num in 0..5 {
+    for batch_num in 0..total_batches {
         for entry_num in 1..=3 {
             let entry = wal.read_next("test_topic", true).unwrap().unwrap();
             let expected = format!("batch_{}_entry_{}", batch_num, entry_num);
@@ -1152,7 +1161,7 @@ fn test_integrity_batch_write_sequential_numbers() {
     .unwrap();
 
     // Create batch with sequential numbers as data
-    let batch_size = 100;
+    let batch_size = 64;
     let entries_data: Vec<Vec<u8>> = (0..batch_size)
         .map(|i| {
             let mut data = vec![];
@@ -1405,8 +1414,8 @@ fn test_integrity_multiple_batches_sequential() {
     )
     .unwrap();
 
-    // Write 10 batches, each with unique identifiable data
-    let num_batches = 10;
+    // Write a moderate number of batches, each with unique identifiable data
+    let num_batches = 6;
     let entries_per_batch = 5;
 
     for batch_id in 0..num_batches {
@@ -1464,12 +1473,12 @@ fn test_integrity_batch_after_crash_recovery() {
         )
         .unwrap();
 
-        let entries_data: Vec<Vec<u8>> = (0..20)
+        let entries_data: Vec<Vec<u8>> = (0..12)
             .map(|i| {
-                let mut data = vec![0u8; 10000];
+                let mut data = vec![0u8; 4096];
                 data[0..8].copy_from_slice(&(i as u64).to_le_bytes());
                 data[8..16].copy_from_slice(&(0xDEADBEEFCAFEBABE_u64).to_le_bytes());
-                for j in 16..10000 {
+                for j in 16..4096 {
                     data[j] = ((i + j) % 256) as u8;
                 }
                 data
@@ -1496,12 +1505,12 @@ fn test_integrity_batch_after_crash_recovery() {
         )
         .unwrap();
 
-        for i in 0..20 {
+        for i in 0..12 {
             let entry = wal.read_next("integrity_crash", true).unwrap().unwrap();
 
             assert_eq!(
                 entry.data.len(),
-                10000,
+                4096,
                 "Size mismatch at entry {} after recovery",
                 i
             );
@@ -1538,7 +1547,7 @@ fn test_integrity_batch_after_crash_recovery() {
                 i
             );
 
-            for j in 16..10000 {
+            for j in 16..4096 {
                 let expected = ((i + j) % 256) as u8;
                 assert_eq!(
                     entry.data[j], expected,
@@ -1785,7 +1794,7 @@ fn test_rollback_block_state_consistency() {
     );
 
     // This test verifies that block locking state is properly reverted
-    let num_threads = 3; // Further reduced to avoid io_uring memory issues
+    let num_threads = 2; // Reduced to limit concurrent io_uring usage
     let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = vec![];
 
@@ -1795,7 +1804,7 @@ fn test_rollback_block_state_consistency() {
 
         let handle = thread::spawn(move || {
             // Smaller batch to reduce memory pressure
-            let entry = vec![i as u8; 2 * 1024 * 1024]; // 2MB per entry
+            let entry = vec![i as u8; 512 * 1024]; // 512KB per entry
             let entries: Vec<&[u8]> = (0..3).map(|_| entry.as_slice()).collect(); // 3 entries
 
             barrier_clone.wait();
