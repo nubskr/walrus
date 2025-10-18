@@ -179,6 +179,91 @@ fn test_batch_read_tail_only() {
 }
 
 // ============================================================================
+// ENTRY LIMIT
+// ============================================================================
+
+#[test]
+fn test_batch_read_respects_entry_cap() {
+    let _guard = setup_test_env();
+    enable_fd_backend();
+
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    )
+    .unwrap();
+
+    const LIMIT: usize = 2000;
+
+    // Prepare two full batches so we exceed the read limit.
+    let batch_one_storage: Vec<Vec<u8>> = (0..LIMIT)
+        .map(|i| format!("entry_{:04}", i).into_bytes())
+        .collect();
+    let batch_two_storage: Vec<Vec<u8>> = (LIMIT..(LIMIT * 2))
+        .map(|i| format!("entry_{:04}", i).into_bytes())
+        .collect();
+
+    let batch_one: Vec<&[u8]> = batch_one_storage.iter().map(|v| v.as_slice()).collect();
+    let batch_two: Vec<&[u8]> = batch_two_storage.iter().map(|v| v.as_slice()).collect();
+
+    wal.batch_append_for_topic("entry_cap", &batch_one)
+        .expect("batch append 1 should succeed");
+    wal.batch_append_for_topic("entry_cap", &batch_two)
+        .expect("batch append 2 should succeed");
+
+    // Request an enormous byte budget; we still expect only LIMIT entries.
+    let first_read = wal
+        .batch_read_for_topic("entry_cap", usize::MAX)
+        .expect("batch read should succeed");
+    assert_eq!(
+        first_read.len(),
+        LIMIT,
+        "batch read should stop at entry cap"
+    );
+    assert_eq!(
+        first_read.first().unwrap().data,
+        b"entry_0000",
+        "first batch entry mismatch"
+    );
+    assert_eq!(
+        first_read.last().unwrap().data,
+        format!("entry_{:04}", LIMIT - 1).as_bytes(),
+        "last batch entry mismatch"
+    );
+
+    // The remaining entries should be returned on the next call.
+    let second_read = wal
+        .batch_read_for_topic("entry_cap", usize::MAX)
+        .expect("second batch read should succeed");
+    assert_eq!(
+        second_read.len(),
+        LIMIT,
+        "second batch read should return the remaining entries"
+    );
+    assert_eq!(
+        second_read.first().unwrap().data,
+        format!("entry_{:04}", LIMIT).as_bytes(),
+        "first entry of second batch mismatch"
+    );
+    assert_eq!(
+        second_read.last().unwrap().data,
+        format!("entry_{:04}", LIMIT * 2 - 1).as_bytes(),
+        "last entry of second batch mismatch"
+    );
+
+    // Nothing should remain afterwards.
+    let third_read = wal
+        .batch_read_for_topic("entry_cap", usize::MAX)
+        .expect("third batch read should succeed");
+    assert!(
+        third_read.is_empty(),
+        "no entries should remain after consuming two batches"
+    );
+
+    cleanup_test_env();
+}
+
+// ============================================================================
 // CONCURRENT WRITE/READ CHAOS
 // ============================================================================
 

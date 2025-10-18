@@ -42,6 +42,7 @@ const BLOCKS_PER_FILE: u64 = 100;
 const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
 const PREFIX_META_SIZE: usize = 64;
 const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
+const MAX_BATCH_ENTRIES: usize = 2000;
 
 fn now_millis_str() -> String {
     let ms = SystemTime::now()
@@ -1311,11 +1312,10 @@ impl Walrus {
         }
 
         // Phase 0: Validate batch size
-        const MAX_BATCH_ENTRIES: usize = 2000;
         if batch.len() > MAX_BATCH_ENTRIES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "batch exceeds 2000 entry limit",
+                format!("batch exceeds {} entry limit", MAX_BATCH_ENTRIES),
             ));
         }
 
@@ -2324,10 +2324,16 @@ impl Walrus {
         let mut saw_tail = false;
 
         for (plan_idx, read_plan) in plan.iter().enumerate() {
+            if entries.len() >= MAX_BATCH_ENTRIES {
+                break;
+            }
             let buffer = &buffers[plan_idx];
             let mut buf_offset = 0usize;
 
             while buf_offset < buffer.len() {
+                if entries.len() >= MAX_BATCH_ENTRIES {
+                    break;
+                }
                 // Try to read metadata header
                 if buf_offset + PREFIX_META_SIZE > buffer.len() {
                     break; // Not enough data for header
