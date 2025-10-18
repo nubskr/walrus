@@ -1,0 +1,59 @@
+name: Benchmark - Batch Writes
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  WALRUS_QUIET: "1"
+  WALRUS_FSYNC: "500"
+  WALRUS_DURATION: "2m"
+  WALRUS_BATCH_SIZE: "100"
+
+jobs:
+  batch-benchmark:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run Batch Benchmark
+        run: |
+          echo "Running batch writes benchmark with:"
+          echo "  - Fsync schedule: 500ms"
+          echo "  - Read consistency: 5000 (persist_every) - configured in benchmark code"
+          echo "  - Threads: 10"
+          echo "  - Duration: 2m"
+          echo "  - Batch size: 100 entries per batch"
+          echo "  - Uses batch_append_for_topic() for atomic batch writes"
+          echo ""
+          RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_batch multithreaded_batch_benchmark -- --test-threads=1 --nocapture
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: batch-benchmark-results
+          path: |
+            batch_benchmark_throughput.csv
+          retention-days: 30
