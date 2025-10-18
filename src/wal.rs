@@ -1604,12 +1604,25 @@ impl Walrus {
                 let mut all_success = true;
                 for _ in 0..write_plan.len() {
                     if let Some(cqe) = ring.completion().next() {
-                        if cqe.result() < 0 {
+                        let data_idx = cqe.user_data() as usize;
+                        let expected_bytes = buffers.get(data_idx).map(|b| b.len()).unwrap_or(0);
+                        let result = cqe.result();
+
+                        if result < 0 {
                             all_success = false;
                             debug_print!(
                                 "[batch] write failed for entry {}: error {}",
-                                cqe.user_data(),
-                                cqe.result()
+                                data_idx,
+                                result
+                            );
+                            break;
+                        } else if (result as usize) != expected_bytes {
+                            all_success = false;
+                            debug_print!(
+                                "[batch] short write for entry {}: wrote {} bytes, expected {}",
+                                data_idx,
+                                result,
+                                expected_bytes
                             );
                             break;
                         }

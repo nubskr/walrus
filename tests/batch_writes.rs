@@ -555,8 +555,7 @@ fn test_chaos_batch_write_with_concurrent_readers() {
 #[test]
 fn test_chaos_batch_write_crash_recovery() {
     let _guard = setup_test_env();
-    // Temporarily disable FD backend to test if issue is backend-specific
-    disable_fd_backend();
+    enable_fd_backend();
 
     // Phase 1: Write batch and "crash" (drop WAL)
     {
@@ -784,8 +783,7 @@ fn test_chaos_many_topics_racing_batch_and_regular() {
 #[test]
 fn test_chaos_sequential_batches_with_crashes() {
     let _guard = setup_test_env();
-    // Temporarily disable FD backend to test if issue is backend-specific
-    disable_fd_backend();
+    enable_fd_backend();
 
     for cycle in 0..5 {
         let wal = Walrus::with_consistency_and_schedule(
