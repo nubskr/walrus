@@ -271,13 +271,13 @@ fn test_concurrent_batch_reads_same_topic() {
     );
 
     // Pre-populate with 500 entries (reduced from 1000)
-    println!("Writing 500 entries for concurrent reads test...");
+    test_println!("Writing 500 entries for concurrent reads test...");
     for i in 0..500 {
         let data = format!("entry_{:05}", i);
         wal.append_for_topic("concurrent_reads", data.as_bytes())
             .unwrap();
     }
-    println!("Finished writing entries");
+    test_println!("Finished writing entries");
 
     // Multiple readers competing for same topic
     let barrier = Arc::new(Barrier::new(5));
@@ -289,21 +289,21 @@ fn test_concurrent_batch_reads_same_topic() {
 
         let handle = thread::spawn(move || {
             barrier_clone.wait();
-            println!("Concurrent reader {} starting", reader_id);
+            test_println!("Concurrent reader {} starting", reader_id);
 
             let mut total_read = 0;
             let mut batch_count = 0;
             loop {
                 match wal_clone.batch_read_for_topic("concurrent_reads", 500) {
                     Ok(batch) if batch.is_empty() => {
-                        println!("Reader {} got empty batch, stopping", reader_id);
+                        test_println!("Reader {} got empty batch, stopping", reader_id);
                         break;
                     }
                     Ok(batch) => {
                         total_read += batch.len();
                         batch_count += 1;
                         if batch_count % 10 == 0 {
-                            println!(
+                            test_println!(
                                 "Reader {} batch {}: read {} entries, total: {}",
                                 reader_id,
                                 batch_count,
@@ -313,13 +313,13 @@ fn test_concurrent_batch_reads_same_topic() {
                         }
                     }
                     Err(e) => {
-                        println!("Reader {} got error: {:?}, stopping", reader_id, e);
+                        test_println!("Reader {} got error: {:?}, stopping", reader_id, e);
                         break;
                     }
                 }
             }
 
-            println!(
+            test_println!(
                 "Concurrent reader {} finished with {} entries",
                 reader_id, total_read
             );
@@ -332,8 +332,8 @@ fn test_concurrent_batch_reads_same_topic() {
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let total: usize = results.iter().map(|(_, count)| count).sum();
 
-    println!("Concurrent reads results: {:?}", results);
-    println!("Total entries read: {}", total);
+    test_println!("Concurrent reads results: {:?}", results);
+    test_println!("Total entries read: {}", total);
 
     // All entries should be read exactly once (due to StrictlyAtOnce) - updated to 500
     assert_eq!(
@@ -415,11 +415,11 @@ fn test_batch_read_recovery_mid_read() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    println!("Starting recovery test...");
+    test_println!("Starting recovery test...");
 
     // Phase 1: Write data and partially read
     let read_before_crash = {
-        println!("Phase 1: Writing and partially reading data");
+        test_println!("Phase 1: Writing and partially reading data");
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::NoFsync,
@@ -431,14 +431,14 @@ fn test_batch_read_recovery_mid_read() {
             let data = format!("recovery_{:04}", i);
             wal.append_for_topic("recovery", data.as_bytes()).unwrap();
         }
-        println!("Written 50 entries");
+        test_println!("Written 50 entries");
 
         // Read first 20 entries (reduced from 30)
         let mut read_so_far = 0;
         let mut batch_count = 0;
         while read_so_far < 20 {
             let batch = wal.batch_read_for_topic("recovery", 300).unwrap();
-            println!(
+            test_println!(
                 "Batch {}: read {} entries, total so far: {}",
                 batch_count,
                 batch.len(),
@@ -446,13 +446,13 @@ fn test_batch_read_recovery_mid_read() {
             );
 
             if batch.is_empty() {
-                println!("WARNING: Got empty batch, breaking early");
+                test_println!("WARNING: Got empty batch, breaking early");
                 break;
             }
             read_so_far += batch.len();
             batch_count += 1;
         }
-        println!("Phase 1 complete: read {} entries", read_so_far);
+        test_println!("Phase 1 complete: read {} entries", read_so_far);
 
         // Drop (simulates crash)
         read_so_far
@@ -460,7 +460,7 @@ fn test_batch_read_recovery_mid_read() {
 
     // Phase 2: Recover and continue reading
     {
-        println!("Phase 2: Recovering and continuing read");
+        test_println!("Phase 2: Recovering and continuing read");
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::NoFsync,
@@ -469,7 +469,7 @@ fn test_batch_read_recovery_mid_read() {
 
         // Should continue right after the entries consumed before the crash
         let remaining = wal.batch_read_for_topic("recovery", 10000).unwrap();
-        println!("Recovery read: got {} entries", remaining.len());
+        test_println!("Recovery read: got {} entries", remaining.len());
 
         // Expect remaining entries after the pre-crash reads
         let expected_remaining = 50 - read_before_crash;
@@ -486,7 +486,7 @@ fn test_batch_read_recovery_mid_read() {
             let expected = format!("recovery_{:04}", read_before_crash + i);
             let actual = String::from_utf8_lossy(&entry.data);
             if actual != expected {
-                println!(
+                test_println!(
                     "Mismatch at index {}: expected '{}', got '{}'",
                     i, expected, actual
                 );
@@ -498,11 +498,11 @@ fn test_batch_read_recovery_mid_read() {
                 read_before_crash + i
             );
         }
-        println!("All remaining entries verified correctly");
+        test_println!("All remaining entries verified correctly");
     }
 
     cleanup_test_env();
-    println!("Recovery test completed successfully");
+    test_println!("Recovery test completed successfully");
 }
 
 #[test]
@@ -510,11 +510,11 @@ fn test_batch_read_at_least_once_duplicates() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    println!("Starting AtLeastOnce duplicates test...");
+    test_println!("Starting AtLeastOnce duplicates test...");
 
     // Phase 1: Write and read with AtLeastOnce
     {
-        println!("Phase 1: Writing and reading with AtLeastOnce");
+        test_println!("Phase 1: Writing and reading with AtLeastOnce");
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::AtLeastOnce { persist_every: 5 }, // Reduced from 10 to 5
             FsyncSchedule::NoFsync,
@@ -527,14 +527,14 @@ fn test_batch_read_at_least_once_duplicates() {
             wal.append_for_topic("at_least_once", data.as_bytes())
                 .unwrap();
         }
-        println!("Written 25 entries");
+        test_println!("Written 25 entries");
 
         // Read 8 entries (only persists after 5th, so some will be re-read)
         let mut count = 0;
         let mut batch_num = 0;
         while count < 8 {
             let batch = wal.batch_read_for_topic("at_least_once", 200).unwrap();
-            println!(
+            test_println!(
                 "Phase 1 Batch {}: read {} entries, total: {}",
                 batch_num,
                 batch.len(),
@@ -544,18 +544,18 @@ fn test_batch_read_at_least_once_duplicates() {
             batch_num += 1;
 
             if batch.is_empty() {
-                println!("WARNING: Got empty batch in phase 1, breaking early");
+                test_println!("WARNING: Got empty batch in phase 1, breaking early");
                 break;
             }
         }
-        println!("Phase 1 complete: read {} entries", count);
+        test_println!("Phase 1 complete: read {} entries", count);
 
         // Crash without reading more
     }
 
     // Phase 2: Recover - should see duplicates due to AtLeastOnce
     {
-        println!("Phase 2: Recovering with AtLeastOnce (expecting duplicates)");
+        test_println!("Phase 2: Recovering with AtLeastOnce (expecting duplicates)");
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::AtLeastOnce { persist_every: 5 },
             FsyncSchedule::NoFsync,
@@ -567,21 +567,21 @@ fn test_batch_read_at_least_once_duplicates() {
         loop {
             let batch = wal.batch_read_for_topic("at_least_once", 1000).unwrap();
             if batch.is_empty() {
-                println!("Phase 2: Got empty batch, stopping");
+                test_println!("Phase 2: Got empty batch, stopping");
                 break;
             }
-            println!("Phase 2 Batch {}: read {} entries", batch_num, batch.len());
+            test_println!("Phase 2 Batch {}: read {} entries", batch_num, batch.len());
             all_entries.extend(batch);
             batch_num += 1;
 
             // Safety break to prevent infinite loops
             if batch_num > 50 {
-                println!("WARNING: Too many batches, breaking to prevent infinite loop");
+                test_println!("WARNING: Too many batches, breaking to prevent infinite loop");
                 break;
             }
         }
 
-        println!("Phase 2 complete: read {} total entries", all_entries.len());
+        test_println!("Phase 2 complete: read {} total entries", all_entries.len());
 
         // Should have read at least 25 (may have duplicates of entries 5-8)
         assert!(
@@ -591,21 +591,21 @@ fn test_batch_read_at_least_once_duplicates() {
         );
 
         // Print first few and last few entries for debugging
-        println!("First 5 entries:");
+        test_println!("First 5 entries:");
         for (i, entry) in all_entries.iter().take(5).enumerate() {
-            println!("  {}: {}", i, String::from_utf8_lossy(&entry.data));
+            test_println!("  {}: {}", i, String::from_utf8_lossy(&entry.data));
         }
 
-        println!("Last 5 entries:");
+        test_println!("Last 5 entries:");
         let start = all_entries.len().saturating_sub(5);
         for (i, entry) in all_entries.iter().skip(start).enumerate() {
-            println!("  {}: {}", start + i, String::from_utf8_lossy(&entry.data));
+            test_println!("  {}: {}", start + i, String::from_utf8_lossy(&entry.data));
         }
 
         // Last entry should definitely be entry 24 (adjusted from 49)
         let last = &all_entries[all_entries.len() - 1];
         let expected_last = b"alo_0024";
-        println!(
+        test_println!(
             "Checking last entry: expected '{}', got '{}'",
             String::from_utf8_lossy(expected_last),
             String::from_utf8_lossy(&last.data)
@@ -614,7 +614,7 @@ fn test_batch_read_at_least_once_duplicates() {
     }
 
     cleanup_test_env();
-    println!("AtLeastOnce duplicates test completed successfully");
+    test_println!("AtLeastOnce duplicates test completed successfully");
 }
 
 // ============================================================================
@@ -947,12 +947,12 @@ fn test_rapid_fire_batch_reads() {
     .unwrap();
 
     // Pre-populate with many entries (reduced from 10000 to 1000)
-    println!("Writing 1000 entries for rapid fire test...");
+    test_println!("Writing 1000 entries for rapid fire test...");
     for i in 0..1000 {
         let data = format!("{:06}", i);
         wal.append_for_topic("rapid_fire", data.as_bytes()).unwrap();
     }
-    println!("Finished writing entries");
+    test_println!("Finished writing entries");
 
     // Rapid fire batch reads with tiny budgets
     let mut total_read = 0;
@@ -967,14 +967,14 @@ fn test_rapid_fire_batch_reads() {
         iterations += 1;
 
         if iterations % 50 == 0 {
-            println!(
+            test_println!(
                 "Rapid fire: iteration {}, read {} entries so far",
                 iterations, total_read
             );
         }
     }
 
-    println!(
+    test_println!(
         "Rapid fire complete: {} iterations, {} entries read",
         iterations, total_read
     );
@@ -999,7 +999,7 @@ fn test_simple_deadlock_repro() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    println!("Starting simple deadlock reproduction test...");
+    test_println!("Starting simple deadlock reproduction test...");
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -1016,16 +1016,16 @@ fn test_simple_deadlock_repro() {
     let barrier1 = barrier.clone();
     let writer = thread::spawn(move || {
         barrier1.wait();
-        println!("Writer starting...");
+        test_println!("Writer starting...");
         for i in 0..10 {
             // Write large entries to force sealing
             let data = vec![i as u8; 1024 * 1024]; // 1MB entries
             match wal1.append_for_topic("deadlock_test", &data) {
-                Ok(_) => println!("Writer: wrote entry {}", i),
-                Err(e) => println!("Writer: error on entry {}: {:?}", i, e),
+                Ok(_) => test_println!("Writer: wrote entry {}", i),
+                Err(e) => test_println!("Writer: error on entry {}: {:?}", i, e),
             }
         }
-        println!("Writer finished");
+        test_println!("Writer finished");
     });
 
     // Reader thread 1: continuous batch reads
@@ -1033,15 +1033,15 @@ fn test_simple_deadlock_repro() {
     let barrier2 = barrier.clone();
     let reader1 = thread::spawn(move || {
         barrier2.wait();
-        println!("Reader 1 starting...");
+        test_println!("Reader 1 starting...");
         for i in 0..20 {
             match wal2.batch_read_for_topic("deadlock_test", 512 * 1024) {
-                Ok(batch) => println!("Reader 1: batch {} read {} entries", i, batch.len()),
-                Err(e) => println!("Reader 1: batch {} error: {:?}", i, e),
+                Ok(batch) => test_println!("Reader 1: batch {} read {} entries", i, batch.len()),
+                Err(e) => test_println!("Reader 1: batch {} error: {:?}", i, e),
             }
             thread::sleep(std::time::Duration::from_millis(10));
         }
-        println!("Reader 1 finished");
+        test_println!("Reader 1 finished");
     });
 
     // Reader thread 2: continuous single reads
@@ -1049,38 +1049,38 @@ fn test_simple_deadlock_repro() {
     let barrier3 = barrier.clone();
     let reader2 = thread::spawn(move || {
         barrier3.wait();
-        println!("Reader 2 starting...");
+        test_println!("Reader 2 starting...");
         for i in 0..50 {
             match wal3.read_next("deadlock_test") {
-                Ok(Some(_)) => println!("Reader 2: read entry {}", i),
-                Ok(None) => println!("Reader 2: no entry at {}", i),
-                Err(e) => println!("Reader 2: error at {}: {:?}", i, e),
+                Ok(Some(_)) => test_println!("Reader 2: read entry {}", i),
+                Ok(None) => test_println!("Reader 2: no entry at {}", i),
+                Err(e) => test_println!("Reader 2: error at {}: {:?}", i, e),
             }
             thread::sleep(std::time::Duration::from_millis(5));
         }
-        println!("Reader 2 finished");
+        test_println!("Reader 2 finished");
     });
 
     // Wait for all threads with timeout
     let timeout = std::time::Duration::from_secs(30);
 
     match writer.join() {
-        Ok(_) => println!("Writer joined successfully"),
-        Err(_) => println!("Writer panicked"),
+        Ok(_) => test_println!("Writer joined successfully"),
+        Err(_) => test_println!("Writer panicked"),
     }
 
     match reader1.join() {
-        Ok(_) => println!("Reader 1 joined successfully"),
-        Err(_) => println!("Reader 1 panicked"),
+        Ok(_) => test_println!("Reader 1 joined successfully"),
+        Err(_) => test_println!("Reader 1 panicked"),
     }
 
     match reader2.join() {
-        Ok(_) => println!("Reader 2 joined successfully"),
-        Err(_) => println!("Reader 2 panicked"),
+        Ok(_) => test_println!("Reader 2 joined successfully"),
+        Err(_) => test_println!("Reader 2 panicked"),
     }
 
     cleanup_test_env();
-    println!("Simple deadlock test completed");
+    test_println!("Simple deadlock test completed");
 }
 
 #[test]
@@ -1100,7 +1100,7 @@ fn test_full_chaos_all_operations() {
     let mut writer_handles = vec![];
     let mut reader_handles = vec![];
 
-    println!("Starting chaos test with 8 threads...");
+    test_println!("Starting chaos test with 8 threads...");
 
     // 2 single-entry writers (reduced from 200 to 50 entries each)
     for writer_id in 0..2 {
@@ -1108,7 +1108,7 @@ fn test_full_chaos_all_operations() {
         let barrier_clone = barrier.clone();
         writer_handles.push(thread::spawn(move || {
             barrier_clone.wait();
-            println!("Single writer {} starting", writer_id);
+            test_println!("Single writer {} starting", writer_id);
             for i in 0..50 {
                 let data = format!("single_w{}_e{}", writer_id, i);
                 let _ = wal_clone.append_for_topic("chaos_all", data.as_bytes());
@@ -1116,7 +1116,7 @@ fn test_full_chaos_all_operations() {
                     thread::sleep(std::time::Duration::from_micros(500));
                 }
             }
-            println!("Single writer {} finished", writer_id);
+            test_println!("Single writer {} finished", writer_id);
         }));
     }
 
@@ -1126,7 +1126,7 @@ fn test_full_chaos_all_operations() {
         let barrier_clone = barrier.clone();
         writer_handles.push(thread::spawn(move || {
             barrier_clone.wait();
-            println!("Batch writer {} starting", writer_id);
+            test_println!("Batch writer {} starting", writer_id);
             for batch_num in 0..10 {
                 let entries: Vec<Vec<u8>> = (0..10)
                     .map(|i| format!("batch_w{}_b{}_e{}", writer_id, batch_num, i).into_bytes())
@@ -1135,7 +1135,7 @@ fn test_full_chaos_all_operations() {
                 let _ = wal_clone.batch_append_for_topic("chaos_all", &refs);
                 thread::sleep(std::time::Duration::from_millis(5));
             }
-            println!("Batch writer {} finished", writer_id);
+            test_println!("Batch writer {} finished", writer_id);
         }));
     }
 
@@ -1146,7 +1146,7 @@ fn test_full_chaos_all_operations() {
         reader_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             thread::sleep(std::time::Duration::from_millis(20));
-            println!("Single reader {} starting", reader_id);
+            test_println!("Single reader {} starting", reader_id);
             let mut count = 0;
             for _ in 0..100 {
                 if let Ok(Some(_entry)) = wal_clone.read_next("chaos_all") {
@@ -1155,7 +1155,7 @@ fn test_full_chaos_all_operations() {
                     thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
-            println!(
+            test_println!(
                 "Single reader {} finished with {} entries",
                 reader_id, count
             );
@@ -1170,7 +1170,7 @@ fn test_full_chaos_all_operations() {
         reader_handles.push(thread::spawn(move || {
             barrier_clone.wait();
             thread::sleep(std::time::Duration::from_millis(30));
-            println!("Batch reader {} starting", reader_id);
+            test_println!("Batch reader {} starting", reader_id);
             let mut count = 0;
             for _ in 0..50 {
                 if let Ok(batch) = wal_clone.batch_read_for_topic("chaos_all", 1024) {
@@ -1179,7 +1179,7 @@ fn test_full_chaos_all_operations() {
                     thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
-            println!("Batch reader {} finished with {} entries", reader_id, count);
+            test_println!("Batch reader {} finished with {} entries", reader_id, count);
             (reader_id, count)
         }));
     }
@@ -1201,7 +1201,7 @@ fn test_full_chaos_all_operations() {
         total_read += count;
     }
 
-    println!("Chaos test: wrote {}, read {}", total_written, total_read);
+    test_println!("Chaos test: wrote {}, read {}", total_written, total_read);
 
     // Due to AtLeastOnce and concurrent access, we can't guarantee exact counts,
     // but we should have read something

@@ -275,12 +275,12 @@ fn test_log_file_deletion_with_fast_fsync() {
     )
     .unwrap();
 
-    println!("Creating first 999MB entry...");
+    test_println!("Creating first 999MB entry...");
     let large_data_1 = vec![0xAA; 999 * 1024 * 1024]; // 999MB of 0xAA bytes
     wal.append_for_topic("deletion_test", &large_data_1)
         .unwrap();
 
-    println!("Creating second 999MB entry...");
+    test_println!("Creating second 999MB entry...");
     let large_data_2 = vec![0xBB; 999 * 1024 * 1024]; // 999MB of 0xBB bytes
     wal.append_for_topic("deletion_test", &large_data_2)
         .unwrap();
@@ -296,12 +296,12 @@ fn test_log_file_deletion_with_fast_fsync() {
         })
         .collect::<Vec<_>>();
 
-    println!(
+    test_println!(
         "Files after writing 2x999MB entries: {}",
         files_after_writes.len()
     );
     for file in &files_after_writes {
-        println!("  File: {:?}", file.file_name());
+        test_println!("  File: {:?}", file.file_name());
     }
 
     assert!(
@@ -309,14 +309,14 @@ fn test_log_file_deletion_with_fast_fsync() {
         "Should have at least 2 files after writing 2x999MB entries"
     );
 
-    println!("Reading first entry (999MB)...");
+    test_println!("Reading first entry (999MB)...");
     let entry1 = wal.read_next("deletion_test").unwrap().unwrap();
     assert_eq!(entry1.data.len(), 999 * 1024 * 1024);
     assert_eq!(entry1.data[0], 0xAA); // Verify it's the first entry
 
-    println!("First entry read successfully. Waiting for file cleanup...");
+    test_println!("First entry read successfully. Waiting for file cleanup...");
 
-    println!("Waiting 60 seconds for background deletion to process...");
+    test_println!("Waiting 60 seconds for background deletion to process...");
 
     for i in 1..=12 {
         thread::sleep(Duration::from_secs(5));
@@ -330,10 +330,10 @@ fn test_log_file_deletion_with_fast_fsync() {
                 !name.ends_with("_index.db") && !name.ends_with(".tmp")
             })
             .count();
-        println!("After {} seconds: {} files remaining", i * 5, current_files);
+        test_println!("After {} seconds: {} files remaining", i * 5, current_files);
 
         if current_files < files_after_writes.len() {
-            println!("FILE DELETION DETECTED at {} seconds!", i * 5);
+            test_println!("FILE DELETION DETECTED at {} seconds!", i * 5);
             break;
         }
     }
@@ -349,32 +349,32 @@ fn test_log_file_deletion_with_fast_fsync() {
         })
         .collect::<Vec<_>>();
 
-    println!(
+    test_println!(
         "Files after reading first entry and waiting: {}",
         files_after_read.len()
     );
     for file in &files_after_read {
-        println!("  File: {:?}", file.file_name());
+        test_println!("  File: {:?}", file.file_name());
     }
 
     if files_after_read.len() < files_after_writes.len() {
-        println!(
+        test_println!(
             "SUCCESS: File deletion occurred! {} -> {} files",
             files_after_writes.len(),
             files_after_read.len()
         );
     } else {
-        println!(
+        test_println!(
             "INFO: Files still present, deletion may require more time or different conditions"
         );
     }
 
-    println!("Reading second entry to verify WAL integrity...");
+    test_println!("Reading second entry to verify WAL integrity...");
     let entry2 = wal.read_next("deletion_test").unwrap().unwrap();
     assert_eq!(entry2.data.len(), 999 * 1024 * 1024);
     assert_eq!(entry2.data[0], 0xBB); // Verify it's the second entry
 
-    println!("Test completed successfully!");
+    test_println!("Test completed successfully!");
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn test_log_file_deletion_with_large_data() {
         0
     };
 
-    println!("Large data test - Files before: {}", files_before);
+    test_println!("Large data test - Files before: {}", files_before);
 
     drop(wal);
     thread::sleep(Duration::from_secs(3));
@@ -444,7 +444,7 @@ fn test_log_file_deletion_with_large_data() {
         0
     };
 
-    println!("Large data test - Files after: {}", files_after);
+    test_println!("Large data test - Files after: {}", files_after);
 }
 
 #[test]

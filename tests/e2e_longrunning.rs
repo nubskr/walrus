@@ -91,11 +91,11 @@ fn e2e_sustained_mixed_workload() {
     let total_writes: u64 = write_counts.values().sum();
     let total_reads: u64 = read_counts.values().sum();
 
-    println!("E2E Sustained Test Results:");
-    println!("  Total writes: {}", total_writes);
-    println!("  Total reads: {}", total_reads);
-    println!("  Validation errors: {}", validation_errors);
-    println!("  Duration: {:?}", start_time.elapsed());
+    test_println!("E2E Sustained Test Results:");
+    test_println!("  Total writes: {}", total_writes);
+    test_println!("  Total reads: {}", total_reads);
+    test_println!("  Validation errors: {}", validation_errors);
+    test_println!("  Duration: {:?}", start_time.elapsed());
 
     assert!(
         total_writes > 100,
@@ -227,10 +227,10 @@ fn e2e_realistic_application_simulation() {
         thread::sleep(Duration::from_millis(10)); // Small delay to prevent tight loop
     }
 
-    println!("E2E Realistic Application Results:");
-    println!("  Processed entries: {}", processed_count);
-    println!("  Validation errors: {}", validation_errors);
-    println!("  Duration: {:?}", start_time.elapsed());
+    test_println!("E2E Realistic Application Results:");
+    test_println!("  Processed entries: {}", processed_count);
+    test_println!("  Validation errors: {}", validation_errors);
+    test_println!("  Duration: {:?}", start_time.elapsed());
 
     assert!(
         processed_count > 100,
@@ -263,7 +263,7 @@ fn e2e_recovery_and_persistence_marathon() {
     }
 
     for cycle in 0..total_cycles {
-        println!("E2E Recovery Cycle {}/{}", cycle + 1, total_cycles);
+        test_println!("E2E Recovery Cycle {}/{}", cycle + 1, total_cycles);
 
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -315,12 +315,12 @@ fn e2e_recovery_and_persistence_marathon() {
         }
     }
 
-    println!("E2E Recovery Marathon Results:");
-    println!("  Total cycles: {}", total_cycles);
-    println!("  Entries per cycle per topic: {}", entries_per_cycle);
-    println!("  Total topics: {}", topics.len());
-    println!("  Remaining entries read: {}", total_read);
-    println!("  Validation errors: {}", validation_errors);
+    test_println!("E2E Recovery Marathon Results:");
+    test_println!("  Total cycles: {}", total_cycles);
+    test_println!("  Entries per cycle per topic: {}", entries_per_cycle);
+    test_println!("  Total topics: {}", topics.len());
+    test_println!("  Remaining entries read: {}", total_read);
+    test_println!("  Validation errors: {}", validation_errors);
 
     // let expected_remaining = (total_cycles * entries_per_cycle * topics.len()) / 2;
     // assert!(
@@ -405,34 +405,34 @@ fn e2e_massive_data_throughput_test() {
 
     let elapsed = start_time.elapsed();
 
-    println!("E2E Massive Throughput Results:");
-    println!("  Duration: {:?}", elapsed);
-    println!(
+    test_println!("E2E Massive Throughput Results:");
+    test_println!("  Duration: {:?}", elapsed);
+    test_println!(
         "  Bytes written: {} ({:.2} MB)",
         bytes_written,
         bytes_written as f64 / 1_000_000.0
     );
-    println!(
+    test_println!(
         "  Bytes read: {} ({:.2} MB)",
         bytes_read,
         bytes_read as f64 / 1_000_000.0
     );
-    println!("  Entries written: {}", entries_written);
-    println!("  Entries read: {}", entries_read);
-    println!("  Validation errors: {}", validation_errors);
-    println!(
+    test_println!("  Entries written: {}", entries_written);
+    test_println!("  Entries read: {}", entries_read);
+    test_println!("  Validation errors: {}", validation_errors);
+    test_println!(
         "  Write throughput: {:.2} MB/s",
         (bytes_written as f64 / 1_000_000.0) / elapsed.as_secs_f64()
     );
-    println!(
+    test_println!(
         "  Read throughput: {:.2} MB/s",
         (bytes_read as f64 / 1_000_000.0) / elapsed.as_secs_f64()
     );
-    println!(
+    test_println!(
         "  Write rate: {:.2} entries/s",
         entries_written as f64 / elapsed.as_secs_f64()
     );
-    println!(
+    test_println!(
         "  Read rate: {:.2} entries/s",
         entries_read as f64 / elapsed.as_secs_f64()
     );
@@ -545,19 +545,19 @@ fn e2e_system_stress_and_stability() {
 
     let elapsed = start_time.elapsed();
 
-    println!("E2E System Stress Results:");
-    println!("  Duration: {:?}", elapsed);
-    println!("  Successful operations: {}", successful_operations);
-    println!("  Write errors: {}", write_errors);
-    println!("  Read errors: {}", read_errors);
-    println!("  Read validation errors: {}", read_validation_errors);
-    println!(
+    test_println!("E2E System Stress Results:");
+    test_println!("  Duration: {:?}", elapsed);
+    test_println!("  Successful operations: {}", successful_operations);
+    test_println!("  Write errors: {}", write_errors);
+    test_println!("  Read errors: {}", read_errors);
+    test_println!("  Read validation errors: {}", read_validation_errors);
+    test_println!(
         "  Success rate: {:.2}%",
         (successful_operations as f64
             / (successful_operations + write_errors + read_errors) as f64)
             * 100.0
     );
-    println!(
+    test_println!(
         "  Operations/sec: {:.2}",
         successful_operations as f64 / elapsed.as_secs_f64()
     );
@@ -591,14 +591,14 @@ fn e2e_performance_benchmark() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    println!("=== WAL Performance Benchmark ===");
+    test_println!("=== WAL Performance Benchmark ===");
 
     let start = Instant::now();
     let duration = Duration::from_secs(10); // Reduced duration for CI
     let mut write_count = 0u64;
     let mut write_bytes = 0u64;
 
-    println!("Running write benchmark for {:?}...", duration);
+    test_println!("Running write benchmark for {:?}...", duration);
 
     while start.elapsed() < duration {
         let data = b"benchmark_data_entry";
@@ -609,10 +609,10 @@ fn e2e_performance_benchmark() {
     }
 
     let write_elapsed = start.elapsed();
-    println!("Write Results:");
-    println!("  Operations: {}", write_count);
-    println!("  Bytes: {} KB", write_bytes / 1024);
-    println!(
+    test_println!("Write Results:");
+    test_println!("  Operations: {}", write_count);
+    test_println!("  Bytes: {} KB", write_bytes / 1024);
+    test_println!(
         "  Throughput: {:.0} ops/sec",
         write_count as f64 / write_elapsed.as_secs_f64()
     );
@@ -621,7 +621,7 @@ fn e2e_performance_benchmark() {
     let mut read_count = 0u64;
     let mut read_bytes = 0u64;
 
-    println!("Running read benchmark for {:?}...", duration);
+    test_println!("Running read benchmark for {:?}...", duration);
 
     while start.elapsed() < duration {
         if let Some(entry) = wal.read_next("bench").unwrap() {
@@ -631,10 +631,10 @@ fn e2e_performance_benchmark() {
     }
 
     let read_elapsed = start.elapsed();
-    println!("Read Results:");
-    println!("  Operations: {}", read_count);
-    println!("  Bytes: {} KB", read_bytes / 1024);
-    println!(
+    test_println!("Read Results:");
+    test_println!("  Operations: {}", read_count);
+    test_println!("  Bytes: {} KB", read_bytes / 1024);
+    test_println!(
         "  Throughput: {:.0} ops/sec",
         read_count as f64 / read_elapsed.as_secs_f64()
     );
@@ -650,5 +650,5 @@ fn e2e_performance_benchmark() {
         read_count
     );
 
-    println!("Performance benchmark completed!");
+    test_println!("Performance benchmark completed!");
 }

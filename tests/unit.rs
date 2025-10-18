@@ -395,7 +395,7 @@ fn stress_extreme_topic_names() {
                 assert_eq!(entry.data, data);
             }
             Err(_) => {
-                println!("Topic '{}' rejected (expected for some cases)", topic);
+                test_println!("Topic '{}' rejected (expected for some cases)", topic);
             }
         }
     }

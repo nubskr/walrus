@@ -4,6 +4,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Macro for test output that respects WALRUS_QUIET
+#[macro_export]
+macro_rules! test_println {
+    ($($arg:tt)*) => {
+        if std::env::var("WALRUS_QUIET").is_err() {
+            println!($($arg)*);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! test_eprintln {
+    ($($arg:tt)*) => {
+        if std::env::var("WALRUS_QUIET").is_err() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
