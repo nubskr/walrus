@@ -58,12 +58,8 @@ pub(crate) fn now_millis_str() -> String {
             system_ms_u64
         };
 
-        match LAST_MILLIS.compare_exchange(
-            observed,
-            candidate,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match LAST_MILLIS.compare_exchange(observed, candidate, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => return candidate.to_string(),
             Err(actual) => observed = actual,
         }

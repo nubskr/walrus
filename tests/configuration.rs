@@ -540,8 +540,8 @@ fn key_based_instances_use_isolated_directories() {
     let analytics_key = env.unique_key("analytics");
 
     {
-        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce)
-            .unwrap();
+        let wal =
+            Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("tx", b"txn-1").unwrap();
     }
 
@@ -576,8 +576,8 @@ fn key_based_instances_recover_independently() {
     let analytics_key = env.unique_key("analytics");
 
     {
-        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce)
-            .unwrap();
+        let wal =
+            Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("tx", b"a").unwrap();
         wal.append_for_topic("tx", b"b").unwrap();
     }

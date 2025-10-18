@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -286,8 +285,10 @@ fn multithreaded_read_benchmark() {
     let (write_duration, read_duration) = parse_duration();
 
     println!("=== Multi-threaded WAL Read Benchmark ===");
+    let num_threads = 16;
     println!(
-        "Configuration: 10 threads, {:.0}s write phase + {:.0}s read phase",
+        "Configuration: {} threads, {:.0}s write phase + {:.0}s read phase",
+        num_threads,
         write_duration.as_secs(),
         read_duration.as_secs()
     );
@@ -297,8 +298,11 @@ fn multithreaded_read_benchmark() {
         write_duration, read_duration
     );
 
+    // Pre-create benchmarking topics for each thread so we can reuse them later
+    let topics: Vec<String> = (0..num_threads).map(|i| format!("topic_{}", i)).collect();
     let wal = Arc::new(
-        Walrus::with_consistency_and_schedule(
+        Walrus::with_consistency_and_schedule_for_key(
+            "benchmark-reads",
             ReadConsistency::AtLeastOnce {
                 persist_every: 5000,
             },
@@ -306,9 +310,9 @@ fn multithreaded_read_benchmark() {
         )
         .expect("Failed to create Walrus"),
     );
-    let num_threads = 10;
-    const WRITE_BATCH_ENTRIES: usize = 32;
-    const READ_BATCH_MAX_BYTES: usize = 512 * 1024;
+    const WRITE_BATCH_ENTRIES: usize = 2000;
+    const ENTRY_SIZE_BYTES: usize = 100 * 1024;
+    const READ_BATCH_MAX_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
     // Shared counters for statistics
     let total_writes = Arc::new(AtomicU64::new(0));
@@ -321,7 +325,7 @@ fn multithreaded_read_benchmark() {
     // Create CSV file for throughput monitoring
     let csv_path = "read_benchmark_throughput.csv";
     let mut csv_file = fs::File::create(csv_path).expect("Failed to create CSV file");
-    writeln!(csv_file, "timestamp,elapsed_seconds,phase,writes_per_second,reads_per_second,write_bytes_per_second,read_bytes_per_second,total_writes,total_reads,dirty_pages_kb,dirty_ratio_percent").expect("Failed to write CSV header");
+    writeln!(csv_file, "timestamp,elapsed_seconds,phase,write_mb_per_sec,read_mb_per_sec,total_write_mb,total_read_mb,dirty_pages_kb,dirty_ratio_percent").expect("Failed to write CSV header");
 
     // Channel for throughput monitoring
     let (throughput_tx, throughput_rx) = mpsc::channel::<String>();
@@ -332,29 +336,11 @@ fn multithreaded_read_benchmark() {
     let read_start_barrier = Arc::new(Barrier::new(num_threads + 1));
     let read_end_barrier = Arc::new(Barrier::new(num_threads + 1));
 
-    // Topic names for each thread
-    let topics = vec![
-        "topic_0".to_string(),
-        "topic_1".to_string(),
-        "topic_2".to_string(),
-        "topic_3".to_string(),
-        "topic_4".to_string(),
-        "topic_5".to_string(),
-        "topic_6".to_string(),
-        "topic_7".to_string(),
-        "topic_8".to_string(),
-        "topic_9".to_string(),
-    ];
-
     println!("Starting {} writer/reader threads...", num_threads);
 
     // Spawn throughput monitoring thread
-    let total_writes_monitor = Arc::clone(&total_writes);
     let total_write_bytes_monitor = Arc::clone(&total_write_bytes);
-    let total_reads_monitor = Arc::clone(&total_reads);
     let total_read_bytes_monitor = Arc::clone(&total_read_bytes);
-    let monitor_write_duration = write_duration;
-    let monitor_read_duration = read_duration;
 
     let monitor_handle = thread::spawn(move || {
         let mut csv_file = fs::OpenOptions::new()
@@ -363,14 +349,12 @@ fn multithreaded_read_benchmark() {
             .open("read_benchmark_throughput.csv")
             .expect("Failed to open CSV file");
 
-        let mut start_time = Instant::now();
-        let mut last_writes = 0u64;
-        let mut last_reads = 0u64;
-        let mut last_write_bytes = 0u64;
-        let mut last_read_bytes = 0u64;
-        let mut last_time = start_time;
+        let mut last_write_bytes: u64;
+        let mut last_read_bytes: u64;
         let mut current_phase = "write";
-        let mut tick_index: u64 = 0;
+        let mut elapsed_total: f64;
+        let interval_s = 0.5f64;
+        let sample_interval = Duration::from_millis((interval_s * 1000.0) as u64);
 
         // Wait for explicit start of write phase to avoid pre-start samples
         let _ = throughput_rx.recv(); // expect "write_start"
@@ -380,158 +364,141 @@ fn multithreaded_read_benchmark() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let (_, initial_dirty_kb, initial_dirty_ratio) = get_memory_info();
+            let (_total_mem_kb, initial_dirty_kb, initial_dirty_ratio) = get_memory_info();
+            let initial_total_write_mb =
+                total_write_bytes_monitor.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            let initial_total_read_mb =
+                total_read_bytes_monitor.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
             writeln!(
                 csv_file,
-                "{},{:.2},{},{:.0},{:.0},{:.0},{:.0},{},{},{},{:.2}",
+                "{},{:.2},{},{:.3},{:.3},{:.3},{:.3},{},{:.2}",
                 timestamp,
                 0.0,
                 "write",
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                0,
-                0,
+                initial_total_write_mb,
+                initial_total_read_mb,
                 initial_dirty_kb,
                 initial_dirty_ratio
             )
             .expect("Failed to write initial CSV entry");
             csv_file.flush().expect("Failed to flush CSV");
         }
-        start_time = Instant::now();
-        last_time = start_time;
-        last_writes = 0;
-        last_write_bytes = 0;
-        tick_index = 0;
+        last_write_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
+        last_read_bytes = total_read_bytes_monitor.load(Ordering::Relaxed);
+        elapsed_total = 0.0;
 
         loop {
             // Check for phase changes
             if let Ok(phase) = throughput_rx.try_recv() {
-                current_phase = match phase.as_str() {
+                match phase.as_str() {
                     "read_start" => {
                         // Log initial state at time 0 for read phase
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
-                        let current_writes = total_writes_monitor.load(Ordering::Relaxed);
-                        let (_, phase_dirty_kb, phase_dirty_ratio) = get_memory_info();
+                        let (_total_mem_kb, phase_dirty_kb, phase_dirty_ratio) = get_memory_info();
+                        let phase_total_write_mb = total_write_bytes_monitor.load(Ordering::Relaxed)
+                            as f64
+                            / (1024.0 * 1024.0);
+                        let phase_total_read_mb = total_read_bytes_monitor.load(Ordering::Relaxed)
+                            as f64
+                            / (1024.0 * 1024.0);
                         writeln!(
                             csv_file,
-                            "{},{:.2},{},{:.0},{:.0},{:.0},{:.0},{},{},{},{:.2}",
+                            "{},{:.2},{},{:.3},{:.3},{:.3},{:.3},{},{:.2}",
                             timestamp,
                             0.0,
                             "read",
                             0.0,
                             0.0,
-                            0.0,
-                            0.0,
-                            current_writes,
-                            0,
+                            phase_total_write_mb,
+                            phase_total_read_mb,
                             phase_dirty_kb,
                             phase_dirty_ratio
                         )
                         .expect("Failed to write initial CSV entry");
                         csv_file.flush().expect("Failed to flush CSV");
-                        start_time = Instant::now(); // Reset start time for read phase
-                        last_time = start_time;
-                        last_reads = 0;
-                        last_read_bytes = 0;
-                        tick_index = 0;
-                        "read"
+                        elapsed_total = 0.0;
+                        last_write_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
+                        last_read_bytes = total_read_bytes_monitor.load(Ordering::Relaxed);
+                        current_phase = "read";
                     }
                     "end" => break,
-                    _ => current_phase,
-                };
-                // After logging initial state, wait before next measurement
-                thread::sleep(Duration::from_millis(500));
+                    _ => {
+                        elapsed_total = 0.0;
+                        last_write_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
+                        last_read_bytes = total_read_bytes_monitor.load(Ordering::Relaxed);
+                    }
+                }
+                thread::sleep(sample_interval);
                 continue;
             } else {
-                thread::sleep(Duration::from_millis(500)); // Sample every 500ms
+                thread::sleep(sample_interval); // Sample every interval
             }
 
-            // Deterministic time base to avoid duplicate/rounded times
-            tick_index += 1;
-            let interval_s = 0.5f64;
-            let elapsed_total = tick_index as f64 * interval_s;
+            elapsed_total += interval_s;
 
-            let current_time = Instant::now();
-            let current_writes = total_writes_monitor.load(Ordering::Relaxed);
-            let current_reads = total_reads_monitor.load(Ordering::Relaxed);
             let current_write_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
             let current_read_bytes = total_read_bytes_monitor.load(Ordering::Relaxed);
 
-            // Calculate rates over fixed interval
-            let writes_per_second = (current_writes - last_writes) as f64 / interval_s;
-            let reads_per_second = (current_reads - last_reads) as f64 / interval_s;
-            let write_bytes_per_second =
-                (current_write_bytes - last_write_bytes) as f64 / interval_s;
-            let read_bytes_per_second = (current_read_bytes - last_read_bytes) as f64 / interval_s;
+            // Calculate bandwidth over fixed interval
+            let write_mb_per_sec =
+                ((current_write_bytes - last_write_bytes) as f64 / interval_s) / (1024.0 * 1024.0);
+            let read_mb_per_sec =
+                ((current_read_bytes - last_read_bytes) as f64 / interval_s) / (1024.0 * 1024.0);
+            let total_write_mb = current_write_bytes as f64 / (1024.0 * 1024.0);
+            let total_read_mb = current_read_bytes as f64 / (1024.0 * 1024.0);
 
             // Get memory information including dirty pages
-            let (_, dirty_kb, dirty_ratio) = get_memory_info();
+            let (_total_mem_kb, dirty_kb, dirty_ratio) = get_memory_info();
 
-            // Log if there's activity or every 2 seconds
-            let has_activity = (current_writes != last_writes) || (current_reads != last_reads);
-            let should_log = has_activity || (elapsed_total as u64 % 2 == 0);
+            // Always log every interval for real-time feedback
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-            if should_log {
-                // Write to CSV
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+            writeln!(
+                csv_file,
+                "{},{:.2},{},{:.3},{:.3},{:.3},{:.3},{},{:.2}",
+                timestamp,
+                elapsed_total,
+                current_phase,
+                write_mb_per_sec,
+                read_mb_per_sec,
+                total_write_mb,
+                total_read_mb,
+                dirty_kb,
+                dirty_ratio
+            )
+            .expect("Failed to write to CSV");
+            csv_file.flush().expect("Failed to flush CSV");
 
-                writeln!(
-                    csv_file,
-                    "{},{:.2},{},{:.0},{:.0},{:.0},{:.0},{},{},{},{:.2}",
-                    timestamp,
+            if current_phase == "write" {
+                println!(
+                    "[Monitor] {:.1}s [WRITE]: {:.2} MB/s, total: {:.2} GB, dirty: {:.2}% ({} KB)",
                     elapsed_total,
-                    current_phase,
-                    writes_per_second,
-                    reads_per_second,
-                    write_bytes_per_second,
-                    read_bytes_per_second,
-                    current_writes,
-                    current_reads,
-                    dirty_kb,
-                    dirty_ratio
-                )
-                .expect("Failed to write to CSV");
-                csv_file.flush().expect("Failed to flush CSV");
-
-                // Print progress only if there's activity
-                if has_activity {
-                    if current_phase == "write" {
-                        println!(
-                            "[Monitor] {:.1}s [WRITE]: {:.0} writes/sec, {:.2} MB/sec, total: {} writes, dirty: {:.2}% ({} KB)",
-                            elapsed_total,
-                            writes_per_second,
-                            write_bytes_per_second / (1024.0 * 1024.0),
-                            current_writes,
-                            dirty_ratio,
-                            dirty_kb
-                        );
-                    } else {
-                        println!(
-                            "[Monitor] {:.1}s [READ]: {:.0} reads/sec, {:.2} MB/sec, total: {} reads, dirty: {:.2}% ({} KB)",
-                            elapsed_total,
-                            reads_per_second,
-                            read_bytes_per_second / (1024.0 * 1024.0),
-                            current_reads,
-                            dirty_ratio,
-                            dirty_kb
-                        );
-                    }
-                }
+                    write_mb_per_sec,
+                    total_write_mb / 1024.0,
+                    dirty_ratio,
+                    dirty_kb
+                );
+            } else {
+                println!(
+                    "[Monitor] {:.1}s [READ]: {:.2} MB/s, total: {:.2} GB, dirty: {:.2}% ({} KB)",
+                    elapsed_total,
+                    read_mb_per_sec,
+                    total_read_mb / 1024.0,
+                    dirty_ratio,
+                    dirty_kb
+                );
             }
 
-            last_writes = current_writes;
-            last_reads = current_reads;
             last_write_bytes = current_write_bytes;
             last_read_bytes = current_read_bytes;
-            last_time = current_time;
         }
     });
 
@@ -562,7 +529,6 @@ fn multithreaded_read_benchmark() {
             let mut counter = 0u64;
 
             // Write phase - start slow and ramp up to simulate realistic workload
-            let mut rng = rand::thread_rng();
             let ramp_up_duration = write_duration.mul_f64(0.15); // 15% of total duration for ramp-up
             let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_ENTRIES);
 
@@ -570,7 +536,8 @@ fn multithreaded_read_benchmark() {
                 payloads.clear();
                 let mut batch_bytes = 0u64;
 
-                while payloads.len() < WRITE_BATCH_ENTRIES && write_start_time.elapsed() < write_duration
+                while payloads.len() < WRITE_BATCH_ENTRIES
+                    && write_start_time.elapsed() < write_duration
                 {
                     // Calculate current write rate based on ramp-up
                     let elapsed = write_start_time.elapsed();
@@ -589,9 +556,8 @@ fn multithreaded_read_benchmark() {
                         thread::sleep(Duration::from_millis(delay_ms as u64));
                     }
 
-                    // Random entry size between 500B and 1KB
-                    let size = rng.gen_range(500..=1024);
-                    let data = vec![(counter % 256) as u8; size];
+                    // Fixed entry size of 100KB
+                    let data = vec![(counter % 256) as u8; ENTRY_SIZE_BYTES];
                     batch_bytes += data.len() as u64;
                     payloads.push(data);
                     counter += 1;
@@ -723,10 +689,6 @@ fn multithreaded_read_benchmark() {
     );
     println!("Write Errors: {}", write_errors_after_write_phase);
     println!(
-        "Write Throughput: {:.0} ops/sec",
-        writes_after_write_phase as f64 / write_elapsed.as_secs_f64()
-    );
-    println!(
         "Write Bandwidth: {:.2} MB/sec",
         (write_bytes_after_write_phase as f64 / (1024.0 * 1024.0)) / write_elapsed.as_secs_f64()
     );
@@ -756,10 +718,6 @@ fn multithreaded_read_benchmark() {
     println!("Total Reads: {}", final_reads);
     println!("Total Read Bytes: {} MB", final_read_bytes / (1024 * 1024));
     println!("Read Errors: {}", final_read_errors);
-    println!(
-        "Read Throughput: {:.0} ops/sec",
-        final_reads as f64 / read_elapsed.as_secs_f64()
-    );
     println!(
         "Read Bandwidth: {:.2} MB/sec",
         (final_read_bytes as f64 / (1024.0 * 1024.0)) / read_elapsed.as_secs_f64()
