@@ -573,6 +573,10 @@ fn test_chaos_batch_write_crash_recovery() {
 
         // Simulate crash by dropping wal without graceful shutdown
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Phase 2: Recover and verify - SAME KEY ensures same directory
@@ -806,6 +810,9 @@ fn test_chaos_sequential_batches_with_crashes() {
 
         // Simulate crash
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Final recovery: should see all 5 cycles × 2 entries = 10 entries
@@ -1463,6 +1470,9 @@ fn test_integrity_batch_after_crash_recovery() {
 
         // Simulate crash
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Phase 2: Recover and verify exact data - SAME KEY ensures same directory
