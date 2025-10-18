@@ -538,9 +538,6 @@ fn multithreaded_batch_benchmark() {
                         }
                     }
                 }
-
-                // Longer delay between batches to avoid overwhelming io_uring queue
-                thread::sleep(Duration::from_millis(500));
             }
 
             // Persist error count at the end
