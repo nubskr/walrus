@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+env:
+  WALRUS_QUIET: "1"
+
 jobs:
   run-all-tests:
     runs-on: self-hosted
