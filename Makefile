@@ -1,6 +1,9 @@
 .PHONY: help bench-writes bench-reads bench-scaling bench-batch-scaling show-writes show-reads show-scaling show-batch-writes show-batch-scaling live-writes live-scaling clean bench-walrus-vs-rocksdb
 .PHONY: bench-writes-sync bench-reads-sync bench-scaling-sync bench-writes-fast bench-reads-fast bench-scaling-fast
 
+WALRUS_CSV ?= walrus.csv
+ROCKSDB_CSV ?= rocksdb.csv
+
 help:
 	@echo "Walrus Benchmarks"
 	@echo "=================="
@@ -233,6 +236,18 @@ show-batch-writes:
 		exit 1; \
 	fi
 	python3 scripts/visualize_batch_benchmark.py
+
+show-walrus-vs-rocksdb:
+	@echo "Comparing Walrus and RocksDB benchmark CSVs..."
+	@if [ ! -f "$(WALRUS_CSV)" ]; then \
+		echo "$(WALRUS_CSV) not found. Run 'WALRUS_DURATION=1s WALRUS_FSYNC=no-fsync make bench-walrus-vs-rocksdb' first, or set WALRUS_CSV=<path>."; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(ROCKSDB_CSV)" ]; then \
+		echo "$(ROCKSDB_CSV) not found. Run 'WALRUS_DURATION=1s WALRUS_FSYNC=no-fsync make bench-walrus-vs-rocksdb' first, or set ROCKSDB_CSV=<path>."; \
+		exit 1; \
+	fi
+	python3 scripts/compare_walrus_rocksdb.py --walrus "$(WALRUS_CSV)" --rocksdb "$(ROCKSDB_CSV)" --out walrus_vs_rocksdb.png
 
 # Live monitoring targets
 live-writes:
