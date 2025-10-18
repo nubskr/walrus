@@ -9,6 +9,7 @@ on:
 
 env:
   WALRUS_QUIET: "1"
+  RUST_TEST_THREADS: "16"
 
 jobs:
   unit-tests:
@@ -33,7 +34,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run unit tests
-        run: RUSTFLAGS=-Awarnings cargo test --lib --bins --test unit -- --test-threads=1
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --lib --bins --test unit
 
   integration-tests:
     runs-on: self-hosted
@@ -57,7 +60,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run integration tests
-        run: RUSTFLAGS=-Awarnings cargo test --test integration -- --test-threads=1
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test integration
 
   configuration-tests:
     runs-on: self-hosted
@@ -81,7 +86,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run configuration tests
-        run: RUSTFLAGS=-Awarnings cargo test --test configuration -- --test-threads=1
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test configuration
 
   e2e-sustained-mixed-workload:
     runs-on: self-hosted
@@ -107,7 +114,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run sustained mixed workload test
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --nocapture
 
   e2e-realistic-application-simulation:
     runs-on: self-hosted
@@ -133,7 +142,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run realistic application simulation test
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --nocapture
 
   e2e-recovery-and-persistence-marathon:
     runs-on: self-hosted
@@ -159,7 +170,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run recovery and persistence marathon test
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --nocapture
 
   e2e-massive-data-throughput:
     runs-on: self-hosted
@@ -185,7 +198,9 @@ jobs:
         run: cargo build --locked
 
       - name: Run massive data throughput test
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --nocapture
 
   e2e-system-stress-and-stability:
     runs-on: self-hosted
@@ -211,4 +226,6 @@ jobs:
         run: cargo build --locked
 
       - name: Run system stress and stability test
-        run: RUSTFLAGS=-Awarnings cargo test --test e2e_longrunning e2e_system_stress_and_stability -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test e2e_longrunning e2e_system_stress_and_stability -- --nocapture

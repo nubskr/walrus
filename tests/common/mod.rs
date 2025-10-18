@@ -127,6 +127,14 @@ impl TestEnv {
 
         Self { key, dir }
     }
+
+    pub fn namespace_key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn unique_key(&self, base: &str) -> String {
+        format!("{}-{}", base, self.key)
+    }
 }
 
 impl Drop for TestEnv {

@@ -535,17 +535,19 @@ fn test_file_state_tracking() {
 
 #[test]
 fn key_based_instances_use_isolated_directories() {
-    let _env = setup_env();
+    let env = setup_env();
+    let tx_key = env.unique_key("transactions");
+    let analytics_key = env.unique_key("analytics");
 
     {
-        let wal = Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce)
+        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce)
             .unwrap();
         wal.append_for_topic("tx", b"txn-1").unwrap();
     }
 
     {
-        let wal =
-            Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce)
+            .unwrap();
         wal.append_for_topic("events", b"evt-1").unwrap();
     }
 
@@ -557,18 +559,24 @@ fn key_based_instances_use_isolated_directories() {
         .collect();
     dir_names.sort();
 
-    assert_eq!(
-        dir_names,
-        vec![sanitize_key("analytics"), sanitize_key("transactions")]
+    assert!(
+        dir_names.contains(&sanitize_key(&analytics_key)),
+        "expected analytics namespace directory to exist"
+    );
+    assert!(
+        dir_names.contains(&sanitize_key(&tx_key)),
+        "expected transactions namespace directory to exist"
     );
 }
 
 #[test]
 fn key_based_instances_recover_independently() {
-    let _env = setup_env();
+    let env = setup_env();
+    let tx_key = env.unique_key("transactions");
+    let analytics_key = env.unique_key("analytics");
 
     {
-        let wal = Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce)
+        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce)
             .unwrap();
         wal.append_for_topic("tx", b"a").unwrap();
         wal.append_for_topic("tx", b"b").unwrap();
@@ -578,8 +586,8 @@ fn key_based_instances_recover_independently() {
     thread::sleep(Duration::from_millis(50));
 
     {
-        let wal =
-            Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce)
+            .unwrap();
         wal.append_for_topic("events", b"x").unwrap();
     }
 
@@ -587,13 +595,13 @@ fn key_based_instances_recover_independently() {
     thread::sleep(Duration::from_millis(50));
 
     let wal_tx =
-        Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce).unwrap();
+        Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"a");
     assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"b");
     assert!(wal_tx.read_next("tx", true).unwrap().is_none());
 
     let wal_an =
-        Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
+        Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce).unwrap();
     assert!(wal_an.read_next("tx", true).unwrap().is_none());
     assert_eq!(
         wal_an.read_next("events", true).unwrap().unwrap().data,

@@ -9,6 +9,7 @@ on:
 
 env:
   WALRUS_QUIET: "1"
+  RUST_TEST_THREADS: "16"
 
 jobs:
   run-all-tests:
@@ -45,4 +46,6 @@ jobs:
         run: cargo build --locked
 
       - name: Run tests (${{ matrix.test-target }})
-        run: RUSTFLAGS=-Awarnings cargo test --test ${{ matrix.test-target }} -- --test-threads=1 --nocapture
+        run: |
+          export RUSTFLAGS=-Awarnings
+          cargo test --test ${{ matrix.test-target }} -- --nocapture

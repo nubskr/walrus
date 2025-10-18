@@ -13,6 +13,7 @@ env:
   WALRUS_QUIET: "1"
   WALRUS_FSYNC: "500"
   WALRUS_DURATION: "2m"
+  RUST_TEST_THREADS: "16"
 
 jobs:
   multithreaded-writes-benchmark:
@@ -45,7 +46,8 @@ jobs:
           echo "  - Threads: 10"
           echo "  - Duration: 2m"
           echo ""
-          RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_writes multithreaded_benchmark -- --test-threads=1 --nocapture
+          export RUSTFLAGS=-Awarnings
+          cargo test --test multithreaded_benchmark_writes multithreaded_benchmark -- --nocapture
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
