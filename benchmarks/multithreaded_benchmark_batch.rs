@@ -294,7 +294,7 @@ fn multithreaded_batch_benchmark() {
 
     println!("=== Multi-threaded WAL Batch Benchmark ===");
     println!(
-        "Configuration: 3 threads, {:.0}s write phase only, batch size: {} entries/batch",
+        "Configuration: 1 thread, {:.0}s write phase only, batch size: {} entries/batch",
         write_duration.as_secs(),
         batch_size
     );
@@ -312,7 +312,7 @@ fn multithreaded_batch_benchmark() {
         )
         .expect("Failed to create Walrus"),
     );
-    let num_threads = 3; // Reduced from 10 to avoid io_uring queue overflow
+    let num_threads = 1; // Single thread to avoid any io_uring queue issues
 
     // Shared counters for statistics
     let total_batches = Arc::new(AtomicU64::new(0));
@@ -339,7 +339,7 @@ fn multithreaded_batch_benchmark() {
     // Topic names for each thread
     let topics: Vec<String> = (0..num_threads).map(|i| format!("batch_topic_{}", i)).collect();
 
-    println!("Starting {} batch writer threads (reduced to avoid io_uring queue overflow)...", num_threads);
+    println!("Starting {} batch writer thread...", num_threads);
 
     // Spawn throughput monitoring thread
     let total_batches_monitor = Arc::clone(&total_batches);

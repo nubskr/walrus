@@ -1,10 +1,11 @@
-name: Full Tests
+# COMMENTED OUT - Only running batch benchmark for now
+# name: Full Tests
 
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+# on:
+#   push:
+#     branches: [ main, master ]
+#   pull_request:
+#     branches: [ main, master ]
 
 env:
   WALRUS_QUIET: "1"

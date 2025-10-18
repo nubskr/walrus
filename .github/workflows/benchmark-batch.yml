@@ -42,7 +42,7 @@ jobs:
           echo "Running batch writes benchmark with:"
           echo "  - Fsync schedule: 500ms"
           echo "  - Read consistency: 5000 (persist_every) - configured in benchmark code"
-          echo "  - Threads: 3 (reduced to avoid io_uring queue overflow)"
+          echo "  - Threads: 1 (single thread)"
           echo "  - Duration: 2m"
           echo "  - Batch size: 2,500,000 entries per batch"
           echo "  - Uses batch_append_for_topic() for atomic batch writes"
