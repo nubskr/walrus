@@ -30,8 +30,7 @@ fn parse_thread_range() -> (usize, usize) {
         if args[i] == "--threads" && i + 1 < args.len() {
             let threads_arg = &args[i + 1];
             if let Some((start_str, end_str)) = threads_arg.split_once('-') {
-                if let (Ok(start), Ok(end)) =
-                    (start_str.parse::<usize>(), end_str.parse::<usize>())
+                if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>())
                 {
                     if start > 0 && end >= start && end <= 128 {
                         return (start, end);
@@ -116,9 +115,73 @@ fn parse_batch_size() -> usize {
     256
 }
 
+fn parse_storage_backend() -> Option<String> {
+    fn normalize(value: &str) -> Option<String> {
+        match value.to_ascii_lowercase().as_str() {
+            "fd" | "io_uring" | "uring" | "file" => Some("fd".to_string()),
+            "mmap" | "memory" => Some("mmap".to_string()),
+            _ => None,
+        }
+    }
+
+    if let Ok(backend_env) = env::var("WALRUS_BACKEND") {
+        if let Some(norm) = normalize(&backend_env) {
+            return Some(norm);
+        }
+    }
+
+    let args: Vec<String> = env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--backend" && i + 1 < args.len() {
+            if let Some(norm) = normalize(&args[i + 1]) {
+                return Some(norm);
+            }
+        }
+    }
+
+    None
+}
+
+fn configure_storage_backend() {
+    let selection = parse_storage_backend();
+    #[cfg(target_os = "linux")]
+    {
+        match selection.as_deref() {
+            Some("mmap") => {
+                walrus_rust::disable_fd_backend();
+                println!("Storage backend: mmap");
+            }
+            Some("fd") | Some("io_uring") | Some("uring") | Some("file") | None => {
+                walrus_rust::enable_fd_backend();
+                println!("Storage backend: fd");
+            }
+            Some(other) => {
+                println!(
+                    "Unknown storage backend '{}'; defaulting to fd (io_uring) backend.",
+                    other
+                );
+                walrus_rust::enable_fd_backend();
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(choice) = selection {
+            println!(
+                "Storage backend '{}' requested, but only the mmap backend is available on this platform.",
+                choice
+            );
+        }
+    }
+}
+
 fn print_usage() {
-    println!("Usage: WALRUS_FSYNC=<schedule> WALRUS_THREADS=<range> WALRUS_BATCH_SIZE=<entries>");
-    println!("       cargo test batch_scaling_benchmark -- --fsync <schedule> --threads <range> --batch-size <entries>");
+    println!(
+        "Usage: WALRUS_FSYNC=<schedule> WALRUS_THREADS=<range> WALRUS_BATCH_SIZE=<entries> WALRUS_BACKEND=<fd|mmap>"
+    );
+    println!(
+        "       cargo test batch_scaling_benchmark -- --fsync <schedule> --threads <range> --batch-size <entries> --backend <fd|mmap>"
+    );
     println!();
     println!("Fsync Schedule Options:");
     println!("  sync-each    Fsync after every write (slowest, most durable)");
@@ -136,8 +199,15 @@ fn print_usage() {
     println!("Batch Size Options:");
     println!("  <number>     Entries per batch (1-10000, default: 256)");
     println!();
+    println!("Storage Backend Options (Linux only):");
+    println!("  fd           Use fd/io_uring backend (default)");
+    println!("  mmap         Use memory-mapped backend");
+    println!("  Set via WALRUS_BACKEND=<fd|mmap> or --backend <value>");
+    println!();
     println!("Examples:");
-    println!("  WALRUS_FSYNC=sync-each WALRUS_THREADS=12 WALRUS_BATCH_SIZE=128 cargo test batch_scaling_benchmark");
+    println!(
+        "  WALRUS_FSYNC=sync-each WALRUS_THREADS=12 WALRUS_BATCH_SIZE=128 cargo test batch_scaling_benchmark"
+    );
     println!("  WALRUS_THREADS=4-32 cargo test batch_scaling_benchmark -- --batch-size 512");
     println!("  make bench-batch-scaling  # Uses Makefile convenience target");
 }
@@ -159,9 +229,6 @@ struct BatchScalingResult {
 
 fn run_benchmark_with_threads(num_threads: usize, batch_size: usize) -> BatchScalingResult {
     cleanup_wal();
-
-    #[cfg(target_os = "linux")]
-    walrus_rust::enable_fd_backend();
 
     unsafe {
         std::env::set_var("WALRUS_QUIET", "1");
@@ -237,8 +304,7 @@ fn run_benchmark_with_threads(num_threads: usize, batch_size: usize) -> BatchSca
                         local_bytes += batch_bytes as u64;
 
                         total_batches_clone.fetch_add(1, Ordering::Relaxed);
-                        total_entries_clone
-                            .fetch_add(batch_size as u64, Ordering::Relaxed);
+                        total_entries_clone.fetch_add(batch_size as u64, Ordering::Relaxed);
                         total_bytes_clone.fetch_add(batch_bytes as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -315,12 +381,17 @@ fn batch_scaling_benchmark() {
     let (start_threads, end_threads) = parse_thread_range();
     let batch_size = parse_batch_size();
 
+    configure_storage_backend();
+
     println!("=== WAL Batch Scaling Benchmark ===");
     println!(
         "Testing batch throughput scaling from {} to {} threads",
         start_threads, end_threads
     );
-    println!("Each test runs for 30 seconds with batch size {}", batch_size);
+    println!(
+        "Each test runs for 30 seconds with batch size {}",
+        batch_size
+    );
     println!("Fsync schedule: {:?}", fsync_schedule);
     println!();
 
@@ -374,7 +445,10 @@ fn batch_scaling_benchmark() {
         .iter()
         .map(|(_, res)| res.entries_per_sec)
         .fold(0.0_f64, f64::max);
-    let baseline = results.first().map(|(_, res)| res.entries_per_sec).unwrap_or(0.0);
+    let baseline = results
+        .first()
+        .map(|(_, res)| res.entries_per_sec)
+        .unwrap_or(0.0);
 
     assert!(
         best > baseline,
@@ -389,10 +463,6 @@ fn batch_scaling_benchmark() {
     println!(
         "Best entries throughput: {:.0} entries/sec ({:.1}x over single thread)",
         best,
-        if baseline > 0.0 {
-            best / baseline
-        } else {
-            0.0
-        }
+        if baseline > 0.0 { best / baseline } else { 0.0 }
     );
 }

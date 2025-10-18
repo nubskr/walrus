@@ -181,6 +181,7 @@ backends.
 - **`WALRUS_DURATION`**: Configure benchmark duration for both write and read phases (`30s`, `2m`, `1h`)
 - **`WALRUS_WRITE_DURATION`**: Configure write phase duration specifically (`1m`, `120s`)
 - **`WALRUS_READ_DURATION`**: Configure read phase duration specifically (`2m`, `180s`)
+- **`WALRUS_BATCH_SIZE`**: Override entries per batch for batch benchmarks (default 2000 for `multithreaded_benchmark_batch`, 256 for `batch_scaling_benchmark`)
 
 ```bash
 export WALRUS_QUIET=1                    # Suppress debug messages
@@ -191,6 +192,7 @@ export WALRUS_THREADS=2-8                # Test scaling from 2 to 8 threads
 export WALRUS_DURATION=30s               # Run benchmarks for 30 seconds
 export WALRUS_WRITE_DURATION=2m          # 2 minute write phase
 export WALRUS_READ_DURATION=1m           # 1 minute read phase
+export WALRUS_BATCH_SIZE=512             # Use 512 entries per batch in batch benchmarks
 ```
 
 ## File Structure and Storage
@@ -356,6 +358,7 @@ FSYNC=500ms make bench-reads               # Custom fsync interval
 THREADS=16 make bench-scaling              # Test up to 16 threads
 THREADS=2-8 make bench-scaling-sync        # Test 2-8 threads with sync-each
 FSYNC=250ms THREADS=32 make bench-scaling  # Combined custom settings
+BATCH=512 make bench-batch-scaling         # Override batch size (default 256 entries)
 
 # Show results
 make show-writes       # Visualize write results
@@ -383,6 +386,8 @@ WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --noc
 WALRUS_FSYNC=500ms cargo test --test multithreaded_benchmark_reads -- --nocapture
 WALRUS_THREADS=16 cargo test --test scaling_benchmark -- --nocapture
 WALRUS_FSYNC=sync-each WALRUS_THREADS=2-8 cargo test --test scaling_benchmark -- --nocapture
+WALRUS_BATCH_SIZE=512 cargo test --test multithreaded_benchmark_batch -- --nocapture
+cargo test --test multithreaded_benchmark_batch -- --nocapture -- --batch-size 512
 ```
 
 ### Benchmark Configuration Options
@@ -429,6 +434,12 @@ Configure how many threads to test in the scaling benchmark:
 - **Default**: `1-10` threads
 - **Maximum**: 128 threads
 
+#### Batch Size Configuration (Batch Benchmarks)
+
+- `WALRUS_BATCH_SIZE` sets entries per batch for batch-focused benchmarks; defaults are 2000 for `multithreaded_benchmark_batch` and 256 for `batch_scaling_benchmark`.
+- `BATCH=<entries>` on `make bench-batch-scaling` forwards to `WALRUS_BATCH_SIZE` for convenience.
+- `cargo test --test multithreaded_benchmark_batch -- --batch-size <entries>` overrides the batch size without environment variables.
+
 #### Configuration Methods
 
 **Environment Variables (Recommended for Makefile):**
@@ -439,6 +450,7 @@ export WALRUS_THREADS=16             # Set thread range
 export WALRUS_DURATION=30s           # Set benchmark duration
 export WALRUS_WRITE_DURATION=2m      # Set write phase duration
 export WALRUS_READ_DURATION=1m       # Set read phase duration
+export WALRUS_BATCH_SIZE=512         # Set entries per batch (batch benchmarks)
 ```
 
 **Makefile Parameters:**

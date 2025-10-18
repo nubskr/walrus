@@ -200,6 +200,66 @@ fn parse_duration() -> Duration {
     Duration::from_secs(120)
 }
 
+fn parse_storage_backend() -> Option<String> {
+    fn normalize(value: &str) -> Option<String> {
+        match value.to_ascii_lowercase().as_str() {
+            "fd" | "io_uring" | "uring" | "file" => Some("fd".to_string()),
+            "mmap" | "memory" => Some("mmap".to_string()),
+            _ => None,
+        }
+    }
+
+    if let Ok(backend_env) = env::var("WALRUS_BACKEND") {
+        if let Some(norm) = normalize(&backend_env) {
+            return Some(norm);
+        }
+    }
+
+    let args: Vec<String> = env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--backend" && i + 1 < args.len() {
+            if let Some(norm) = normalize(&args[i + 1]) {
+                return Some(norm);
+            }
+        }
+    }
+
+    None
+}
+
+fn configure_storage_backend() {
+    let selection = parse_storage_backend();
+    #[cfg(target_os = "linux")]
+    {
+        match selection.as_deref() {
+            Some("mmap") => {
+                walrus_rust::disable_fd_backend();
+                println!("Storage backend: mmap");
+            }
+            Some("fd") | Some("io_uring") | Some("uring") | Some("file") | None => {
+                walrus_rust::enable_fd_backend();
+                println!("Storage backend: fd");
+            }
+            Some(other) => {
+                println!(
+                    "Unknown storage backend '{}'; defaulting to fd (io_uring) backend.",
+                    other
+                );
+                walrus_rust::enable_fd_backend();
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(choice) = selection {
+            println!(
+                "Storage backend '{}' requested, but only the mmap backend is available on this platform.",
+                choice
+            );
+        }
+    }
+}
+
 fn parse_duration_string(duration_str: &str) -> Option<Duration> {
     if duration_str.ends_with("s") {
         // Parse seconds: "30s", "120s"
@@ -225,10 +285,10 @@ fn parse_duration_string(duration_str: &str) -> Option<Duration> {
 
 fn print_usage() {
     println!(
-        "Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> WALRUS_BATCH_SIZE=<size> cargo test multithreaded_benchmark_batch"
+        "Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> WALRUS_BATCH_SIZE=<size> WALRUS_BACKEND=<fd|mmap> cargo test multithreaded_benchmark_batch"
     );
     println!(
-        "   or: cargo test multithreaded_benchmark_batch -- --fsync <schedule> --duration <duration> --batch-size <size>"
+        "   or: cargo test multithreaded_benchmark_batch -- --fsync <schedule> --duration <duration> --batch-size <size> --backend <fd|mmap>"
     );
     println!();
     println!("Fsync Schedule Options:");
@@ -241,6 +301,11 @@ fn print_usage() {
     println!();
     println!("Batch Size Options:");
     println!("  <number>     Number of entries per batch (1-10000000, default: 2047)");
+    println!();
+    println!("Storage Backend Options (Linux only):");
+    println!("  fd           Use fd/io_uring backend (default)");
+    println!("  mmap         Use memory-mapped backend");
+    println!("  Set via WALRUS_BACKEND=<fd|mmap> or --backend <value>");
     println!();
     println!("Duration Options:");
     println!("  <number>s    Duration in seconds (e.g., 30s, 120s)");
@@ -262,7 +327,7 @@ fn print_usage() {
     );
     println!();
     println!(
-        "Note: This benchmark uses batch_append_for_topic() which requires FD backend on Linux."
+        "Note: On Linux the fd/io_uring backend is used by default; pass WALRUS_BACKEND=mmap or --backend mmap to compare mmap performance."
     );
 }
 
@@ -283,9 +348,7 @@ fn multithreaded_batch_benchmark() {
 
     cleanup_wal();
 
-    // Enable FD backend for batch operations (Linux only)
-    #[cfg(target_os = "linux")]
-    walrus_rust::enable_fd_backend();
+    configure_storage_backend();
 
     // Enable quiet mode to suppress debug output during benchmark
     unsafe {
