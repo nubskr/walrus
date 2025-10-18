@@ -42,9 +42,9 @@ jobs:
           echo "Running batch writes benchmark with:"
           echo "  - Fsync schedule: 500ms"
           echo "  - Read consistency: 5000 (persist_every) - configured in benchmark code"
-          echo "  - Threads: 10"
+          echo "  - Threads: 5"
           echo "  - Duration: 2m"
-          echo "  - Batch size: 450 entries per batch (5MB each = ~2.25GB total)"
+          echo "  - Batch size: 450 entries per batch (1MB each = ~450MB total)"
           echo "  - Uses batch_append_for_topic() for atomic batch writes"
           echo ""
           RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_batch -- --test-threads=1 --nocapture
