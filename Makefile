@@ -1,4 +1,4 @@
-.PHONY: help bench-writes bench-reads bench-scaling show-writes show-reads show-scaling live-writes live-scaling clean
+.PHONY: help bench-writes bench-reads bench-scaling bench-batch-scaling show-writes show-reads show-scaling show-batch-writes show-batch-scaling live-writes live-scaling clean
 .PHONY: bench-writes-sync bench-reads-sync bench-scaling-sync bench-writes-fast bench-reads-fast bench-scaling-fast
 
 help:
@@ -9,6 +9,7 @@ help:
 	@echo "  bench-writes    Run write-only benchmark (2 min)"
 	@echo "  bench-reads     Run read benchmark (1 min write + 2 min read)"
 	@echo "  bench-scaling   Run scaling benchmark across thread counts"
+	@echo "  bench-batch-scaling   Run batch scaling benchmark across thread counts"
 	@echo ""
 	@echo "Benchmarks (Sync each write - most durable, slowest):"
 	@echo "  bench-writes-sync    Run write benchmark with sync-each"
@@ -25,11 +26,14 @@ help:
 	@echo ""
 	@echo "Custom thread count (scaling benchmark only):"
 	@echo "  THREADS=<range> make bench-scaling   # e.g., THREADS=16 or THREADS=2-8"
+	@echo "  THREADS=<range> make bench-batch-scaling   # e.g., THREADS=8 or THREADS=4-16"
+	@echo "  BATCH=<entries> make bench-batch-scaling   # override batch size (default 256)"
 	@echo ""
 	@echo "Visualization:"
 	@echo "  show-writes     Show write benchmark results"
 	@echo "  show-reads      Show read benchmark results"
 	@echo "  show-scaling    Show scaling benchmark results"
+	@echo "  show-batch-scaling Show batch scaling benchmark results"
 	@echo "  live-writes     Live monitoring of write benchmark"
 	@echo "  live-scaling    Live monitoring of scaling benchmark"
 	@echo ""
@@ -137,6 +141,14 @@ show-scaling:
 	fi
 	python3 scripts/show_scaling_graph_writes.py
 
+show-batch-writes:
+	@echo "Showing batch benchmark results..."
+	@if [ ! -f batch_benchmark_throughput.csv ]; then \
+		echo "batch_benchmark_throughput.csv not found. Run 'cargo test multithreaded_batch_benchmark -- --nocapture' first."; \
+		exit 1; \
+	fi
+	python3 scripts/visualize_batch_benchmark.py
+
 # Live monitoring targets
 live-writes:
 	@echo "Starting live write benchmark monitoring..."
@@ -171,3 +183,19 @@ bench-and-show-scaling-sync: bench-scaling-sync show-scaling
 bench-and-show-writes-fast: bench-writes-fast show-writes
 bench-and-show-reads-fast: bench-reads-fast show-reads
 bench-and-show-scaling-fast: bench-scaling-fast show-scaling
+bench-batch-scaling:
+	@echo "Running batch scaling benchmark (default: 1-10 threads, async 1000ms fsync, 256 entries/batch)..."
+	@bash -c '\
+		set -e; \
+		if [ -n "$(FSYNC)" ]; then export WALRUS_FSYNC="$(FSYNC)"; fi; \
+		if [ -n "$(THREADS)" ]; then export WALRUS_THREADS="$(THREADS)"; fi; \
+		if [ -n "$(BATCH)" ]; then export WALRUS_BATCH_SIZE="$(BATCH)"; fi; \
+		cargo test --test batch_scaling_benchmark -- --nocapture \
+	'
+show-batch-scaling:
+	@echo "Showing batch scaling benchmark results..."
+	@if [ ! -f batch_scaling_results.csv ]; then \
+		echo "batch_scaling_results.csv not found. Run 'make bench-batch-scaling' first."; \
+		exit 1; \
+	fi
+	python3 scripts/show_batch_scaling_graph.py

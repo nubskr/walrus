@@ -1,4 +1,5 @@
 *.py
+!scripts/*.py
 .DS_Store
 /target
 /wal_files
