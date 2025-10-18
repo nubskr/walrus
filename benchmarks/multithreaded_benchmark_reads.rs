@@ -307,6 +307,8 @@ fn multithreaded_read_benchmark() {
         .expect("Failed to create Walrus"),
     );
     let num_threads = 10;
+    const WRITE_BATCH_ENTRIES: usize = 32;
+    const READ_BATCH_MAX_BYTES: usize = 512 * 1024;
 
     // Shared counters for statistics
     let total_writes = Arc::new(AtomicU64::new(0));
@@ -562,46 +564,62 @@ fn multithreaded_read_benchmark() {
             // Write phase - start slow and ramp up to simulate realistic workload
             let mut rng = rand::thread_rng();
             let ramp_up_duration = write_duration.mul_f64(0.15); // 15% of total duration for ramp-up
+            let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_ENTRIES);
 
             while write_start_time.elapsed() < write_duration {
-                // Calculate current write rate based on ramp-up
-                let elapsed = write_start_time.elapsed();
-                let delay_ms = if elapsed < ramp_up_duration {
-                    // Ramp up from 50ms delay to 0ms delay over ramp_up_duration
-                    let ramp_progress = elapsed.as_secs_f64() / ramp_up_duration.as_secs_f64();
-                    let max_delay_ms = 50.0;
-                    max_delay_ms * (1.0 - ramp_progress)
-                } else {
-                    // Full speed after ramp-up
-                    0.0
-                };
+                payloads.clear();
+                let mut batch_bytes = 0u64;
 
-                // Apply the delay if we're still ramping up
-                if delay_ms > 0.1 {
-                    thread::sleep(Duration::from_millis(delay_ms as u64));
+                while payloads.len() < WRITE_BATCH_ENTRIES && write_start_time.elapsed() < write_duration
+                {
+                    // Calculate current write rate based on ramp-up
+                    let elapsed = write_start_time.elapsed();
+                    let delay_ms = if elapsed < ramp_up_duration {
+                        // Ramp up from 50ms delay to 0ms delay over ramp_up_duration
+                        let ramp_progress = elapsed.as_secs_f64() / ramp_up_duration.as_secs_f64();
+                        let max_delay_ms = 50.0;
+                        max_delay_ms * (1.0 - ramp_progress)
+                    } else {
+                        // Full speed after ramp-up
+                        0.0
+                    };
+
+                    // Apply the delay if we're still ramping up
+                    if delay_ms > 0.1 {
+                        thread::sleep(Duration::from_millis(delay_ms as u64));
+                    }
+
+                    // Random entry size between 500B and 1KB
+                    let size = rng.gen_range(500..=1024);
+                    let data = vec![(counter % 256) as u8; size];
+                    batch_bytes += data.len() as u64;
+                    payloads.push(data);
+                    counter += 1;
+
+                    // Small gap after every 50k writes for more sustainable writing
+                    if counter % 50000 == 0 {
+                        thread::sleep(Duration::from_micros(100));
+                    }
                 }
 
-                // Random entry size between 500B and 1KB
-                let size = rng.gen_range(500..=1024);
-                let data = vec![(counter % 256) as u8; size];
+                if payloads.is_empty() {
+                    break;
+                }
 
-                match wal_clone.append_for_topic(&topic, &data) {
+                let batch_refs: Vec<&[u8]> =
+                    payloads.iter().map(|payload| payload.as_slice()).collect();
+
+                match wal_clone.batch_append_for_topic(&topic, &batch_refs) {
                     Ok(_) => {
-                        local_writes += 1;
-                        local_write_bytes += data.len() as u64;
-                        total_writes_clone.fetch_add(1, Ordering::Relaxed);
-                        total_write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        let batch_count = payloads.len() as u64;
+                        local_writes += batch_count;
+                        local_write_bytes += batch_bytes;
+                        total_writes_clone.fetch_add(batch_count, Ordering::Relaxed);
+                        total_write_bytes_clone.fetch_add(batch_bytes, Ordering::Relaxed);
                     }
                     Err(_) => {
-                        local_write_errors += 1;
+                        local_write_errors += payloads.len() as u64;
                     }
-                }
-
-                counter += 1;
-
-                // Small gap after every 50k writes for more sustainable writing
-                if counter % 50000 == 0 {
-                    thread::sleep(Duration::from_micros(100));
                 }
             }
 
@@ -629,22 +647,28 @@ fn multithreaded_read_benchmark() {
 
             // Read phase - consume all written data and continue reading
             while read_start_time.elapsed() < read_duration {
-                match wal_clone.read_next(&topic, true) {
-                    Ok(Some(entry)) => {
-                        local_reads += 1;
-                        local_read_bytes += entry.data.len() as u64;
-                        total_reads_clone.fetch_add(1, Ordering::Relaxed);
-                        total_read_bytes_clone
-                            .fetch_add(entry.data.len() as u64, Ordering::Relaxed);
-                        consecutive_nulls = 0;
-                    }
-                    Ok(None) => {
-                        consecutive_nulls += 1;
-                        // If we've caught up, sleep briefly to avoid spinning
-                        if consecutive_nulls > 10 {
-                            thread::sleep(Duration::from_micros(100));
-                            consecutive_nulls = 0;
+                match wal_clone.batch_read_for_topic(&topic, READ_BATCH_MAX_BYTES, true) {
+                    Ok(batch) => {
+                        if batch.is_empty() {
+                            consecutive_nulls += 1;
+                            if consecutive_nulls > 10 {
+                                thread::sleep(Duration::from_micros(100));
+                                consecutive_nulls = 0;
+                            }
+                            continue;
                         }
+
+                        consecutive_nulls = 0;
+                        let batch_count = batch.len() as u64;
+                        let mut batch_bytes = 0u64;
+                        for entry in batch {
+                            let len = entry.data.len() as u64;
+                            batch_bytes += len;
+                            local_reads += 1;
+                            local_read_bytes += len;
+                        }
+                        total_reads_clone.fetch_add(batch_count, Ordering::Relaxed);
+                        total_read_bytes_clone.fetch_add(batch_bytes, Ordering::Relaxed);
                     }
                     Err(_) => {
                         local_read_errors += 1;
