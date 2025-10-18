@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 // Global flag to choose backend
@@ -41,12 +41,33 @@ pub(crate) const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
 pub(crate) const MAX_BATCH_ENTRIES: usize = 2000;
 pub(crate) const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total payload limit
 
+static LAST_MILLIS: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn now_millis_str() -> String {
-    let ms = SystemTime::now()
+    let system_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_millis();
-    ms.to_string()
+
+    let mut observed = LAST_MILLIS.load(Ordering::Relaxed);
+    loop {
+        let system_ms_u64 = system_ms.try_into().unwrap_or(u64::MAX);
+        let candidate = if system_ms_u64 <= observed {
+            observed.saturating_add(1)
+        } else {
+            system_ms_u64
+        };
+
+        match LAST_MILLIS.compare_exchange(
+            observed,
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return candidate.to_string(),
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 pub(crate) fn checksum64(data: &[u8]) -> u64 {
