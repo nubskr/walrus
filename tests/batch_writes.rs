@@ -799,7 +799,13 @@ fn test_chaos_sequential_batches_with_crashes() {
 
         // Simulate crash
         drop(wal);
+
+        // Small delay to ensure background threads complete
+        thread::sleep(Duration::from_millis(100));
     }
+
+    // Extra delay before final recovery to ensure all async operations complete
+    thread::sleep(Duration::from_millis(200));
 
     // Final recovery: should see all 5 cycles × 2 entries = 10 entries
     let wal = Walrus::with_consistency_and_schedule(
