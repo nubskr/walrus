@@ -38,3 +38,7 @@ path = "benchmarks/multithreaded_benchmark_reads.rs"
 [[test]]
 name = "scaling_benchmark"
 path = "benchmarks/scaling_benchmark.rs"
+
+[[test]]
+name = "multithreaded_benchmark_batch"
+path = "benchmarks/multithreaded_benchmark_batch.rs"

@@ -47,7 +47,7 @@ jobs:
           echo "  - Batch size: 100 entries per batch"
           echo "  - Uses batch_append_for_topic() for atomic batch writes"
           echo ""
-          RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_batch multithreaded_batch_benchmark -- --test-threads=1 --nocapture
+          RUSTFLAGS=-Awarnings cargo test --test multithreaded_benchmark_batch -- --test-threads=1 --nocapture
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
