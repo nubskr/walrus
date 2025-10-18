@@ -1,4 +1,4 @@
-.PHONY: help bench-writes bench-reads bench-scaling bench-batch-scaling show-writes show-reads show-scaling show-batch-writes show-batch-scaling live-writes live-scaling clean
+.PHONY: help bench-writes bench-reads bench-scaling bench-batch-scaling show-writes show-reads show-scaling show-batch-writes show-batch-scaling live-writes live-scaling clean bench-walrus-vs-rocksdb
 .PHONY: bench-writes-sync bench-reads-sync bench-scaling-sync bench-writes-fast bench-reads-fast bench-scaling-fast
 
 help:
@@ -10,6 +10,7 @@ help:
 	@echo "  bench-reads     Run read benchmark (1 min write + 2 min read)"
 	@echo "  bench-scaling   Run scaling benchmark across thread counts"
 	@echo "  bench-batch-scaling   Run batch scaling benchmark across thread counts"
+	@echo "  bench-walrus-vs-rocksdb   Run Walrus + RocksDB WAL benchmarks and plot comparison"
 	@echo ""
 	@echo "Benchmarks (Sync each write - most durable, slowest):"
 	@echo "  bench-writes-sync    Run write benchmark with sync-each"
@@ -278,6 +279,19 @@ bench-batch-scaling:
 		if [ -n "$(BACKEND)" ]; then export WALRUS_BACKEND="$(BACKEND)"; fi; \
 		cargo test --release --test batch_scaling_benchmark -- --nocapture \
 	'
+
+bench-walrus-vs-rocksdb:
+	@echo "Running Walrus write benchmark (baseline)..."
+	@$(MAKE) bench-writes FSYNC="$(FSYNC)" BACKEND="$(BACKEND)"
+	@echo "Running RocksDB WAL benchmark..."
+	@bash -c '\
+		set -e; \
+		if [ -n "$(FSYNC)" ]; then export WALRUS_FSYNC="$(FSYNC)"; fi; \
+		if [ -n "$(DURATION)" ]; then export WALRUS_DURATION="$(DURATION)"; fi; \
+		cargo test --release --test rocksdb_multithreaded_benchmark_writes -- --nocapture \
+	'
+	@echo "Generating Walrus vs RocksDB comparison plot..."
+	@python3 scripts/compare_walrus_rocksdb.py --walrus benchmark_throughput.csv --rocksdb rocksdb_benchmark_throughput.csv --out walrus_vs_rocksdb.png
 show-batch-scaling:
 	@echo "Showing batch scaling benchmark results..."
 	@if [ ! -f batch_scaling_results.csv ]; then \

@@ -359,6 +359,7 @@ THREADS=16 make bench-scaling              # Test up to 16 threads
 THREADS=2-8 make bench-scaling-sync        # Test 2-8 threads with sync-each
 FSYNC=250ms THREADS=32 make bench-scaling  # Combined custom settings
 BATCH=512 make bench-batch-scaling         # Override batch size (default 256 entries)
+make bench-walrus-vs-rocksdb               # Run Walrus + RocksDB benchmarks and plot comparison
 
 # Show results
 make show-writes       # Visualize write results
@@ -582,6 +583,7 @@ The `scripts/` directory contains Python visualization tools:
 - `show_reads_graph.py` - Read benchmark graphs  
 - `show_scaling_graph_writes.py` - Scaling results
 - `live_scaling_plot.py` - Live scaling monitoring
+- `compare_walrus_rocksdb.py` - Overlay Walrus vs RocksDB benchmark throughput
 
 Requirements: `pandas`, `matplotlib`
 
