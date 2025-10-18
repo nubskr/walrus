@@ -285,7 +285,7 @@ fn multithreaded_read_benchmark() {
     let (write_duration, read_duration) = parse_duration();
 
     println!("=== Multi-threaded WAL Read Benchmark ===");
-    let num_threads = 16;
+    let num_threads = 5;
     println!(
         "Configuration: {} threads, {:.0}s write phase + {:.0}s read phase",
         num_threads,
@@ -528,8 +528,6 @@ fn multithreaded_read_benchmark() {
             let mut local_write_errors = 0u64;
             let mut counter = 0u64;
 
-            // Write phase - start slow and ramp up to simulate realistic workload
-            let ramp_up_duration = write_duration.mul_f64(0.15); // 15% of total duration for ramp-up
             let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_ENTRIES);
 
             while write_start_time.elapsed() < write_duration {
@@ -539,33 +537,11 @@ fn multithreaded_read_benchmark() {
                 while payloads.len() < WRITE_BATCH_ENTRIES
                     && write_start_time.elapsed() < write_duration
                 {
-                    // Calculate current write rate based on ramp-up
-                    let elapsed = write_start_time.elapsed();
-                    let delay_ms = if elapsed < ramp_up_duration {
-                        // Ramp up from 50ms delay to 0ms delay over ramp_up_duration
-                        let ramp_progress = elapsed.as_secs_f64() / ramp_up_duration.as_secs_f64();
-                        let max_delay_ms = 50.0;
-                        max_delay_ms * (1.0 - ramp_progress)
-                    } else {
-                        // Full speed after ramp-up
-                        0.0
-                    };
-
-                    // Apply the delay if we're still ramping up
-                    if delay_ms > 0.1 {
-                        thread::sleep(Duration::from_millis(delay_ms as u64));
-                    }
-
                     // Fixed entry size of 100KB
                     let data = vec![(counter % 256) as u8; ENTRY_SIZE_BYTES];
                     batch_bytes += data.len() as u64;
                     payloads.push(data);
                     counter += 1;
-
-                    // Small gap after every 50k writes for more sustainable writing
-                    if counter % 50000 == 0 {
-                        thread::sleep(Duration::from_micros(100));
-                    }
                 }
 
                 if payloads.is_empty() {
@@ -609,22 +585,14 @@ fn multithreaded_read_benchmark() {
             let mut local_reads = 0u64;
             let mut local_read_bytes = 0u64;
             let mut local_read_errors = 0u64;
-            let mut consecutive_nulls = 0u32;
-
             // Read phase - consume all written data and continue reading
             while read_start_time.elapsed() < read_duration {
                 match wal_clone.batch_read_for_topic(&topic, READ_BATCH_MAX_BYTES, true) {
                     Ok(batch) => {
                         if batch.is_empty() {
-                            consecutive_nulls += 1;
-                            if consecutive_nulls > 10 {
-                                thread::sleep(Duration::from_micros(100));
-                                consecutive_nulls = 0;
-                            }
                             continue;
                         }
 
-                        consecutive_nulls = 0;
                         let batch_count = batch.len() as u64;
                         let mut batch_bytes = 0u64;
                         for entry in batch {
@@ -638,11 +606,6 @@ fn multithreaded_read_benchmark() {
                     }
                     Err(_) => {
                         local_read_errors += 1;
-                        consecutive_nulls += 1;
-                        if consecutive_nulls > 100 {
-                            thread::sleep(Duration::from_millis(1));
-                            consecutive_nulls = 0;
-                        }
                     }
                 }
             }
