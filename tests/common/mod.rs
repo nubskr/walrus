@@ -51,6 +51,9 @@ impl TestEnv {
             .unwrap_or_else(|e| e.into_inner());
 
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Ensure WAL_DATA_DIR is stable across tests so hardened keys can resolve consistently.
+        // We keep a single temp directory per process and clean it in Drop.
+        static GLOBAL_DIR: OnceLock<PathBuf> = OnceLock::new();
         let unique = format!(
             "walrus-test-{}-{}-{}",
             std::process::id(),
@@ -60,7 +63,9 @@ impl TestEnv {
                 .as_nanos(),
             counter
         );
-        let dir = std::env::temp_dir().join(unique);
+        let dir = GLOBAL_DIR
+            .get_or_init(|| std::env::temp_dir().join(unique))
+            .clone();
 
         let namespace_key = format!(
             "test-key-{:x}-{:x}-{:x}",
