@@ -21,7 +21,7 @@ fn test_strictly_at_once_consistency() {
     wal.append_for_topic("test", b"msg1").unwrap();
     wal.append_for_topic("test", b"msg2").unwrap();
 
-    let entry1 = wal.read_next("test").unwrap().unwrap();
+    let entry1 = wal.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry1.data, b"msg1");
 
     drop(wal);
@@ -30,7 +30,7 @@ fn test_strictly_at_once_consistency() {
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let entry2 = wal2.read_next("test").unwrap().unwrap();
+    let entry2 = wal2.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
 }
 
@@ -51,7 +51,7 @@ fn test_fsync_schedule() {
     )
     .unwrap();
     wal.append_for_topic("test", b"data").unwrap();
-    let entry = wal.read_next("test").unwrap().unwrap();
+    let entry = wal.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry.data, b"data");
 }
 
@@ -69,17 +69,17 @@ fn test_fsync_schedule_sync_each() {
     wal.append_for_topic("sync_each_test", b"msg2").unwrap();
     wal.append_for_topic("sync_each_test", b"msg3").unwrap();
 
-    let entry1 = wal.read_next("sync_each_test").unwrap().unwrap();
+    let entry1 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry1.data, b"msg1");
 
-    let entry2 = wal.read_next("sync_each_test").unwrap().unwrap();
+    let entry2 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
 
-    let entry3 = wal.read_next("sync_each_test").unwrap().unwrap();
+    let entry3 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry3.data, b"msg3");
 
     // Verify no more entries
-    assert!(wal.read_next("sync_each_test").unwrap().is_none());
+    assert!(wal.read_next("sync_each_test", true).unwrap().is_none());
 }
 
 #[test]
@@ -111,10 +111,10 @@ fn test_crash_recovery_strictly_at_once() {
                 .unwrap();
         }
 
-        let entry1 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry1.data, b"recovery_msg_1");
 
-        let entry2 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry2 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry2.data, b"recovery_msg_2");
     }
 
@@ -124,16 +124,16 @@ fn test_crash_recovery_strictly_at_once() {
     {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-        let entry3 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry3 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry3.data, b"recovery_msg_3");
 
-        let entry4 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry4 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry4.data, b"recovery_msg_4");
 
-        let entry5 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry5 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry5.data, b"recovery_msg_5");
 
-        assert!(wal.read_next("recovery_test").unwrap().is_none());
+        assert!(wal.read_next("recovery_test", true).unwrap().is_none());
     }
 }
 
@@ -151,10 +151,10 @@ fn test_crash_recovery_at_least_once() {
                 .unwrap();
         }
 
-        let entry1 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry1.data, b"at_least_once_msg_1");
 
-        let entry2 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry2 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry2.data, b"at_least_once_msg_2");
     }
 
@@ -165,13 +165,13 @@ fn test_crash_recovery_at_least_once() {
         let wal =
             Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 
-        let entry1 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry1.data, b"at_least_once_msg_1");
 
-        let entry2 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry2 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry2.data, b"at_least_once_msg_2");
 
-        let entry3 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry3 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry3.data, b"at_least_once_msg_3");
     }
 
@@ -182,7 +182,7 @@ fn test_crash_recovery_at_least_once() {
         let wal =
             Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 
-        let entry4 = wal.read_next("recovery_test").unwrap().unwrap();
+        let entry4 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry4.data, b"at_least_once_msg_4");
     }
 }
@@ -198,8 +198,8 @@ fn test_multiple_topics_different_consistency_behavior() {
     wal.append_for_topic("topic_a", b"a2").unwrap();
     wal.append_for_topic("topic_b", b"b2").unwrap();
 
-    assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, b"a1");
-    assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"b1");
+    assert_eq!(wal.read_next("topic_a", true).unwrap().unwrap().data, b"a1");
+    assert_eq!(wal.read_next("topic_b", true).unwrap().unwrap().data, b"b1");
 
     drop(wal);
 
@@ -208,8 +208,14 @@ fn test_multiple_topics_different_consistency_behavior() {
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 2 }).unwrap();
 
-    assert_eq!(wal2.read_next("topic_a").unwrap().unwrap().data, b"a1");
-    assert_eq!(wal2.read_next("topic_b").unwrap().unwrap().data, b"b1");
+    assert_eq!(
+        wal2.read_next("topic_a", true).unwrap().unwrap().data,
+        b"a1"
+    );
+    assert_eq!(
+        wal2.read_next("topic_b", true).unwrap().unwrap().data,
+        b"b1"
+    );
 }
 
 #[test]
@@ -241,7 +247,7 @@ fn test_configuration_with_concurrent_operations() {
     let start_time = Instant::now();
 
     while start_time.elapsed() < Duration::from_millis(200) && read_count < 10 {
-        if let Some(entry) = wal.read_next("concurrent").unwrap() {
+        if let Some(entry) = wal.read_next("concurrent", true).unwrap() {
             let expected = format!("concurrent_msg_{}", read_count);
             assert_eq!(entry.data, expected.as_bytes());
             read_count += 1;
@@ -251,7 +257,7 @@ fn test_configuration_with_concurrent_operations() {
 
     writer_handle.join().unwrap();
 
-    while let Some(entry) = wal.read_next("concurrent").unwrap() {
+    while let Some(entry) = wal.read_next("concurrent", true).unwrap() {
         let expected = format!("concurrent_msg_{}", read_count);
         assert_eq!(entry.data, expected.as_bytes());
         read_count += 1;
@@ -272,7 +278,7 @@ fn test_persist_every_zero_clamping() {
     wal.append_for_topic("test", b"msg1").unwrap();
     wal.append_for_topic("test", b"msg2").unwrap();
 
-    let entry1 = wal.read_next("test").unwrap().unwrap();
+    let entry1 = wal.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry1.data, b"msg1");
 
     drop(wal);
@@ -282,7 +288,7 @@ fn test_persist_every_zero_clamping() {
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 0 }).unwrap();
 
-    let entry2 = wal2.read_next("test").unwrap().unwrap();
+    let entry2 = wal2.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
 }
 
@@ -331,7 +337,7 @@ fn test_log_file_deletion_with_fast_fsync() {
     );
 
     test_println!("Reading first entry (999MB)...");
-    let entry1 = wal.read_next("deletion_test").unwrap().unwrap();
+    let entry1 = wal.read_next("deletion_test", true).unwrap().unwrap();
     assert_eq!(entry1.data.len(), 999 * 1024 * 1024);
     assert_eq!(entry1.data[0], 0xAA); // Verify it's the first entry
 
@@ -391,7 +397,7 @@ fn test_log_file_deletion_with_fast_fsync() {
     }
 
     test_println!("Reading second entry to verify WAL integrity...");
-    let entry2 = wal.read_next("deletion_test").unwrap().unwrap();
+    let entry2 = wal.read_next("deletion_test", true).unwrap().unwrap();
     assert_eq!(entry2.data.len(), 999 * 1024 * 1024);
     assert_eq!(entry2.data[0], 0xBB); // Verify it's the second entry
 
@@ -418,7 +424,7 @@ fn test_log_file_deletion_with_large_data() {
     }
 
     for i in 0..num_entries {
-        let entry = wal.read_next("large_deletion_test").unwrap().unwrap();
+        let entry = wal.read_next("large_deletion_test", true).unwrap().unwrap();
         let expected_prefix = format!("large_test_entry_{:04}_", i);
         let entry_str = String::from_utf8_lossy(&entry.data);
         assert!(
@@ -428,7 +434,11 @@ fn test_log_file_deletion_with_large_data() {
         );
     }
 
-    assert!(wal.read_next("large_deletion_test").unwrap().is_none());
+    assert!(
+        wal.read_next("large_deletion_test", true)
+            .unwrap()
+            .is_none()
+    );
 
     let wal_dir = current_wal_dir();
     let files_before = if wal_dir.exists() {
@@ -496,7 +506,7 @@ fn test_file_state_tracking() {
     assert!(files_exist, "Should have created log files");
 
     for i in 0..25 {
-        let entry = wal.read_next("state_test").unwrap().unwrap();
+        let entry = wal.read_next("state_test", true).unwrap().unwrap();
         let expected = format!("state_tracking_msg_{}", i);
         assert_eq!(entry.data, expected.as_bytes());
     }
@@ -515,12 +525,12 @@ fn test_file_state_tracking() {
     );
 
     for i in 25..50 {
-        let entry = wal.read_next("state_test").unwrap().unwrap();
+        let entry = wal.read_next("state_test", true).unwrap().unwrap();
         let expected = format!("state_tracking_msg_{}", i);
         assert_eq!(entry.data, expected.as_bytes());
     }
 
-    assert!(wal.read_next("state_test").unwrap().is_none());
+    assert!(wal.read_next("state_test", true).unwrap().is_none());
 }
 
 #[test]
@@ -578,15 +588,18 @@ fn key_based_instances_recover_independently() {
 
     let wal_tx =
         Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce).unwrap();
-    assert_eq!(wal_tx.read_next("tx").unwrap().unwrap().data, b"a");
-    assert_eq!(wal_tx.read_next("tx").unwrap().unwrap().data, b"b");
-    assert!(wal_tx.read_next("tx").unwrap().is_none());
+    assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"a");
+    assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"b");
+    assert!(wal_tx.read_next("tx", true).unwrap().is_none());
 
     let wal_an =
         Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
-    assert!(wal_an.read_next("tx").unwrap().is_none());
-    assert_eq!(wal_an.read_next("events").unwrap().unwrap().data, b"x");
-    assert!(wal_an.read_next("events").unwrap().is_none());
+    assert!(wal_an.read_next("tx", true).unwrap().is_none());
+    assert_eq!(
+        wal_an.read_next("events", true).unwrap().unwrap().data,
+        b"x"
+    );
+    assert!(wal_an.read_next("events", true).unwrap().is_none());
 }
 
 #[test]

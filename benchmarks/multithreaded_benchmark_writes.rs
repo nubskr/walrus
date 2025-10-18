@@ -275,7 +275,9 @@ fn multithreaded_benchmark() {
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
-            ReadConsistency::AtLeastOnce { persist_every: 5000 },
+            ReadConsistency::AtLeastOnce {
+                persist_every: 5000,
+            },
             fsync_schedule,
         )
         .expect("Failed to create Walrus"),

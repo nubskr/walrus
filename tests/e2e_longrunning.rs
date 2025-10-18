@@ -65,7 +65,7 @@ fn e2e_sustained_mixed_workload() {
         ];
 
         for topic in &topics {
-            if let Some(entry) = wal.read_next(topic).unwrap() {
+            if let Some(entry) = wal.read_next(topic, true).unwrap() {
                 *read_counts.entry(topic.clone()).or_insert(0) += 1;
 
                 let data_str = String::from_utf8_lossy(&entry.data);
@@ -184,7 +184,7 @@ fn e2e_realistic_application_simulation() {
             "error_logs",
         ];
         for topic in &topics {
-            if let Some(entry) = wal.read_next(topic).unwrap() {
+            if let Some(entry) = wal.read_next(topic, true).unwrap() {
                 processed_count += 1;
 
                 let data_str = String::from_utf8_lossy(&entry.data);
@@ -285,7 +285,7 @@ fn e2e_recovery_and_persistence_marathon() {
         for topic in &topics {
             let read_count = (entries_per_cycle * (cycle + 1)) / 2; // Read half
             for _ in 0..read_count {
-                if wal.read_next(topic).unwrap().is_none() {
+                if wal.read_next(topic, true).unwrap().is_none() {
                     break;
                 }
             }
@@ -299,7 +299,7 @@ fn e2e_recovery_and_persistence_marathon() {
     let mut validation_errors = 0;
 
     for topic in &topics {
-        while let Some(entry) = wal.read_next(topic).unwrap() {
+        while let Some(entry) = wal.read_next(topic, true).unwrap() {
             total_read += 1;
 
             let data_str = String::from_utf8_lossy(&entry.data);
@@ -375,7 +375,7 @@ fn e2e_massive_data_throughput_test() {
         for _ in 0..2 {
             let topic = &topics[topic_index % topics.len()];
 
-            if let Some(entry) = wal.read_next(topic).unwrap() {
+            if let Some(entry) = wal.read_next(topic, true).unwrap() {
                 bytes_read += entry.data.len() as u64;
                 entries_read += 1;
 
@@ -505,7 +505,7 @@ fn e2e_system_stress_and_stability() {
         for _ in 0..3 {
             let topic = &topics[topic_index % topics.len()];
 
-            match wal.read_next(topic).unwrap() {
+            match wal.read_next(topic, true).unwrap() {
                 Some(entry) => {
                     successful_operations += 1;
 
@@ -624,7 +624,7 @@ fn e2e_performance_benchmark() {
     test_println!("Running read benchmark for {:?}...", duration);
 
     while start.elapsed() < duration {
-        if let Some(entry) = wal.read_next("bench").unwrap() {
+        if let Some(entry) = wal.read_next("bench", true).unwrap() {
             read_count += 1;
             read_bytes += entry.data.len() as u64;
         }

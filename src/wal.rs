@@ -43,6 +43,7 @@ const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
 const PREFIX_META_SIZE: usize = 64;
 const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
 const MAX_BATCH_ENTRIES: usize = 2000;
+const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total payload limit
 
 fn now_millis_str() -> String {
     let ms = SystemTime::now()
@@ -1324,6 +1325,13 @@ impl Walrus {
             .map(|data| (PREFIX_META_SIZE as u64) + (data.len() as u64))
             .sum();
 
+        if total_bytes > MAX_BATCH_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch exceeds 10GB limit",
+            ));
+        }
+
         if batch.is_empty() {
             return Ok(());
         }
@@ -1707,7 +1715,7 @@ impl Walrus {
         }
     }
 
-    pub fn read_next(&self, col_name: &str) -> std::io::Result<Option<Entry>> {
+    pub fn read_next(&self, col_name: &str, checkpoint: bool) -> std::io::Result<Option<Entry>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
             let map = self.reader.data.read().map_err(|_| {
@@ -1827,21 +1835,26 @@ impl Walrus {
 
                 match block.read(off) {
                     Ok((entry, consumed)) => {
-                        // Compute new offset and whether to persist while holding the column lock
+                        // Compute new offset and decide whether to commit progress
                         let new_off = off + consumed as u64;
-                        info.cur_block_offset = new_off;
-                        let maybe_persist = if self.should_persist(&mut info, false) {
-                            Some((info.cur_block_idx as u64, new_off))
-                        } else {
-                            None
-                        };
+                        let mut maybe_persist = None;
+                        if checkpoint {
+                            info.cur_block_offset = new_off;
+                            maybe_persist = if self.should_persist(&mut info, false) {
+                                Some((info.cur_block_idx as u64, new_off))
+                            } else {
+                                None
+                            };
+                        }
 
                         // Drop the column lock before touching the index to avoid lock inversion
                         // Release before returning; we'll not use `info` after this branch
                         drop(info);
-                        if let Some((idx_val, off_val)) = maybe_persist {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
+                        if checkpoint {
+                            if let Some((idx_val, off_val)) = maybe_persist {
+                                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                    let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
+                                }
                             }
                         }
 
@@ -1907,13 +1920,15 @@ impl Walrus {
                     {
                         info.cur_block_idx = idx;
                         info.cur_block_offset = tail_off.min(info.chain[idx].used);
-                        if self.should_persist(&mut info, true) {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    info.cur_block_idx as u64,
-                                    info.cur_block_offset,
-                                );
+                        if checkpoint {
+                            if self.should_persist(&mut info, true) {
+                                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                    let _ = idx_guard.set(
+                                        col_name.to_string(),
+                                        info.cur_block_idx as u64,
+                                        info.cur_block_offset,
+                                    );
+                                }
                             }
                         }
                         persisted_tail = None; // sealed now
@@ -1922,13 +1937,15 @@ impl Walrus {
                     } else {
                         // rebase tail to current active block at 0
                         persisted_tail = Some((active_block.id, 0));
-                        if self.should_persist(&mut info, true) {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(
-                                    col_name.to_string(),
-                                    active_block.id | TAIL_FLAG,
-                                    0,
-                                );
+                        if checkpoint {
+                            if self.should_persist(&mut info, true) {
+                                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                    let _ = idx_guard.set(
+                                        col_name.to_string(),
+                                        active_block.id | TAIL_FLAG,
+                                        0,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1936,9 +1953,12 @@ impl Walrus {
             } else {
                 // No persisted tail; init at current active block start
                 persisted_tail = Some((active_block.id, 0));
-                if self.should_persist(&mut info, true) {
-                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                if checkpoint {
+                    if self.should_persist(&mut info, true) {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ =
+                                idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                        }
                     }
                 }
             }
@@ -1974,17 +1994,22 @@ impl Walrus {
                                 "col info write lock poisoned",
                             )
                         })?;
-                        info.tail_block_id = active_block.id;
-                        info.tail_offset = new_off;
-                        let maybe_persist = if self.should_persist(&mut info, false) {
-                            Some((tail_block_id | TAIL_FLAG, new_off))
-                        } else {
-                            None
-                        };
+                        let mut maybe_persist = None;
+                        if checkpoint {
+                            info.tail_block_id = active_block.id;
+                            info.tail_offset = new_off;
+                            maybe_persist = if self.should_persist(&mut info, false) {
+                                Some((tail_block_id | TAIL_FLAG, new_off))
+                            } else {
+                                None
+                            };
+                        }
                         drop(info);
-                        if let Some((idx_val, off_val)) = maybe_persist {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
+                        if checkpoint {
+                            if let Some((idx_val, off_val)) = maybe_persist {
+                                if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                    let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
+                                }
                             }
                         }
 
@@ -2045,6 +2070,7 @@ impl Walrus {
         &self,
         col_name: &str,
         max_bytes: usize,
+        checkpoint: bool,
     ) -> std::io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
@@ -2409,9 +2435,8 @@ impl Walrus {
             }
         }
 
-        // 5) Commit progress
+        // 5) Commit progress (optional)
         if entries_parsed > 0 {
-            // Prepare persistence target while holding the appropriate lock
             enum PersistTarget {
                 Tail { blk_id: u64, off: u64 },
                 Sealed { idx: u64, off: u64 },
@@ -2422,74 +2447,81 @@ impl Walrus {
             if hold_lock_during_io {
                 // We still hold the original write guard here
                 let mut info = info_opt.take().expect("column lock should be held");
-                // Update position
-                if saw_tail {
-                    info.cur_block_idx = chain_len_at_plan;
-                    info.cur_block_offset = 0;
-                    info.tail_block_id = final_tail_block_id;
-                    info.tail_offset = final_tail_offset;
-                    // StrictlyAtOnce: persist immediately
-                    target = PersistTarget::Tail {
-                        blk_id: final_tail_block_id,
-                        off: final_tail_offset,
-                    };
-                } else {
-                    info.cur_block_idx = final_block_idx;
-                    info.cur_block_offset = final_block_offset;
-                    // StrictlyAtOnce: persist immediately
-                    target = PersistTarget::Sealed {
-                        idx: final_block_idx as u64,
-                        off: final_block_offset,
-                    };
+                if checkpoint {
+                    if saw_tail {
+                        info.cur_block_idx = chain_len_at_plan;
+                        info.cur_block_offset = 0;
+                        info.tail_block_id = final_tail_block_id;
+                        info.tail_offset = final_tail_offset;
+                        target = PersistTarget::Tail {
+                            blk_id: final_tail_block_id,
+                            off: final_tail_offset,
+                        };
+                    } else {
+                        info.cur_block_idx = final_block_idx;
+                        info.cur_block_offset = final_block_offset;
+                        target = PersistTarget::Sealed {
+                            idx: final_block_idx as u64,
+                            off: final_block_offset,
+                        };
+                    }
                 }
-                // Release before persisting index
                 drop(info);
             } else {
                 // Reacquire to update
                 let mut info2 = info_arc.write().map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::Other, "col info write lock poisoned")
                 })?;
-                if saw_tail {
-                    info2.cur_block_idx = chain_len_at_plan;
-                    info2.cur_block_offset = 0;
-                    info2.tail_block_id = final_tail_block_id;
-                    info2.tail_offset = final_tail_offset;
-                    if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                        // Clamp contribution so a single call can't reach the threshold
-                        let room = persist_every
-                            .saturating_sub(1)
-                            .saturating_sub(info2.reads_since_persist);
-                        let add = entries_parsed.min(room);
-                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
-                        // target remains None here to avoid persisting to end in one batch
-                    }
-                } else {
-                    info2.cur_block_idx = final_block_idx;
-                    info2.cur_block_offset = final_block_offset;
-                    if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                        let room = persist_every
-                            .saturating_sub(1)
-                            .saturating_sub(info2.reads_since_persist);
-                        let add = entries_parsed.min(room);
-                        info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
+                if checkpoint {
+                    if saw_tail {
+                        info2.cur_block_idx = chain_len_at_plan;
+                        info2.cur_block_offset = 0;
+                        info2.tail_block_id = final_tail_block_id;
+                        info2.tail_offset = final_tail_offset;
+                        if let ReadConsistency::AtLeastOnce { persist_every } =
+                            self.read_consistency
+                        {
+                            // Clamp contribution so a single call can't reach the threshold
+                            let room = persist_every
+                                .saturating_sub(1)
+                                .saturating_sub(info2.reads_since_persist);
+                            let add = entries_parsed.min(room);
+                            info2.reads_since_persist =
+                                info2.reads_since_persist.saturating_add(add);
+                            // target remains None here to avoid persisting to end in one batch
+                        }
+                    } else {
+                        info2.cur_block_idx = final_block_idx;
+                        info2.cur_block_offset = final_block_offset;
+                        if let ReadConsistency::AtLeastOnce { persist_every } =
+                            self.read_consistency
+                        {
+                            let room = persist_every
+                                .saturating_sub(1)
+                                .saturating_sub(info2.reads_since_persist);
+                            let add = entries_parsed.min(room);
+                            info2.reads_since_persist =
+                                info2.reads_since_persist.saturating_add(add);
+                        }
                     }
                 }
                 drop(info2);
             }
 
-            // Persist if needed
-            match target {
-                PersistTarget::Tail { blk_id, off } => {
-                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
+            if checkpoint {
+                match target {
+                    PersistTarget::Tail { blk_id, off } => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
+                        }
                     }
-                }
-                PersistTarget::Sealed { idx, off } => {
-                    if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                        let _ = idx_guard.set(col_name.to_string(), idx, off);
+                    PersistTarget::Sealed { idx, off } => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(col_name.to_string(), idx, off);
+                        }
                     }
+                    PersistTarget::None => {}
                 }
-                PersistTarget::None => {}
             }
         }
 

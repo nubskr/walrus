@@ -4,7 +4,7 @@ use common::{TestEnv, current_wal_dir};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend, disable_fd_backend};
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, disable_fd_backend, enable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -35,17 +35,17 @@ fn test_batch_write_basic() {
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
     // Read back and verify
-    let e1 = wal.read_next("test_topic").unwrap().unwrap();
+    let e1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e1.data, b"entry1");
 
-    let e2 = wal.read_next("test_topic").unwrap().unwrap();
+    let e2 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e2.data, b"entry2");
 
-    let e3 = wal.read_next("test_topic").unwrap().unwrap();
+    let e3 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e3.data, b"entry3");
 
     // Should be no more entries
-    assert!(wal.read_next("test_topic").unwrap().is_none());
+    assert!(wal.read_next("test_topic", true).unwrap().is_none());
 
     cleanup_test_env();
 }
@@ -65,7 +65,7 @@ fn test_batch_write_atomicity_with_reader() {
     wal.append_for_topic("test_topic", b"before").unwrap();
 
     // Reader consumes it
-    let e = wal.read_next("test_topic").unwrap().unwrap();
+    let e = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e.data, b"before");
 
     // Now do batch write
@@ -73,13 +73,13 @@ fn test_batch_write_atomicity_with_reader() {
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
     // Reader should see all batch entries atomically
-    let e1 = wal.read_next("test_topic").unwrap().unwrap();
+    let e1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e1.data, b"batch1");
 
-    let e2 = wal.read_next("test_topic").unwrap().unwrap();
+    let e2 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e2.data, b"batch2");
 
-    let e3 = wal.read_next("test_topic").unwrap().unwrap();
+    let e3 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(e3.data, b"batch3");
 
     cleanup_test_env();
@@ -116,7 +116,7 @@ fn test_batch_size_limit_enforcement() {
     assert!(err.to_string().contains("10GB limit"));
 
     // Verify nothing was written
-    assert!(wal.read_next("test_topic").unwrap().is_none());
+    assert!(wal.read_next("test_topic", true).unwrap().is_none());
 
     cleanup_test_env();
 }
@@ -269,7 +269,7 @@ fn test_empty_batch() {
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
     // Nothing to read
-    assert!(wal.read_next("test_topic").unwrap().is_none());
+    assert!(wal.read_next("test_topic", true).unwrap().is_none());
 
     cleanup_test_env();
 }
@@ -297,13 +297,13 @@ fn test_batch_spans_multiple_blocks() {
 
     // Read back and verify all entries
     for i in 0..100 {
-        let entry = wal.read_next("test_topic").unwrap().unwrap();
+        let entry = wal.read_next("test_topic", true).unwrap().unwrap();
         assert_eq!(entry.data.len(), 5 * 1024 * 1024);
         assert_eq!(entry.data[0], 0xAB);
     }
 
     // No more entries
-    assert!(wal.read_next("test_topic").unwrap().is_none());
+    assert!(wal.read_next("test_topic", true).unwrap().is_none());
 
     cleanup_test_env();
 }
@@ -331,23 +331,23 @@ fn test_batch_with_varying_entry_sizes() {
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
     // Verify all entries
-    let r1 = wal.read_next("test_topic").unwrap().unwrap();
+    let r1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r1.data.len(), 100);
     assert_eq!(r1.data[0], 1);
 
-    let r2 = wal.read_next("test_topic").unwrap().unwrap();
+    let r2 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r2.data.len(), 1024 * 1024);
     assert_eq!(r2.data[0], 2);
 
-    let r3 = wal.read_next("test_topic").unwrap().unwrap();
+    let r3 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r3.data.len(), 10 * 1024 * 1024);
     assert_eq!(r3.data[0], 3);
 
-    let r4 = wal.read_next("test_topic").unwrap().unwrap();
+    let r4 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r4.data.len(), 500);
     assert_eq!(r4.data[0], 4);
 
-    let r5 = wal.read_next("test_topic").unwrap().unwrap();
+    let r5 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r5.data.len(), 50 * 1024 * 1024);
     assert_eq!(r5.data[0], 5);
 
@@ -403,7 +403,7 @@ fn test_chaos_interleaved_batch_and_regular_writes() {
 
     // Verify we can read all written data without corruption
     let mut count = 0;
-    while let Some(entry) = wal.read_next("chaos_topic").unwrap() {
+    while let Some(entry) = wal.read_next("chaos_topic", true).unwrap() {
         // Just verify we can read without panic/corruption
         assert!(!entry.data.is_empty());
         count += 1;
@@ -465,7 +465,7 @@ fn test_chaos_multiple_topics_concurrent_batches() {
         let topic_name = format!("topic_{}", topic_id);
         let mut count = 0;
 
-        while let Some(entry) = wal.read_next(&topic_name).unwrap() {
+        while let Some(entry) = wal.read_next(&topic_name, true).unwrap() {
             let data_str = String::from_utf8_lossy(&entry.data);
             assert!(data_str.starts_with(&format!("t{}_", topic_id)));
             count += 1;
@@ -527,7 +527,7 @@ fn test_chaos_batch_write_with_concurrent_readers() {
         let handle = thread::spawn(move || {
             let mut read_count = 0;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Ok(Some(entry)) = wal_clone.read_next("chaos_rw_topic") {
+                if let Ok(Some(entry)) = wal_clone.read_next("chaos_rw_topic", true) {
                     // Verify data is not corrupted
                     assert!(!entry.data.is_empty());
                     read_count += 1;
@@ -564,7 +564,7 @@ fn test_chaos_batch_write_crash_recovery() {
         let wal = Walrus::with_consistency_and_schedule_for_key(
             test_key,
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
+            FsyncSchedule::SyncEach, // MUST sync for crash recovery tests!
         )
         .unwrap();
 
@@ -589,13 +589,13 @@ fn test_chaos_batch_write_crash_recovery() {
         .unwrap();
 
         // Should be able to read the batch that was written before crash
-        let e1 = wal.read_next("crash_topic").unwrap().unwrap();
+        let e1 = wal.read_next("crash_topic", true).unwrap().unwrap();
         assert_eq!(e1.data, b"before_crash_1");
 
-        let e2 = wal.read_next("crash_topic").unwrap().unwrap();
+        let e2 = wal.read_next("crash_topic", true).unwrap().unwrap();
         assert_eq!(e2.data, b"before_crash_2");
 
-        let e3 = wal.read_next("crash_topic").unwrap().unwrap();
+        let e3 = wal.read_next("crash_topic", true).unwrap().unwrap();
         assert_eq!(e3.data, b"before_crash_3");
 
         // Write more after recovery
@@ -603,10 +603,10 @@ fn test_chaos_batch_write_crash_recovery() {
         wal.batch_append_for_topic("crash_topic", &entries2)
             .unwrap();
 
-        let e4 = wal.read_next("crash_topic").unwrap().unwrap();
+        let e4 = wal.read_next("crash_topic", true).unwrap().unwrap();
         assert_eq!(e4.data, b"after_crash_1");
 
-        let e5 = wal.read_next("crash_topic").unwrap().unwrap();
+        let e5 = wal.read_next("crash_topic", true).unwrap().unwrap();
         assert_eq!(e5.data, b"after_crash_2");
     }
 
@@ -637,11 +637,11 @@ fn test_chaos_alternating_tiny_and_huge_batches() {
 
     // Verify all entries
     for round in 0..10 {
-        let tiny_entry = wal.read_next("alternating").unwrap().unwrap();
+        let tiny_entry = wal.read_next("alternating", true).unwrap().unwrap();
         assert_eq!(tiny_entry.data, b"t");
 
         for _ in 0..5 {
-            let huge_entry = wal.read_next("alternating").unwrap().unwrap();
+            let huge_entry = wal.read_next("alternating", true).unwrap().unwrap();
             assert_eq!(huge_entry.data.len(), 10 * 1024 * 1024);
             assert_eq!(huge_entry.data[0], 0xAB);
         }
@@ -671,7 +671,7 @@ fn test_chaos_batch_writes_force_multiple_block_rotations() {
 
     // Verify all entries survived the rotations
     for _ in 0..100 {
-        let e = wal.read_next("rotation_topic").unwrap().unwrap();
+        let e = wal.read_next("rotation_topic", true).unwrap().unwrap();
         assert_eq!(e.data.len(), 5 * 1024 * 1024);
         assert_eq!(e.data[0], 0xEE);
     }
@@ -700,7 +700,7 @@ fn test_chaos_readers_at_different_positions_during_batch() {
 
     // Read 3 entries (position reader at offset 3)
     for _ in 0..3 {
-        wal.read_next("atomic_test").unwrap();
+        wal.read_next("atomic_test", true).unwrap();
     }
 
     // Write a batch of 4 entries
@@ -709,7 +709,7 @@ fn test_chaos_readers_at_different_positions_during_batch() {
 
     // Reader should see remaining 2 initial entries + 4 batch entries = 6 total
     let mut entries = Vec::new();
-    while let Some(entry) = wal.read_next("atomic_test").unwrap() {
+    while let Some(entry) = wal.read_next("atomic_test", true).unwrap() {
         entries.push(entry.data);
     }
 
@@ -779,7 +779,7 @@ fn test_chaos_many_topics_racing_batch_and_regular() {
     for topic_id in 0..num_topics {
         let topic = format!("race_topic_{}", topic_id);
         let mut count = 0;
-        while wal.read_next(&topic).unwrap().is_some() {
+        while wal.read_next(&topic, true).unwrap().is_some() {
             count += 1;
         }
         assert!(count > 0, "Topic {} should have entries", topic_id);
@@ -799,7 +799,7 @@ fn test_chaos_sequential_batches_with_crashes() {
         let wal = Walrus::with_consistency_and_schedule_for_key(
             test_key,
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
+            FsyncSchedule::SyncEach, // MUST sync for crash recovery tests!
         )
         .unwrap();
 
@@ -826,12 +826,12 @@ fn test_chaos_sequential_batches_with_crashes() {
     for cycle in 0..5 {
         let expected = format!("cycle_{}", cycle);
         for _ in 0..2 {
-            let entry = wal.read_next("crash_cycles").unwrap().unwrap();
+            let entry = wal.read_next("crash_cycles", true).unwrap().unwrap();
             assert_eq!(entry.data, expected.as_bytes());
         }
     }
 
-    assert!(wal.read_next("crash_cycles").unwrap().is_none());
+    assert!(wal.read_next("crash_cycles", true).unwrap().is_none());
 
     cleanup_test_env();
 }
@@ -858,7 +858,7 @@ fn test_chaos_batch_with_exactly_block_size_entries() {
 
     // Each entry should force a new block
     for i in 0..5 {
-        let entry = wal.read_next("exact_topic").unwrap().unwrap();
+        let entry = wal.read_next("exact_topic", true).unwrap().unwrap();
         assert_eq!(entry.data.len(), exact_size);
         assert_eq!(entry.data[0], i as u8);
     }
@@ -928,7 +928,7 @@ fn test_chaos_hammering_same_topic_with_batches() {
 
     // Count actual entries written
     let mut count = 0;
-    while wal.read_next("hammered_topic").unwrap().is_some() {
+    while wal.read_next("hammered_topic", true).unwrap().is_some() {
         count += 1;
     }
 
@@ -955,18 +955,30 @@ fn test_chaos_zero_length_entries_in_batch() {
     wal.batch_append_for_topic("zero_topic", &entries).unwrap();
 
     // Verify all entries including empty ones
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
     assert_eq!(
-        wal.read_next("zero_topic").unwrap().unwrap().data,
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
+        b""
+    );
+    assert_eq!(
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
         b"normal"
     );
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
     assert_eq!(
-        wal.read_next("zero_topic").unwrap().unwrap().data,
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
+        b""
+    );
+    assert_eq!(
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
+        b""
+    );
+    assert_eq!(
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
         b"another"
     );
-    assert_eq!(wal.read_next("zero_topic").unwrap().unwrap().data, b"");
+    assert_eq!(
+        wal.read_next("zero_topic", true).unwrap().unwrap().data,
+        b""
+    );
 
     cleanup_test_env();
 }
@@ -991,7 +1003,7 @@ fn test_chaos_batch_interspersed_with_frequent_fsync() {
 
     // Verify all 50 entries
     let mut count = 0;
-    while wal.read_next("fsync_topic").unwrap().is_some() {
+    while wal.read_next("fsync_topic", true).unwrap().is_some() {
         count += 1;
     }
     assert_eq!(count, 50);
@@ -1018,7 +1030,7 @@ fn test_batch_single_entry() {
 
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
-    let entry = wal.read_next("test_topic").unwrap().unwrap();
+    let entry = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(entry.data, b"single_entry");
 
     cleanup_test_env();
@@ -1047,10 +1059,10 @@ fn test_batch_exactly_at_block_boundary() {
 
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
-    let r1 = wal.read_next("test_topic").unwrap().unwrap();
+    let r1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r1.data[0], 0xAA);
 
-    let r2 = wal.read_next("test_topic").unwrap().unwrap();
+    let r2 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(r2.data[0], 0xBB);
 
     cleanup_test_env();
@@ -1076,15 +1088,15 @@ fn test_batch_then_regular_write() {
 
     // Verify order
     assert_eq!(
-        wal.read_next("test_topic").unwrap().unwrap().data,
+        wal.read_next("test_topic", true).unwrap().unwrap().data,
         b"batch1"
     );
     assert_eq!(
-        wal.read_next("test_topic").unwrap().unwrap().data,
+        wal.read_next("test_topic", true).unwrap().unwrap().data,
         b"batch2"
     );
     assert_eq!(
-        wal.read_next("test_topic").unwrap().unwrap().data,
+        wal.read_next("test_topic", true).unwrap().unwrap().data,
         b"regular"
     );
 
@@ -1115,7 +1127,7 @@ fn test_multiple_sequential_batches() {
     // Verify all entries in order
     for batch_num in 0..5 {
         for entry_num in 1..=3 {
-            let entry = wal.read_next("test_topic").unwrap().unwrap();
+            let entry = wal.read_next("test_topic", true).unwrap().unwrap();
             let expected = format!("batch_{}_entry_{}", batch_num, entry_num);
             assert_eq!(entry.data, expected.as_bytes());
         }
@@ -1156,7 +1168,7 @@ fn test_integrity_batch_write_sequential_numbers() {
 
     // Verify every single byte matches
     for i in 0..batch_size {
-        let entry = wal.read_next("integrity_seq").unwrap().unwrap();
+        let entry = wal.read_next("integrity_seq", true).unwrap().unwrap();
 
         // Verify the numeric prefix
         let num = u64::from_le_bytes([
@@ -1177,7 +1189,7 @@ fn test_integrity_batch_write_sequential_numbers() {
         assert_eq!(text, expected.as_bytes(), "Text mismatch at entry {}", i);
     }
 
-    assert!(wal.read_next("integrity_seq").unwrap().is_none());
+    assert!(wal.read_next("integrity_seq", true).unwrap().is_none());
     cleanup_test_env();
 }
 
@@ -1212,7 +1224,7 @@ fn test_integrity_batch_write_random_patterns() {
 
     // Verify every byte of every entry
     for i in 0..batch_size {
-        let entry = wal.read_next("integrity_random").unwrap().unwrap();
+        let entry = wal.read_next("integrity_random", true).unwrap().unwrap();
         let expected_size = 1000 + (i * 137) % 5000;
 
         assert_eq!(
@@ -1232,7 +1244,7 @@ fn test_integrity_batch_write_random_patterns() {
         }
     }
 
-    assert!(wal.read_next("integrity_random").unwrap().is_none());
+    assert!(wal.read_next("integrity_random", true).unwrap().is_none());
     cleanup_test_env();
 }
 
@@ -1273,7 +1285,7 @@ fn test_integrity_batch_write_large_entries_exact_match() {
 
     // Verify every entry byte-by-byte
     for i in 0..batch_size {
-        let entry = wal.read_next("integrity_large").unwrap().unwrap();
+        let entry = wal.read_next("integrity_large", true).unwrap().unwrap();
 
         assert_eq!(entry.data.len(), entry_size, "Size mismatch at entry {}", i);
 
@@ -1316,7 +1328,7 @@ fn test_integrity_batch_write_large_entries_exact_match() {
         }
     }
 
-    assert!(wal.read_next("integrity_large").unwrap().is_none());
+    assert!(wal.read_next("integrity_large", true).unwrap().is_none());
     cleanup_test_env();
 }
 
@@ -1356,7 +1368,7 @@ fn test_integrity_batch_spanning_blocks_exact_data() {
 
     // Verify every u32 value in every entry
     for i in 0..batch_size {
-        let entry = wal.read_next("integrity_spanning").unwrap().unwrap();
+        let entry = wal.read_next("integrity_spanning", true).unwrap().unwrap();
 
         assert_eq!(entry.data.len(), entry_size, "Size mismatch at entry {}", i);
 
@@ -1378,7 +1390,7 @@ fn test_integrity_batch_spanning_blocks_exact_data() {
         }
     }
 
-    assert!(wal.read_next("integrity_spanning").unwrap().is_none());
+    assert!(wal.read_next("integrity_spanning", true).unwrap().is_none());
     cleanup_test_env();
 }
 
@@ -1416,7 +1428,7 @@ fn test_integrity_multiple_batches_sequential() {
     // Verify all entries in all batches
     for batch_id in 0..num_batches {
         for entry_id in 0..entries_per_batch {
-            let entry = wal.read_next("integrity_multi").unwrap().unwrap();
+            let entry = wal.read_next("integrity_multi", true).unwrap().unwrap();
 
             let batch_id_read =
                 u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
@@ -1432,7 +1444,7 @@ fn test_integrity_multiple_batches_sequential() {
         }
     }
 
-    assert!(wal.read_next("integrity_multi").unwrap().is_none());
+    assert!(wal.read_next("integrity_multi", true).unwrap().is_none());
     cleanup_test_env();
 }
 
@@ -1448,7 +1460,7 @@ fn test_integrity_batch_after_crash_recovery() {
         let wal = Walrus::with_consistency_and_schedule_for_key(
             test_key,
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
+            FsyncSchedule::SyncEach, // MUST sync for crash recovery tests!
         )
         .unwrap();
 
@@ -1485,7 +1497,7 @@ fn test_integrity_batch_after_crash_recovery() {
         .unwrap();
 
         for i in 0..20 {
-            let entry = wal.read_next("integrity_crash").unwrap().unwrap();
+            let entry = wal.read_next("integrity_crash", true).unwrap().unwrap();
 
             assert_eq!(
                 entry.data.len(),
@@ -1536,7 +1548,7 @@ fn test_integrity_batch_after_crash_recovery() {
             }
         }
 
-        assert!(wal.read_next("integrity_crash").unwrap().is_none());
+        assert!(wal.read_next("integrity_crash", true).unwrap().is_none());
     }
 
     cleanup_test_env();
@@ -1580,7 +1592,7 @@ fn test_stress_large_batch_1000_entries() {
         if i % 100 == 0 {
             test_println!("[stress] Verified {} entries...", i);
         }
-        let e = wal.read_next("stress_topic").unwrap().unwrap();
+        let e = wal.read_next("stress_topic", true).unwrap().unwrap();
         assert_eq!(e.data.len(), 1024 * 1024);
         assert_eq!(e.data[0], 0xCD);
     }
@@ -1621,7 +1633,7 @@ fn test_stress_many_small_batches() {
     test_println!("[stress] Reading and verifying 100000 entries...");
     // Count entries
     let mut count = 0;
-    while wal.read_next("stress_topic").unwrap().is_some() {
+    while wal.read_next("stress_topic", true).unwrap().is_some() {
         count += 1;
         if count % 10000 == 0 {
             test_println!("[stress] Read {} entries...", count);
@@ -1651,7 +1663,7 @@ fn test_rollback_data_becomes_invisible_to_readers() {
     wal.append_for_topic("rollback_test", b"initial").unwrap();
 
     // Read it to establish baseline
-    let initial = wal.read_next("rollback_test").unwrap().unwrap();
+    let initial = wal.read_next("rollback_test", true).unwrap().unwrap();
     assert_eq!(initial.data, b"initial");
 
     // Try concurrent batch writes with smaller batches to reduce memory pressure
@@ -1698,7 +1710,7 @@ fn test_rollback_data_becomes_invisible_to_readers() {
 
     // Count all remaining entries (should be 3 from successful batch, if any succeeded)
     let mut count = 0;
-    while wal.read_next("rollback_test").unwrap().is_some() {
+    while wal.read_next("rollback_test", true).unwrap().is_some() {
         count += 1;
     }
 
@@ -1730,7 +1742,7 @@ fn test_rollback_allows_data_overwrite() {
         .unwrap();
 
     // Consume it
-    let entry = wal.read_next("overwrite_test").unwrap().unwrap();
+    let entry = wal.read_next("overwrite_test", true).unwrap().unwrap();
     assert_eq!(entry.data, b"before_batch");
 
     // Write a successful batch
@@ -1740,11 +1752,11 @@ fn test_rollback_allows_data_overwrite() {
 
     // Verify the batch data is readable
     assert_eq!(
-        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        wal.read_next("overwrite_test", true).unwrap().unwrap().data,
         b"batch1"
     );
     assert_eq!(
-        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        wal.read_next("overwrite_test", true).unwrap().unwrap().data,
         b"batch2"
     );
 
@@ -1752,7 +1764,7 @@ fn test_rollback_allows_data_overwrite() {
     wal.append_for_topic("overwrite_test", b"after_batch")
         .unwrap();
     assert_eq!(
-        wal.read_next("overwrite_test").unwrap().unwrap().data,
+        wal.read_next("overwrite_test", true).unwrap().unwrap().data,
         b"after_batch"
     );
 
@@ -1825,7 +1837,7 @@ fn test_rollback_block_state_consistency() {
 
     // Should be able to read some data (from successful batches + our test)
     let mut count = 0;
-    while wal.read_next("block_state_test").unwrap().is_some() {
+    while wal.read_next("block_state_test", true).unwrap().is_some() {
         count += 1;
     }
     assert!(
@@ -1858,7 +1870,7 @@ fn test_rollback_preserves_existing_data() {
     // Read ALL entries to establish that they exist
     let mut read_entries = Vec::new();
     for i in 0..5 {
-        let entry = wal.read_next("rollback_preserve").unwrap().unwrap();
+        let entry = wal.read_next("rollback_preserve", true).unwrap().unwrap();
         read_entries.push(entry.data);
     }
 
@@ -1878,7 +1890,11 @@ fn test_rollback_preserves_existing_data() {
             test_println!("Batch write succeeded");
             // If it succeeded, we should be able to read the entries
             let mut batch_count = 0;
-            while wal.read_next("rollback_preserve_batch").unwrap().is_some() {
+            while wal
+                .read_next("rollback_preserve_batch", true)
+                .unwrap()
+                .is_some()
+            {
                 batch_count += 1;
             }
             assert_eq!(
@@ -1892,18 +1908,22 @@ fn test_rollback_preserves_existing_data() {
                 e
             );
             // If it failed, there should be no entries to read
-            assert!(wal.read_next("rollback_preserve_batch").unwrap().is_none());
+            assert!(
+                wal.read_next("rollback_preserve_batch", true)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
     // Original data on original topic should still be fully consumed
     // (we already read all 5 entries above)
-    assert!(wal.read_next("rollback_preserve").unwrap().is_none());
+    assert!(wal.read_next("rollback_preserve", true).unwrap().is_none());
 
     // Write new data to the original topic to verify it still works
     wal.append_for_topic("rollback_preserve", b"after_rollbacks")
         .unwrap();
-    let entry = wal.read_next("rollback_preserve").unwrap().unwrap();
+    let entry = wal.read_next("rollback_preserve", true).unwrap().unwrap();
     assert_eq!(entry.data, b"after_rollbacks");
 
     cleanup_test_env();
@@ -1948,7 +1968,7 @@ fn test_rollback_file_state_tracking() {
     // Should be able to read at least the final entry
     let mut found_final = false;
     let mut total_count = 0;
-    while let Some(entry) = wal.read_next("file_state_test").unwrap() {
+    while let Some(entry) = wal.read_next("file_state_test", true).unwrap() {
         if entry.data == b"final_entry" {
             found_final = true;
         }

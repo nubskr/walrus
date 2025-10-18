@@ -1,12 +1,44 @@
-we need to add a batch read endpoint just like batch write endpoint that we have
+# Batch Read Endpoint Design Notes
 
-for some topic, external shits can ask to read X bytes from it, essentially we want to read a bunch of entries which can fit <= X since the last entry we read till then, 
+## Overview
+Walrus exposes a `batch_read_for_topic` API that lets clients page through
+entries for a topic while respecting both byte and entry limits. The reader
+walks the sealed block chain first and then the active writer tail, issuing
+batched I/O via `io_uring` (when the FD backend is enabled) or mmap reads
+otherwise.
 
-for this, it seeems to be pretty easy,
+```rust
+pub fn batch_read_for_topic(
+    &self,
+    col_name: &str,
+    max_bytes: usize,
+    checkpoint: bool,
+) -> std::io::Result<Vec<Entry>>;
+```
 
-we first figure out from the reader chain how many blocks would we need to read (note that blocks can be bigger than 10mb),
-then use io_uring to read those shits, if we get any error to read any of it, we return instantly with failure,
+## Behavior
+- Entries are returned in commit order and each call advances the persisted
+  read offset (StrictlyAtOnce) or the in-memory cursor (AtLeastOnce) **only when**
+  `checkpoint` is `true`. Passing `false` leaves the cursor untouched so callers
+  can peek.
+- `max_bytes` is applied to the payload size only. We always return at least
+  one entry per call even if it exceeds the byte budget.
+- For Linux FD builds, we submit one `io_uring::opcode::Read` per contiguous
+  range, then verify every completion before parsing metadata and payload
+  bytes.
+- Checksums are verified for every entry prior to emitting them to the caller.
 
-note that entries need to be sent in the order they were written(because io_uring might return something out of order)
+## Entry Cap
+- Batch reads now share the same `MAX_BATCH_ENTRIES` constant (2,000) that
+  batch writes use. Even if `max_bytes` is very large, the reader stops parsing
+  after 2,000 entries to stay well below the `io_uring` submission queue size
+  limit (2,047 entries). Remaining entries are surfaced on subsequent calls.
+- Calls that exceed the cap still update the reader cursor so the next call
+  continues where the previous one left off.
 
-how would you do it minimally, does my idea looks good ? this is a zero cost abstraction right ? i.e. there is no better way anyone could do this batch read thingy right ?  
+## Error Handling
+- If any read completion reports an error or a short read we return
+  `UnexpectedEof`.
+- Metadata parsing failures or checksum mismatches produce `InvalidData`.
+- When the FD backend is disabled on Linux builds we fall back to mmap reads,
+  otherwise we error out if the configuration is inconsistent.

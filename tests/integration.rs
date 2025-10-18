@@ -5,9 +5,9 @@ use std::fs;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use walrus_rust::FsyncSchedule;
 use walrus_rust::ReadConsistency;
 use walrus_rust::wal::Walrus;
-use walrus_rust::FsyncSchedule;
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -35,13 +35,13 @@ fn integration_basic_write_read_cycle() {
     wal.append_for_topic("test_topic", b"Second message")
         .unwrap();
 
-    let entry1 = wal.read_next("test_topic").unwrap().unwrap();
+    let entry1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(entry1.data, b"Hello, World!");
 
-    let entry2 = wal.read_next("test_topic").unwrap().unwrap();
+    let entry2 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(entry2.data, b"Second message");
 
-    assert!(wal.read_next("test_topic").unwrap().is_none());
+    assert!(wal.read_next("test_topic", true).unwrap().is_none());
 }
 
 #[test]
@@ -55,21 +55,21 @@ fn integration_multiple_topics() {
     wal.append_for_topic("logs", b"Warning issued").unwrap();
     wal.append_for_topic("events", b"User login").unwrap();
 
-    let log1 = wal.read_next("logs").unwrap().unwrap();
+    let log1 = wal.read_next("logs", true).unwrap().unwrap();
     assert_eq!(log1.data, b"Error occurred");
 
-    let metric1 = wal.read_next("metrics").unwrap().unwrap();
+    let metric1 = wal.read_next("metrics", true).unwrap().unwrap();
     assert_eq!(metric1.data, b"CPU: 80%");
 
-    let log2 = wal.read_next("logs").unwrap().unwrap();
+    let log2 = wal.read_next("logs", true).unwrap().unwrap();
     assert_eq!(log2.data, b"Warning issued");
 
-    let event1 = wal.read_next("events").unwrap().unwrap();
+    let event1 = wal.read_next("events", true).unwrap().unwrap();
     assert_eq!(event1.data, b"User login");
 
-    assert!(wal.read_next("logs").unwrap().is_none());
-    assert!(wal.read_next("metrics").unwrap().is_none());
-    assert!(wal.read_next("events").unwrap().is_none());
+    assert!(wal.read_next("logs", true).unwrap().is_none());
+    assert!(wal.read_next("metrics", true).unwrap().is_none());
+    assert!(wal.read_next("events", true).unwrap().is_none());
 }
 
 #[test]
@@ -79,11 +79,11 @@ fn integration_empty_data_handling() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     wal.append_for_topic("empty_test", b"").unwrap();
-    let empty_entry = wal.read_next("empty_test").unwrap().unwrap();
+    let empty_entry = wal.read_next("empty_test", true).unwrap().unwrap();
     assert!(empty_entry.data.is_empty());
 
     wal.append_for_topic("single_byte", &[42]).unwrap();
-    let single_entry = wal.read_next("single_byte").unwrap().unwrap();
+    let single_entry = wal.read_next("single_byte", true).unwrap().unwrap();
     assert_eq!(single_entry.data, &[42]);
 }
 
@@ -96,7 +96,7 @@ fn integration_binary_data() {
     let binary_data = vec![0, 1, 127, 128, 255, 0, 42];
     wal.append_for_topic("binary", &binary_data).unwrap();
 
-    let entry = wal.read_next("binary").unwrap().unwrap();
+    let entry = wal.read_next("binary", true).unwrap().unwrap();
     assert_eq!(entry.data, binary_data);
 }
 
@@ -121,7 +121,7 @@ fn integration_utf8_strings() {
 
     for (i, expected) in utf8_strings.iter().enumerate() {
         let topic = format!("utf8_{}", i);
-        let entry = wal.read_next(&topic).unwrap().unwrap();
+        let entry = wal.read_next(&topic, true).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, *expected);
     }
@@ -144,7 +144,7 @@ fn integration_medium_sized_data() {
     for (i, size) in sizes.iter().enumerate() {
         let expected = vec![i as u8; *size];
         let topic = format!("medium_{}", i);
-        let entry = wal.read_next(&topic).unwrap().unwrap();
+        let entry = wal.read_next(&topic, true).unwrap().unwrap();
         assert_eq!(entry.data, expected);
     }
 }
@@ -163,12 +163,12 @@ fn integration_sequential_writes_and_reads() {
 
     for i in 0..20 {
         let expected = format!("Message number {}", i);
-        let entry = wal.read_next(topic).unwrap().unwrap();
+        let entry = wal.read_next(topic, true).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
     }
 
-    assert!(wal.read_next(topic).unwrap().is_none());
+    assert!(wal.read_next(topic, true).unwrap().is_none());
 }
 
 #[test]
@@ -181,22 +181,22 @@ fn integration_interleaved_write_read() {
     wal.append_for_topic(topic, b"Message 1").unwrap();
     wal.append_for_topic(topic, b"Message 2").unwrap();
 
-    let entry1 = wal.read_next(topic).unwrap().unwrap();
+    let entry1 = wal.read_next(topic, true).unwrap().unwrap();
     assert_eq!(entry1.data, b"Message 1");
 
     wal.append_for_topic(topic, b"Message 3").unwrap();
     wal.append_for_topic(topic, b"Message 4").unwrap();
 
-    let entry2 = wal.read_next(topic).unwrap().unwrap();
+    let entry2 = wal.read_next(topic, true).unwrap().unwrap();
     assert_eq!(entry2.data, b"Message 2");
 
-    let entry3 = wal.read_next(topic).unwrap().unwrap();
+    let entry3 = wal.read_next(topic, true).unwrap().unwrap();
     assert_eq!(entry3.data, b"Message 3");
 
-    let entry4 = wal.read_next(topic).unwrap().unwrap();
+    let entry4 = wal.read_next(topic, true).unwrap().unwrap();
     assert_eq!(entry4.data, b"Message 4");
 
-    assert!(wal.read_next(topic).unwrap().is_none());
+    assert!(wal.read_next(topic, true).unwrap().is_none());
 }
 
 #[test]
@@ -219,11 +219,11 @@ fn integration_multiple_topics_stress() {
         let topic = format!("stress_topic_{}", topic_id);
         for msg_id in 0..messages_per_topic {
             let expected = format!("Topic {} Message {}", topic_id, msg_id);
-            let entry = wal.read_next(&topic).unwrap().unwrap();
+            let entry = wal.read_next(&topic, true).unwrap().unwrap();
             let actual = String::from_utf8(entry.data).unwrap();
             assert_eq!(actual, expected);
         }
-        assert!(wal.read_next(&topic).unwrap().is_none());
+        assert!(wal.read_next(&topic, true).unwrap().is_none());
     }
 }
 
@@ -260,11 +260,11 @@ fn integration_concurrent_writes() {
         let topic = format!("concurrent_{}", thread_id);
         for msg_id in 0..messages_per_thread {
             let expected = format!("Thread {} Message {}", thread_id, msg_id);
-            let entry = wal.read_next(&topic).unwrap().unwrap();
+            let entry = wal.read_next(&topic, true).unwrap().unwrap();
             let actual = String::from_utf8(entry.data).unwrap();
             assert_eq!(actual, expected);
         }
-        assert!(wal.read_next(&topic).unwrap().is_none());
+        assert!(wal.read_next(&topic, true).unwrap().is_none());
     }
 }
 
@@ -280,16 +280,16 @@ fn integration_topic_isolation() {
     wal.append_for_topic("topic_c", b"C1").unwrap();
     wal.append_for_topic("topic_b", b"B2").unwrap();
 
-    assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, b"A1");
-    assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, b"A2");
-    assert!(wal.read_next("topic_a").unwrap().is_none());
+    assert_eq!(wal.read_next("topic_a", true).unwrap().unwrap().data, b"A1");
+    assert_eq!(wal.read_next("topic_a", true).unwrap().unwrap().data, b"A2");
+    assert!(wal.read_next("topic_a", true).unwrap().is_none());
 
-    assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"B1");
-    assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"B2");
-    assert!(wal.read_next("topic_b").unwrap().is_none());
+    assert_eq!(wal.read_next("topic_b", true).unwrap().unwrap().data, b"B1");
+    assert_eq!(wal.read_next("topic_b", true).unwrap().unwrap().data, b"B2");
+    assert!(wal.read_next("topic_b", true).unwrap().is_none());
 
-    assert_eq!(wal.read_next("topic_c").unwrap().unwrap().data, b"C1");
-    assert!(wal.read_next("topic_c").unwrap().is_none());
+    assert_eq!(wal.read_next("topic_c", true).unwrap().unwrap().data, b"C1");
+    assert!(wal.read_next("topic_c", true).unwrap().is_none());
 }
 
 #[test]
@@ -298,12 +298,15 @@ fn integration_nonexistent_topic() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    assert!(wal.read_next("nonexistent").unwrap().is_none());
+    assert!(wal.read_next("nonexistent", true).unwrap().is_none());
 
     wal.append_for_topic("existing", b"data").unwrap();
-    assert!(wal.read_next("different").unwrap().is_none());
+    assert!(wal.read_next("different", true).unwrap().is_none());
 
-    assert_eq!(wal.read_next("existing").unwrap().unwrap().data, b"data");
+    assert_eq!(
+        wal.read_next("existing", true).unwrap().unwrap().data,
+        b"data"
+    );
 }
 
 #[test]
@@ -314,15 +317,15 @@ fn integration_write_after_exhaustion() {
     let topic = "exhaustion_test";
 
     wal.append_for_topic(topic, b"first").unwrap();
-    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"first");
-    assert!(wal.read_next(topic).unwrap().is_none());
+    assert_eq!(wal.read_next(topic, true).unwrap().unwrap().data, b"first");
+    assert!(wal.read_next(topic, true).unwrap().is_none());
 
     wal.append_for_topic(topic, b"second").unwrap();
     wal.append_for_topic(topic, b"third").unwrap();
 
-    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"second");
-    assert_eq!(wal.read_next(topic).unwrap().unwrap().data, b"third");
-    assert!(wal.read_next(topic).unwrap().is_none());
+    assert_eq!(wal.read_next(topic, true).unwrap().unwrap().data, b"second");
+    assert_eq!(wal.read_next(topic, true).unwrap().unwrap().data, b"third");
+    assert!(wal.read_next(topic, true).unwrap().is_none());
 }
 
 #[test]
@@ -340,11 +343,11 @@ fn integration_large_topic_names() {
         .unwrap();
 
     assert_eq!(
-        wal.read_next(&long_topic).unwrap().unwrap().data,
+        wal.read_next(&long_topic, true).unwrap().unwrap().data,
         b"long topic data"
     );
     assert_eq!(
-        wal.read_next(&very_long_topic).unwrap().unwrap().data,
+        wal.read_next(&very_long_topic, true).unwrap().unwrap().data,
         b"very long topic data"
     );
 }
@@ -370,7 +373,7 @@ fn integration_memory_pressure_test() {
 
     for topic_id in 0..num_topics {
         let topic = format!("memory_pressure_{}", topic_id);
-        let entry = wal.read_next(&topic).unwrap().unwrap();
+        let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
         assert_eq!(entry.data.len(), large_entry_size);
 
@@ -407,7 +410,7 @@ fn integration_file_rollover_stress() {
     }
 
     for entry_id in 0..num_entries {
-        let entry = wal.read_next(topic).unwrap().unwrap();
+        let entry = wal.read_next(topic, true).unwrap().unwrap();
         assert_eq!(entry.data.len(), entry_size);
 
         for (i, &byte) in entry.data.iter().enumerate() {
@@ -432,7 +435,7 @@ fn integration_corruption_detection_comprehensive() {
     let test_data = b"CORRUPTION_TEST_DATA_WITH_STRONG_PATTERN_12345678901234567890";
     wal.append_for_topic(topic, test_data).unwrap();
 
-    let entry = wal.read_next(topic).unwrap().unwrap();
+    let entry = wal.read_next(topic, true).unwrap().unwrap();
     assert_eq!(entry.data, test_data);
 
     let path = first_data_file();
@@ -452,7 +455,7 @@ fn integration_corruption_detection_comprehensive() {
 
         let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-        match wal2.read_next(topic).unwrap() {
+        match wal2.read_next(topic, true).unwrap() {
             None => {}
             Some(corrupted_entry) => {
                 assert_ne!(
@@ -469,9 +472,10 @@ fn integration_extreme_topic_count() {
     let _env = setup_test_env();
 
     let wal = Walrus::with_consistency_and_schedule(
-            ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::SyncEach,
-    ).unwrap();
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::SyncEach,
+    )
+    .unwrap();
     let num_topics = 5000; // Extreme number of topics
 
     for topic_id in 0..num_topics {
@@ -493,7 +497,7 @@ fn integration_extreme_topic_count() {
 
     for &topic_id in &read_order {
         let topic = format!("extreme_topic_{:06}", topic_id);
-        let entry = wal.read_next(&topic).unwrap().unwrap();
+        let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
         let read_topic_id = u64::from_le_bytes([
             entry.data[0],
@@ -534,7 +538,7 @@ fn integration_mixed_size_stress() {
     }
 
     for (i, &base_size) in base_sizes.iter().enumerate() {
-        let entry = wal.read_next(topic).unwrap().unwrap();
+        let entry = wal.read_next(topic, true).unwrap().unwrap();
         assert_eq!(entry.data.len(), base_size);
 
         for (j, &byte) in entry.data.iter().enumerate() {
@@ -580,7 +584,7 @@ fn integration_persistence_stress_with_validation() {
             let topic = format!("persist_stress_{}", topic_id);
 
             for _ in 0..(entries_per_topic / 2) {
-                wal.read_next(&topic).unwrap().unwrap();
+                wal.read_next(&topic, true).unwrap().unwrap();
             }
         }
     } // WAL instance dropped here
@@ -594,7 +598,7 @@ fn integration_persistence_stress_with_validation() {
             let topic = format!("persist_stress_{}", topic_id);
 
             for entry_id in (entries_per_topic / 2)..entries_per_topic {
-                let entry = wal.read_next(&topic).unwrap().unwrap();
+                let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
                 let read_topic_id = u32::from_le_bytes([
                     entry.data[0],
@@ -628,7 +632,7 @@ fn integration_persistence_stress_with_validation() {
                 assert_eq!(actual_payload, expected_payload);
             }
 
-            assert!(wal.read_next(&topic).unwrap().is_none());
+            assert!(wal.read_next(&topic, true).unwrap().is_none());
         }
     }
 }
@@ -673,7 +677,7 @@ fn integration_data_pattern_stress() {
     }
 
     for (pattern_name, expected_data) in patterns {
-        let entry = wal.read_next(&pattern_name).unwrap().unwrap();
+        let entry = wal.read_next(&pattern_name, true).unwrap().unwrap();
         assert_eq!(
             entry.data, expected_data,
             "Pattern '{}' was corrupted during storage/retrieval",
@@ -704,7 +708,7 @@ fn integration_special_topic_names() {
 
     for (i, topic) in topics.iter().enumerate() {
         let expected = format!("Data for topic {}", i);
-        let entry = wal.read_next(topic).unwrap().unwrap();
+        let entry = wal.read_next(topic, true).unwrap().unwrap();
         let actual = String::from_utf8(entry.data).unwrap();
         assert_eq!(actual, expected);
     }
@@ -720,7 +724,10 @@ fn exactly_once_delivery_guarantee() {
     }
 
     for i in 0..5 {
-        assert_eq!(wal.read_next("exactly_once").unwrap().unwrap().data, &[i]);
+        assert_eq!(
+            wal.read_next("exactly_once", true).unwrap().unwrap().data,
+            &[i]
+        );
     }
 
     drop(wal);
@@ -732,6 +739,9 @@ fn exactly_once_delivery_guarantee() {
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     for i in 5..10 {
-        assert_eq!(wal2.read_next("exactly_once").unwrap().unwrap().data, &[i]);
+        assert_eq!(
+            wal2.read_next("exactly_once", true).unwrap().unwrap().data,
+            &[i]
+        );
     }
 }

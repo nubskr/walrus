@@ -22,10 +22,13 @@ pub fn batch_append_for_topic(
 ```
 
 **Constraints:**
+- Maximum entries per batch: 2,000 (hard cap shared with batch reads)
 - Maximum batch size: 10GB total (sum of all entries + metadata)
 - Returns `ErrorKind::InvalidInput` if batch exceeds limit
 - Returns `ErrorKind::WouldBlock` if another batch write is in progress for this topic
-- Returns `ErrorKind::Unsupported` if FD backend is not enabled
+- Falls back to sequential writes when the mmap backend is active; the io_uring
+  path requires the FD backend and will return `ErrorKind::Unsupported` if the
+  storage handle is not fd-backed.
 
 ### Key Design Decisions
 

@@ -88,19 +88,19 @@ fn test_zeroed_header_stops_block_scanning() {
 
         // Should only recover entries 0 and 1 (before the zeroed header)
         let e0 = wal
-            .read_next("zero_test")
+            .read_next("zero_test", true)
             .unwrap()
             .expect("Should read entry_0");
         assert_eq!(e0.data, b"entry_0", "First entry should be entry_0");
 
         let e1 = wal
-            .read_next("zero_test")
+            .read_next("zero_test", true)
             .unwrap()
             .expect("Should read entry_1");
         assert_eq!(e1.data, b"entry_1", "Second entry should be entry_1");
 
         // Should not see entries 2, 3, 4 (they're after the zeroed header)
-        let e2 = wal.read_next("zero_test").unwrap();
+        let e2 = wal.read_next("zero_test", true).unwrap();
         assert!(
             e2.is_none(),
             "Should not read entry_2 or beyond (zeroed header stops scan)"
@@ -109,7 +109,7 @@ fn test_zeroed_header_stops_block_scanning() {
         // Verify WAL is still usable for new writes
         wal.append_for_topic("zero_test", b"new_entry").unwrap();
         let new = wal
-            .read_next("zero_test")
+            .read_next("zero_test", true)
             .unwrap()
             .expect("Should read new entry after recovery");
         assert_eq!(
@@ -180,7 +180,7 @@ fn test_concurrent_rollback_cleanup() {
     // Verify only the winner's data is visible
     let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
-    while let Some(entry) = wal.read_next("rollback_cleanup").unwrap() {
+    while let Some(entry) = wal.read_next("rollback_cleanup", true).unwrap() {
         assert_eq!(entry.data.len(), 512 * 1024, "Entry size should be 512KB");
         assert_eq!(
             entry.data[0], winner,
@@ -216,7 +216,7 @@ fn test_rollback_with_block_spanning() {
 
     // Read it to establish position
     let entry = wal
-        .read_next("spanning_test")
+        .read_next("spanning_test", true)
         .unwrap()
         .expect("Should read initial 8MB entry");
     assert_eq!(
@@ -268,7 +268,7 @@ fn test_rollback_with_block_spanning() {
     // Verify only winner's entries are visible (rollback zeroed losers' headers across blocks)
     let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
-    while let Some(entry) = wal.read_next("spanning_test").unwrap() {
+    while let Some(entry) = wal.read_next("spanning_test", true).unwrap() {
         assert_eq!(entry.data.len(), 6 * 1024 * 1024, "Entry should be 6MB");
         assert_eq!(entry.data[0], winner, "Entry should be from winner batch");
         count += 1;
@@ -341,13 +341,13 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
 
         // Should recover first entry (before zeroed header)
         let e1 = wal
-            .read_next("preserve_test")
+            .read_next("preserve_test", true)
             .unwrap()
             .expect("Should read small_1");
         assert_eq!(e1.data, b"small_1", "First entry should be small_1");
 
         // Should not see the large entry (zeroed header) or small_2 (after zeroed header)
-        let e2 = wal.read_next("preserve_test").unwrap();
+        let e2 = wal.read_next("preserve_test", true).unwrap();
         assert!(
             e2.is_none(),
             "Should not read past zeroed header (preserves data before, blocks garbage after)"
@@ -357,7 +357,7 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         wal.append_for_topic("preserve_test", b"new_after_recovery")
             .unwrap();
         let new_entry = wal
-            .read_next("preserve_test")
+            .read_next("preserve_test", true)
             .unwrap()
             .expect("Should read new entry");
         assert_eq!(

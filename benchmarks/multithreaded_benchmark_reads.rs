@@ -629,7 +629,7 @@ fn multithreaded_read_benchmark() {
 
             // Read phase - consume all written data and continue reading
             while read_start_time.elapsed() < read_duration {
-                match wal_clone.read_next(&topic) {
+                match wal_clone.read_next(&topic, true) {
                     Ok(Some(entry)) => {
                         local_reads += 1;
                         local_read_bytes += entry.data.len() as u64;

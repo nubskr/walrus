@@ -16,7 +16,7 @@
 //! wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
 //!
 //! // Read data from the topic
-//! if let Some(entry) = wal.read_next("my-topic")? {
+//! if let Some(entry) = wal.read_next("my-topic", true)? {
 //!     println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
 //! }
 //! # Ok(())
@@ -50,4 +50,6 @@
 
 #![recursion_limit = "256"]
 pub mod wal;
-pub use wal::{Entry, FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend, disable_fd_backend};
+pub use wal::{
+    Entry, FsyncSchedule, ReadConsistency, Walrus, disable_fd_backend, enable_fd_backend,
+};

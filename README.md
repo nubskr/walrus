@@ -16,6 +16,7 @@
 - **High Performance**: Optimized for concurrent writes and reads
 - **Topic-based Organization**: Separate read/write streams per topic
 - **Configurable Consistency**: Choose between strict and relaxed consistency models
+- **Batched I/O**: Atomic batch append and capped batch read APIs with io_uring acceleration on Linux
 - **Memory-mapped I/O**: Efficient file operations using memory mapping
 - **Persistent Read Offsets**: Read positions survive process restarts
 - **Coordination-free Deletion**: Atomic file cleanup without blocking operations
@@ -52,15 +53,18 @@ let data = b"Hello, Walrus!";
 wal.append_for_topic("my-topic", data)?;
 
 // Read data from the topic
-if let Some(entry) = wal.read_next("my-topic")? {
+if let Some(entry) = wal.read_next("my-topic", true)? {
     println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
 }
 ```
 
+To peek without consuming an entry, call `read_next("my-topic", false)`; the cursor only advances
+when you pass `true`.
+
 ### Advanced Configuration
 
 ```rust
-use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule, enable_fd_backend};
 
 // Configure with custom consistency and fsync behavior
 let wal = Walrus::with_consistency_and_schedule(
@@ -70,6 +74,9 @@ let wal = Walrus::with_consistency_and_schedule(
 
 // Write and read operations work the same way
 wal.append_for_topic("events", b"event data")?;
+
+// Explicitly select the fd + io_uring backend (Linux; enabled by default)
+enable_fd_backend();
 ```
 
 ## Configuration Options
@@ -142,9 +149,33 @@ let wal = Walrus::with_consistency_and_schedule(
 )?;
 ```
 
+### I/O Backend Selection
+
+Walrus ships with two storage backends:
+
+- **FD backend (default on Linux)**: Uses file descriptors for I/O and enables
+  the `io_uring` fast-path for batch appends and reads.
+- **Mmap backend**: Falls back to memory-mapped I/O. Batch append and read
+  helpers execute sequentially without `io_uring`.
+
+Switching between backends is a process-wide toggle:
+
+```rust
+use walrus_rust::{enable_fd_backend, disable_fd_backend};
+
+disable_fd_backend(); // choose mmap backend explicitly
+// ... work with Walrus::new() instances ...
+enable_fd_backend();  // revert to fd + io_uring backend
+```
+
+You can also set `WALRUS_QUIET=1` to silence debug output when flipping
+backends.
+
 ### Environment Variables
 
 - **`WALRUS_QUIET`**: Set to any value to suppress debug output during operations
+- **`WALRUS_DATA_DIR`**: Override the default `wal_files/` directory used for log and index storage
+- **`WALRUS_INSTANCE_KEY`**: Force all instances created via default constructors to namespace their files under `wal_files/<sanitized-key>/`
 - **`WALRUS_FSYNC`**: Configure fsync schedule for benchmarks (`sync-each`, `no-fsync`, `async`, `<number>ms`)
 - **`WALRUS_THREADS`**: Configure thread range for scaling benchmark (`<number>` or `<start-end>`)
 - **`WALRUS_DURATION`**: Configure benchmark duration for both write and read phases (`30s`, `2m`, `1h`)
@@ -181,6 +212,8 @@ wal_files/
 Each `Walrus` instance writes under `wal_files/`. Instances created with the new
 key-aware constructors store their files inside a sanitized subdirectory named
 after the key, keeping topics with different durability requirements isolated.
+Set `WALRUS_DATA_DIR=/path/to/data` before constructing an instance to relocate
+the entire tree elsewhere.
 
 ### Storage Configuration
 
@@ -222,9 +255,39 @@ without switching APIs.
 
 #### `append_for_topic(&self, topic: &str, data: &[u8]) -> std::io::Result<()>`
 Appends data to the specified topic. Topics are created automatically on first write.
+If a batch write is currently in-flight for the topic the call fails fast with
+`ErrorKind::WouldBlock`; retry once the batch completes.
 
-#### `read_next(&self, topic: &str) -> std::io::Result<Option<Entry>>`
-Reads the next entry from the topic. Returns `None` if no more data is available.
+#### `read_next(&self, topic: &str, checkpoint: bool) -> std::io::Result<Option<Entry>>`
+Reads the next entry from the topic. Pass `checkpoint = true` to advance the cursor (persisting
+progress according to the configured consistency mode). Passing `false` returns the entry without
+moving the cursor so the same data can be re-read later. Returns `None` if no more data is available.
+
+### Batch Operations
+
+#### `batch_append_for_topic(&self, topic: &str, batch: &[&[u8]]) -> std::io::Result<()>`
+- Writes up to **2,000** entries atomically (shared with batch reads). Batches larger than this limit or exceeding 10 GB (payload + metadata) return `ErrorKind::InvalidInput`.
+- Acquires a per-topic batch flag; concurrent single writes/batches receive `ErrorKind::WouldBlock` while a batch is active.
+- Uses `io_uring` on Linux when the fd backend is enabled (default); otherwise it falls back to sequential writes through the mmap backend.
+- Any failure (write error, fsync failure, checksum mismatch) rolls back the batch before propagating the error.
+
+```rust
+let wal = Walrus::new()?;
+let batch: Vec<Vec<u8>> = (0..2000).map(|i| format!("msg-{i}").into_bytes()).collect();
+let batch_refs: Vec<&[u8]> = batch.iter().map(|m| m.as_slice()).collect();
+wal.batch_append_for_topic("events", &batch_refs)?;
+```
+
+#### `batch_read_for_topic(&self, topic: &str, max_bytes: usize, checkpoint: bool) -> std::io::Result<Vec<Entry>>`
+- Returns entries in commit order up to `max_bytes` of payload **or** the 2,000-entry ceiling, whichever comes first (the first entry is always returned, even if it exceeds `max_bytes`).
+- On Linux with the fd backend enabled the reader issues one `io_uring` read per contiguous range; other configurations fall back to mmap reads.
+- When `checkpoint = true`, the reader advances its cursor (respecting the configured persistence cadence). Passing `false` leaves the cursor unchanged so callers can peek without consuming data.
+- Subsequent invocations continue from the last checkpointed cursor so larger batches are streamed across multiple calls.
+
+```rust
+let chunk = wal.batch_read_for_topic("events", 512 * 1024, true)?; // ~512KB budget
+println!("read {} entries", chunk.len());
+```
 
 ### Data Types
 

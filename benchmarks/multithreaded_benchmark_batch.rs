@@ -173,8 +173,8 @@ fn parse_batch_size() -> usize {
         }
     }
 
-        // Default batch size (exactly at 2000 entry limit)
-        2000
+    // Default batch size (exactly at 2000 entry limit)
+    2000
 }
 
 fn parse_duration() -> Duration {
@@ -257,9 +257,13 @@ fn print_usage() {
         "  WALRUS_FSYNC=no-fsync WALRUS_DURATION=1m WALRUS_BATCH_SIZE=200 cargo test multithreaded_benchmark_batch"
     );
     println!("  WALRUS_FSYNC=500ms WALRUS_DURATION=5m cargo test multithreaded_benchmark_batch");
-    println!("  cargo test multithreaded_benchmark_batch -- --fsync no-fsync --duration 1m --batch-size 150");
+    println!(
+        "  cargo test multithreaded_benchmark_batch -- --fsync no-fsync --duration 1m --batch-size 150"
+    );
     println!();
-    println!("Note: This benchmark uses batch_append_for_topic() which requires FD backend on Linux.");
+    println!(
+        "Note: This benchmark uses batch_append_for_topic() which requires FD backend on Linux."
+    );
 }
 
 fn cleanup_wal() {
@@ -293,8 +297,10 @@ fn multithreaded_batch_benchmark() {
     let batch_size = parse_batch_size();
 
     println!("=== Multi-threaded WAL Batch Benchmark ===");
+    let num_threads = 16; // Number of concurrent writer threads
     println!(
-        "Configuration: 10 threads, {:.0}s write phase only, batch size: {} entries/batch",
+        "Configuration: {} threads, {:.0}s write phase only, batch size: {} entries/batch",
+        num_threads,
         write_duration.as_secs(),
         batch_size
     );
@@ -307,12 +313,13 @@ fn multithreaded_batch_benchmark() {
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
-            ReadConsistency::AtLeastOnce { persist_every: 5000 },
+            ReadConsistency::AtLeastOnce {
+                persist_every: 5000,
+            },
             fsync_schedule,
         )
         .expect("Failed to create Walrus"),
     );
-    let num_threads = 10; // Scaled up to 10 threads with small random entries
 
     // Shared counters for statistics
     let total_batches = Arc::new(AtomicU64::new(0));
@@ -337,7 +344,9 @@ fn multithreaded_batch_benchmark() {
     let write_end_barrier = Arc::new(Barrier::new(num_threads + 1));
 
     // Topic names for each thread
-    let topics: Vec<String> = (0..num_threads).map(|i| format!("batch_topic_{}", i)).collect();
+    let topics: Vec<String> = (0..num_threads)
+        .map(|i| format!("batch_topic_{}", i))
+        .collect();
 
     println!("Starting {} batch writer threads...", num_threads);
 
@@ -575,7 +584,10 @@ fn multithreaded_batch_benchmark() {
 
     println!("\n=== Write Phase Results ===");
     println!("Write Duration: {:?}", write_elapsed);
-    println!("Total Operations: {} batches ({} entries)", final_batches, final_entries);
+    println!(
+        "Total Operations: {} batches ({} entries)",
+        final_batches, final_entries
+    );
     println!("Total Bytes: {} MB", final_write_bytes / (1024 * 1024));
     println!("Write Errors: {}", final_errors);
     println!(
@@ -583,7 +595,7 @@ fn multithreaded_batch_benchmark() {
         final_batches as f64 / write_elapsed.as_secs_f64()
     );
     println!(
-        "Entry Throughput: {:.0} entries/sec", 
+        "Entry Throughput: {:.0} entries/sec",
         final_entries as f64 / write_elapsed.as_secs_f64()
     );
     println!(

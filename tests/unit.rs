@@ -3,10 +3,10 @@ mod common;
 use common::{TestEnv, current_wal_dir};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use walrus_rust::ReadConsistency;
-use walrus_rust::wal::{Entry, WalIndex, Walrus};
 use std::thread;
 use std::time::Duration;
+use walrus_rust::ReadConsistency;
+use walrus_rust::wal::{Entry, WalIndex, Walrus};
 
 fn setup_wal_env() -> TestEnv {
     TestEnv::new()
@@ -58,9 +58,18 @@ fn large_entry_forces_block_seal() {
     wal.append_for_topic("t", &large_data_2).unwrap();
     wal.append_for_topic("t", &large_data_3).unwrap();
 
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, large_data_1);
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, large_data_2);
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, large_data_3); // it will fail because it's in the write block still :))
+    assert_eq!(
+        wal.read_next("t", true).unwrap().unwrap().data,
+        large_data_1
+    );
+    assert_eq!(
+        wal.read_next("t", true).unwrap().unwrap().data,
+        large_data_2
+    );
+    assert_eq!(
+        wal.read_next("t", true).unwrap().unwrap().data,
+        large_data_3
+    ); // it will fail because it's in the write block still :))
 }
 
 #[test]
@@ -69,9 +78,9 @@ fn basic_roundtrip_single_topic() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"x").unwrap();
     wal.append_for_topic("t", b"y").unwrap();
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"x");
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"y");
-    assert!(wal.read_next("t").unwrap().is_none());
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"x");
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"y");
+    assert!(wal.read_next("t", true).unwrap().is_none());
 }
 
 #[test]
@@ -80,8 +89,8 @@ fn basic_roundtrip_multi_topic() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("a", b"1").unwrap();
     wal.append_for_topic("b", b"2").unwrap();
-    assert_eq!(wal.read_next("a").unwrap().unwrap().data, b"1");
-    assert_eq!(wal.read_next("b").unwrap().unwrap().data, b"2");
+    assert_eq!(wal.read_next("a", true).unwrap().unwrap().data, b"1");
+    assert_eq!(wal.read_next("b", true).unwrap().unwrap().data, b"2");
 }
 
 #[test]
@@ -90,13 +99,13 @@ fn persists_read_offsets_across_restart() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     wal.append_for_topic("t", b"a").unwrap();
     wal.append_for_topic("t", b"b").unwrap();
-    assert_eq!(wal.read_next("t").unwrap().unwrap().data, b"a");
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"a");
     // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
     // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
     thread::sleep(Duration::from_millis(50));
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    assert_eq!(wal2.read_next("t").unwrap().unwrap().data, b"b");
-    assert!(wal2.read_next("t").unwrap().is_none());
+    assert_eq!(wal2.read_next("t", true).unwrap().unwrap().data, b"b");
+    assert!(wal2.read_next("t", true).unwrap().is_none());
 }
 
 #[test]
@@ -123,7 +132,7 @@ fn checksum_corruption_is_detected_via_public_api() {
         panic!("payload not found to corrupt");
     }
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let res = wal2.read_next("t").unwrap();
+    let res = wal2.read_next("t", true).unwrap();
     assert!(res.is_none());
 }
 
@@ -141,12 +150,39 @@ fn stress_massive_single_entry() {
 
     wal.append_for_topic("massive", &massive_data).unwrap();
 
-    let entry = wal.read_next("massive").unwrap().unwrap();
+    let entry = wal.read_next("massive", true).unwrap().unwrap();
     assert_eq!(entry.data.len(), size);
 
     for (i, &byte) in entry.data.iter().enumerate() {
         assert_eq!(byte, (i % 256) as u8, "Data corruption at byte {}", i);
     }
+}
+
+#[test]
+fn read_next_without_checkpoint_does_not_advance() {
+    let _guard = setup_wal_env();
+    let wal = Walrus::new().unwrap();
+
+    wal.append_for_topic("peek_topic", b"first").unwrap();
+    wal.append_for_topic("peek_topic", b"second").unwrap();
+
+    // Peek without advancing
+    let first = wal.read_next("peek_topic", false).unwrap().unwrap();
+    assert_eq!(first.data, b"first");
+
+    // The same entry should still be returned until we checkpoint
+    let first_again = wal.read_next("peek_topic", false).unwrap().unwrap();
+    assert_eq!(first_again.data, b"first");
+
+    // Checkpointing advances to the next entry
+    let committed_first = wal.read_next("peek_topic", true).unwrap().unwrap();
+    assert_eq!(committed_first.data, b"first");
+
+    let second = wal.read_next("peek_topic", true).unwrap().unwrap();
+    assert_eq!(second.data, b"second");
+
+    // No more data after consuming both entries
+    assert!(wal.read_next("peek_topic", true).unwrap().is_none());
 }
 
 #[test]
@@ -176,7 +212,7 @@ fn stress_many_topics_with_validation() {
         let topic = format!("topic_{:04}", topic_id);
 
         for entry_id in 0..entries_per_topic {
-            let entry = wal.read_next(&topic).unwrap().unwrap();
+            let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
             let read_topic_id =
                 u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
@@ -191,7 +227,7 @@ fn stress_many_topics_with_validation() {
             assert_eq!(actual_payload, expected_payload);
         }
 
-        assert!(wal.read_next(&topic).unwrap().is_none());
+        assert!(wal.read_next(&topic, true).unwrap().is_none());
     }
 }
 
@@ -215,7 +251,7 @@ fn stress_rapid_write_read_cycles() {
 
         wal.append_for_topic(topic, &data).unwrap();
 
-        let entry = wal.read_next(topic).unwrap().unwrap();
+        let entry = wal.read_next(topic, true).unwrap().unwrap();
 
         let read_cycle = u64::from_le_bytes([
             entry.data[0],
@@ -272,7 +308,7 @@ fn stress_boundary_conditions() {
 
         wal.append_for_topic(&topic, &data).unwrap();
 
-        let entry = wal.read_next(&topic).unwrap().unwrap();
+        let entry = wal.read_next(&topic, true).unwrap().unwrap();
         assert_eq!(entry.data.len(), size);
 
         for (j, &byte) in entry.data.iter().enumerate() {
@@ -320,7 +356,7 @@ fn stress_data_integrity_patterns() {
     for (pattern_name, data) in patterns {
         wal.append_for_topic(pattern_name, &data).unwrap();
 
-        let entry = wal.read_next(pattern_name).unwrap().unwrap();
+        let entry = wal.read_next(pattern_name, true).unwrap().unwrap();
         assert_eq!(entry.data, data, "Pattern {} corrupted", pattern_name);
     }
 }
@@ -355,7 +391,7 @@ fn stress_concurrent_topic_validation() {
         let topic = format!("concurrent_{}", topic_id);
 
         for round in 0..entries_per_topic {
-            let entry = wal.read_next(&topic).unwrap().unwrap();
+            let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
             let read_topic_id =
                 u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
@@ -396,7 +432,7 @@ fn stress_extreme_topic_names() {
 
         match wal.append_for_topic(topic, &data) {
             Ok(_) => {
-                let entry = wal.read_next(topic).unwrap().unwrap();
+                let entry = wal.read_next(topic, true).unwrap().unwrap();
                 assert_eq!(entry.data, data);
             }
             Err(_) => {
@@ -417,7 +453,7 @@ mod checksum_tests {
         let test_data = b"test_checksum_data_12345";
         wal.append_for_topic("checksum_test", test_data).unwrap();
 
-        let entry = wal.read_next("checksum_test").unwrap().unwrap();
+        let entry = wal.read_next("checksum_test", true).unwrap().unwrap();
         assert_eq!(entry.data, test_data);
 
         let path = first_data_file();
@@ -446,7 +482,7 @@ mod checksum_tests {
         }
 
         let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-        let result = wal2.read_next("checksum_test").unwrap();
+        let result = wal2.read_next("checksum_test", true).unwrap();
 
         match result {
             None => {}
@@ -576,7 +612,7 @@ mod walrus_integration_tests {
         let _guard = setup_wal_env();
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-        assert!(wal.read_next("empty_topic").unwrap().is_none());
+        assert!(wal.read_next("empty_topic", true).unwrap().is_none());
     }
 
     #[test]
@@ -587,11 +623,17 @@ mod walrus_integration_tests {
         wal.append_for_topic("topic1", b"data1").unwrap();
         wal.append_for_topic("topic2", b"data2").unwrap();
 
-        assert_eq!(wal.read_next("topic1").unwrap().unwrap().data, b"data1");
-        assert_eq!(wal.read_next("topic2").unwrap().unwrap().data, b"data2");
+        assert_eq!(
+            wal.read_next("topic1", true).unwrap().unwrap().data,
+            b"data1"
+        );
+        assert_eq!(
+            wal.read_next("topic2", true).unwrap().unwrap().data,
+            b"data2"
+        );
 
-        assert!(wal.read_next("topic1").unwrap().is_none());
-        assert!(wal.read_next("topic2").unwrap().is_none());
+        assert!(wal.read_next("topic1", true).unwrap().is_none());
+        assert!(wal.read_next("topic2", true).unwrap().is_none());
     }
 
     #[test]
@@ -606,12 +648,12 @@ mod walrus_integration_tests {
 
         for expected in &entries {
             assert_eq!(
-                wal.read_next("multi_topic").unwrap().unwrap().data,
+                wal.read_next("multi_topic", true).unwrap().unwrap().data,
                 expected.as_slice()
             );
         }
 
-        assert!(wal.read_next("multi_topic").unwrap().is_none());
+        assert!(wal.read_next("multi_topic", true).unwrap().is_none());
     }
 
     #[test]
@@ -624,10 +666,10 @@ mod walrus_integration_tests {
         wal.append_for_topic("a", b"a2").unwrap();
         wal.append_for_topic("b", b"b2").unwrap();
 
-        assert_eq!(wal.read_next("a").unwrap().unwrap().data, b"a1");
-        assert_eq!(wal.read_next("b").unwrap().unwrap().data, b"b1");
-        assert_eq!(wal.read_next("a").unwrap().unwrap().data, b"a2");
-        assert_eq!(wal.read_next("b").unwrap().unwrap().data, b"b2");
+        assert_eq!(wal.read_next("a", true).unwrap().unwrap().data, b"a1");
+        assert_eq!(wal.read_next("b", true).unwrap().unwrap().data, b"b1");
+        assert_eq!(wal.read_next("a", true).unwrap().unwrap().data, b"a2");
+        assert_eq!(wal.read_next("b", true).unwrap().unwrap().data, b"b2");
     }
 
     #[test]
@@ -644,7 +686,7 @@ mod walrus_integration_tests {
 
         for (i, size) in sizes.iter().enumerate() {
             let expected = vec![i as u8 + 1; *size];
-            let actual = wal.read_next("large_test").unwrap().unwrap().data;
+            let actual = wal.read_next("large_test", true).unwrap().unwrap().data;
             assert_eq!(actual, expected);
         }
     }
@@ -657,8 +699,11 @@ mod walrus_integration_tests {
         wal.append_for_topic("empty", b"").unwrap();
         wal.append_for_topic("empty", b"not_empty").unwrap();
 
-        assert_eq!(wal.read_next("empty").unwrap().unwrap().data, b"");
-        assert_eq!(wal.read_next("empty").unwrap().unwrap().data, b"not_empty");
+        assert_eq!(wal.read_next("empty", true).unwrap().unwrap().data, b"");
+        assert_eq!(
+            wal.read_next("empty", true).unwrap().unwrap().data,
+            b"not_empty"
+        );
     }
 
     #[test]
@@ -672,15 +717,18 @@ mod walrus_integration_tests {
         }
 
         for i in 0..5 {
-            assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, &[i]);
+            assert_eq!(wal.read_next("topic_a", true).unwrap().unwrap().data, &[i]);
         }
 
         for i in 0..10 {
-            assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, &[i + 100]);
+            assert_eq!(
+                wal.read_next("topic_b", true).unwrap().unwrap().data,
+                &[i + 100]
+            );
         }
 
         for i in 5..10 {
-            assert_eq!(wal.read_next("topic_a").unwrap().unwrap().data, &[i]);
+            assert_eq!(wal.read_next("topic_a", true).unwrap().unwrap().data, &[i]);
         }
     }
 
@@ -696,20 +744,20 @@ mod walrus_integration_tests {
                 .unwrap();
 
             assert_eq!(
-                wal.read_next("recovery_test").unwrap().unwrap().data,
+                wal.read_next("recovery_test", true).unwrap().unwrap().data,
                 b"before_restart"
             );
         }
-        
+
         thread::sleep(Duration::from_millis(50));
 
         {
             let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
             assert_eq!(
-                wal.read_next("recovery_test").unwrap().unwrap().data,
+                wal.read_next("recovery_test", true).unwrap().unwrap().data,
                 b"also_before"
             );
-            assert!(wal.read_next("recovery_test").unwrap().is_none());
+            assert!(wal.read_next("recovery_test", true).unwrap().is_none());
         }
     }
 
@@ -719,11 +767,14 @@ mod walrus_integration_tests {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
         wal.append_for_topic("test", b"first").unwrap();
-        assert_eq!(wal.read_next("test").unwrap().unwrap().data, b"first");
-        assert!(wal.read_next("test").unwrap().is_none());
+        assert_eq!(wal.read_next("test", true).unwrap().unwrap().data, b"first");
+        assert!(wal.read_next("test", true).unwrap().is_none());
 
         wal.append_for_topic("test", b"second").unwrap();
-        assert_eq!(wal.read_next("test").unwrap().unwrap().data, b"second");
+        assert_eq!(
+            wal.read_next("test", true).unwrap().unwrap().data,
+            b"second"
+        );
     }
 
     #[test]
@@ -740,22 +791,22 @@ mod walrus_integration_tests {
         }
 
         assert_eq!(
-            wal.read_next("topic_large").unwrap().unwrap().data,
+            wal.read_next("topic_large", true).unwrap().unwrap().data,
             large_data
         );
         assert_eq!(
-            wal.read_next("topic_large").unwrap().unwrap().data,
+            wal.read_next("topic_large", true).unwrap().unwrap().data,
             large_data
         );
-        assert!(wal.read_next("topic_large").unwrap().is_none());
+        assert!(wal.read_next("topic_large", true).unwrap().is_none());
 
         for i in 0..100 {
             assert_eq!(
-                wal.read_next("topic_small").unwrap().unwrap().data,
+                wal.read_next("topic_small", true).unwrap().unwrap().data,
                 &[i as u8]
             );
         }
-        assert!(wal.read_next("topic_small").unwrap().is_none());
+        assert!(wal.read_next("topic_small", true).unwrap().is_none());
     }
 }
 
@@ -783,7 +834,7 @@ mod error_handling_tests {
         }
 
         let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-        let _result = wal2.read_next("test").unwrap();
+        let _result = wal2.read_next("test", true).unwrap();
     }
 }
 
@@ -805,11 +856,11 @@ mod stress_tests {
 
         for i in 0..num_entries {
             let expected = format!("entry_{:04}", i);
-            let actual = wal.read_next("stress_small").unwrap().unwrap().data;
+            let actual = wal.read_next("stress_small", true).unwrap().unwrap().data;
             assert_eq!(actual, expected.as_bytes());
         }
 
-        assert!(wal.read_next("stress_small").unwrap().is_none());
+        assert!(wal.read_next("stress_small", true).unwrap().is_none());
     }
 
     #[test]
@@ -832,10 +883,10 @@ mod stress_tests {
             let topic_name = format!("stress_topic_{}", topic_id);
             for entry_id in 0..entries_per_topic {
                 let expected = format!("t{}_e{}", topic_id, entry_id);
-                let actual = wal.read_next(&topic_name).unwrap().unwrap().data;
+                let actual = wal.read_next(&topic_name, true).unwrap().unwrap().data;
                 assert_eq!(actual, expected.as_bytes());
             }
-            assert!(wal.read_next(&topic_name).unwrap().is_none());
+            assert!(wal.read_next(&topic_name, true).unwrap().is_none());
         }
     }
 }
