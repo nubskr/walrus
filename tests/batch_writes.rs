@@ -557,9 +557,12 @@ fn test_chaos_batch_write_crash_recovery() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
+    let test_key = "crash_recovery_test";
+
     // Phase 1: Write batch and "crash" (drop WAL)
     {
-        let wal = Walrus::with_consistency_and_schedule(
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            test_key,
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
@@ -572,9 +575,10 @@ fn test_chaos_batch_write_crash_recovery() {
         drop(wal);
     }
 
-    // Phase 2: Recover and verify
+    // Phase 2: Recover and verify - SAME KEY ensures same directory
     {
-        let wal = Walrus::with_consistency_and_schedule(
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            test_key,
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::SyncEach,
         )
@@ -785,8 +789,11 @@ fn test_chaos_sequential_batches_with_crashes() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
+    let test_key = "sequential_crashes_test";
+
     for cycle in 0..5 {
-        let wal = Walrus::with_consistency_and_schedule(
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            test_key,
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
@@ -802,7 +809,8 @@ fn test_chaos_sequential_batches_with_crashes() {
     }
 
     // Final recovery: should see all 5 cycles × 2 entries = 10 entries
-    let wal = Walrus::with_consistency_and_schedule(
+    let wal = Walrus::with_consistency_and_schedule_for_key(
+        test_key,
         ReadConsistency::StrictlyAtOnce,
         FsyncSchedule::SyncEach,
     )
@@ -1426,9 +1434,12 @@ fn test_integrity_batch_after_crash_recovery() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
+    let test_key = "integrity_crash_test";
+
     // Phase 1: Write batch with verifiable data
     {
-        let wal = Walrus::with_consistency_and_schedule(
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            test_key,
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::SyncEach,  // MUST sync for crash recovery tests!
         )
@@ -1454,9 +1465,10 @@ fn test_integrity_batch_after_crash_recovery() {
         drop(wal);
     }
 
-    // Phase 2: Recover and verify exact data
+    // Phase 2: Recover and verify exact data - SAME KEY ensures same directory
     {
-        let wal = Walrus::with_consistency_and_schedule(
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            test_key,
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::SyncEach,
         )
