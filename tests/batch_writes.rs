@@ -561,7 +561,7 @@ fn test_chaos_batch_write_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
+            FsyncSchedule::SyncEach,
         )
         .unwrap();
 
@@ -576,7 +576,7 @@ fn test_chaos_batch_write_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
+            FsyncSchedule::SyncEach,
         )
         .unwrap();
 
@@ -788,7 +788,7 @@ fn test_chaos_sequential_batches_with_crashes() {
     for cycle in 0..5 {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
+            FsyncSchedule::SyncEach,
         )
         .unwrap();
 
@@ -804,7 +804,7 @@ fn test_chaos_sequential_batches_with_crashes() {
     // Final recovery: should see all 5 cycles × 2 entries = 10 entries
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
+        FsyncSchedule::SyncEach,
     )
     .unwrap();
 
@@ -1430,7 +1430,7 @@ fn test_integrity_batch_after_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
+            FsyncSchedule::SyncEach,
         )
         .unwrap();
 
@@ -1458,7 +1458,7 @@ fn test_integrity_batch_after_crash_recovery() {
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
+            FsyncSchedule::SyncEach,
         )
         .unwrap();
 
