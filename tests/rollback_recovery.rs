@@ -4,6 +4,7 @@ use common::{TestEnv, current_wal_dir};
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
@@ -43,6 +44,10 @@ fn test_zeroed_header_stops_block_scanning() {
         }
 
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Phase 2: Manually zero the header of entry_2 (simulates rollback cleanup)
@@ -295,6 +300,10 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         wal.append_for_topic("preserve_test", b"small_2").unwrap();
 
         drop(wal);
+
+        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+        // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Phase 2: Zero the header of the large entry (simulates mid-batch rollback)

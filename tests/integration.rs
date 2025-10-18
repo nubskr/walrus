@@ -720,6 +720,11 @@ fn exactly_once_delivery_guarantee() {
     }
 
     drop(wal);
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+    thread::sleep(Duration::from_millis(50));
+
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     for i in 5..10 {

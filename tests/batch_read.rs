@@ -459,6 +459,10 @@ fn test_batch_read_recovery_mid_read() {
         read_so_far
     };
 
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+    thread::sleep(Duration::from_millis(50));
+
     // Phase 2: Recover and continue reading
     {
         test_println!("Phase 2: Recovering and continuing read");
@@ -553,6 +557,10 @@ fn test_batch_read_at_least_once_duplicates() {
 
         // Crash without reading more
     }
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+    thread::sleep(Duration::from_millis(50));
 
     // Phase 2: Recover - should see duplicates due to AtLeastOnce
     {
