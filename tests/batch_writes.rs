@@ -570,6 +570,9 @@ fn test_chaos_batch_write_crash_recovery() {
 
         // Simulate crash by dropping wal without graceful shutdown
         drop(wal);
+
+        // Small delay to ensure background threads complete
+        thread::sleep(Duration::from_millis(100));
     }
 
     // Phase 2: Recover and verify

@@ -121,6 +121,15 @@ impl WalPathManager {
         let path = self.root.join(&file_name);
         let f = std::fs::File::create(&path)?;
         f.set_len(MAX_FILE_SIZE)?;
+
+        // Sync file metadata (size, etc.) to disk
+        f.sync_all()?;
+
+        // CRITICAL for Linux: Sync parent directory to ensure directory entry is durable
+        // Without this, the file might exist but not be visible in directory listing after crash
+        let dir = std::fs::File::open(&self.root)?;
+        dir.sync_all()?;
+
         Ok(path.to_string_lossy().into_owned())
     }
 
