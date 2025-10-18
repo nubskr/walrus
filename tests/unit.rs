@@ -700,6 +700,8 @@ mod walrus_integration_tests {
                 b"before_restart"
             );
         }
+        
+        thread::sleep(Duration::from_millis(50));
 
         {
             let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
