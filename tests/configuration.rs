@@ -25,6 +25,10 @@ fn test_strictly_at_once_consistency() {
     assert_eq!(entry1.data, b"msg1");
 
     drop(wal);
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let entry2 = wal2.read_next("test").unwrap().unwrap();
     assert_eq!(entry2.data, b"msg2");
@@ -114,6 +118,9 @@ fn test_crash_recovery_strictly_at_once() {
         assert_eq!(entry2.data, b"recovery_msg_2");
     }
 
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -151,6 +158,9 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry2.data, b"at_least_once_msg_2");
     }
 
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     {
         let wal =
             Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
@@ -164,6 +174,9 @@ fn test_crash_recovery_at_least_once() {
         let entry3 = wal.read_next("recovery_test").unwrap().unwrap();
         assert_eq!(entry3.data, b"at_least_once_msg_3");
     }
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
 
     {
         let wal =
@@ -189,6 +202,10 @@ fn test_multiple_topics_different_consistency_behavior() {
     assert_eq!(wal.read_next("topic_b").unwrap().unwrap().data, b"b1");
 
     drop(wal);
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 2 }).unwrap();
 
     assert_eq!(wal2.read_next("topic_a").unwrap().unwrap().data, b"a1");
@@ -259,6 +276,10 @@ fn test_persist_every_zero_clamping() {
     assert_eq!(entry1.data, b"msg1");
 
     drop(wal);
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 0 }).unwrap();
 
     let entry2 = wal2.read_next("test").unwrap().unwrap();
@@ -543,11 +564,17 @@ fn key_based_instances_recover_independently() {
         wal.append_for_topic("tx", b"b").unwrap();
     }
 
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
+
     {
         let wal =
             Walrus::with_consistency_for_key("analytics", ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("events", b"x").unwrap();
     }
+
+    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+    thread::sleep(Duration::from_millis(50));
 
     let wal_tx =
         Walrus::with_consistency_for_key("transactions", ReadConsistency::StrictlyAtOnce).unwrap();
