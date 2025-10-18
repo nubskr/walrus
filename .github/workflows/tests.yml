@@ -1,11 +1,11 @@
-# COMMENTED OUT - Only running batch benchmark for now
-# name: Full Tests
+name: Full Tests
 
-# on:
-#   push:
-#     branches: [ main, master ]
-#   pull_request:
-#     branches: [ main, master ]
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 env:
   WALRUS_QUIET: "1"
@@ -19,7 +19,7 @@ jobs:
       matrix:
         test-target:
           - batch_read
-          # - batch_writes  # COMMENTED OUT - Only running batch benchmark for now
+          - batch_writes
           - configuration
           - e2e_longrunning
           - integration
