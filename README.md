@@ -22,7 +22,7 @@
 - **Coordination-free Deletion**: Atomic file cleanup without blocking operations
 - **Comprehensive Benchmarking**: Built-in performance testing suite
 
-## Benchmarks
+## Benchmark Quick Start
 
 Run quick benchmarks with:
 
@@ -183,18 +183,6 @@ backends.
 - **`WALRUS_READ_DURATION`**: Configure read phase duration specifically (`2m`, `180s`)
 - **`WALRUS_BATCH_SIZE`**: Override entries per batch for batch benchmarks (default 2000 for `multithreaded_benchmark_batch`, 256 for `batch_scaling_benchmark`)
 
-```bash
-export WALRUS_QUIET=1                    # Suppress debug messages
-export WALRUS_FSYNC=sync-each            # Use sync-each fsync for benchmarks
-export WALRUS_FSYNC=no-fsync             # Disable fsyncing for max performance
-export WALRUS_THREADS=16                 # Test scaling up to 16 threads
-export WALRUS_THREADS=2-8                # Test scaling from 2 to 8 threads
-export WALRUS_DURATION=30s               # Run benchmarks for 30 seconds
-export WALRUS_WRITE_DURATION=2m          # 2 minute write phase
-export WALRUS_READ_DURATION=1m           # 1 minute read phase
-export WALRUS_BATCH_SIZE=512             # Use 512 entries per batch in batch benchmarks
-```
-
 ## File Structure and Storage
 
 Walrus organizes data in the following structure:
@@ -335,261 +323,57 @@ Walrus includes a comprehensive benchmarking suite to measure performance across
 
 ### Running Benchmarks
 
-#### Using Make (Recommended)
-
-```bash
-# Run individual benchmarks (default settings)
-make bench-writes      # Write benchmark (async 1000ms fsync)
-make bench-reads       # Read benchmark (async 1000ms fsync)  
-make bench-scaling     # Scaling benchmark (1-10 threads, async 1000ms fsync)
-
-# Run with different fsync schedules
-make bench-writes-sync    # Fsync after every write (most durable, slowest)
-make bench-reads-sync     # Fsync after every write
-make bench-scaling-sync   # Fsync after every write
-
-make bench-writes-fast    # 100ms fsync interval (faster)
-make bench-reads-fast     # 100ms fsync interval
-make bench-scaling-fast   # 100ms fsync interval
-
-# Custom configurations
-FSYNC=sync-each make bench-writes           # Custom fsync schedule
-FSYNC=500ms make bench-reads               # Custom fsync interval
-THREADS=16 make bench-scaling              # Test up to 16 threads
-THREADS=2-8 make bench-scaling-sync        # Test 2-8 threads with sync-each
-FSYNC=250ms THREADS=32 make bench-scaling  # Combined custom settings
-BATCH=512 make bench-batch-scaling         # Override batch size (default 256 entries)
-make bench-walrus-vs-rocksdb               # Run Walrus + RocksDB benchmarks and plot comparison
-
-# Show results
-make show-writes       # Visualize write results
-make show-reads        # Visualize read results
-make show-scaling      # Visualize scaling results
-
-# Live monitoring (run in separate terminal)
-make live-writes       # Live write throughput
-make live-scaling      # Live scaling progress
-
-# Cleanup
-make clean            # Remove CSV files
-```
-
-#### Using Cargo Directly
-
-```bash
-# Default benchmarks
-cargo test --test multithreaded_benchmark_writes -- --nocapture
-cargo test --test multithreaded_benchmark_reads -- --nocapture
-cargo test --test scaling_benchmark -- --nocapture
-
-# With environment variables
-WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
-WALRUS_FSYNC=500ms cargo test --test multithreaded_benchmark_reads -- --nocapture
-WALRUS_THREADS=16 cargo test --test scaling_benchmark -- --nocapture
-WALRUS_FSYNC=sync-each WALRUS_THREADS=2-8 cargo test --test scaling_benchmark -- --nocapture
-WALRUS_BATCH_SIZE=512 cargo test --test multithreaded_benchmark_batch -- --nocapture
-cargo test --test multithreaded_benchmark_batch -- --nocapture -- --batch-size 512
-```
+- `make bench-writes`, `make bench-reads`, and `make bench-scaling` cover the main scenarios; tweak them with env vars such as `FSYNC`, `THREADS`, `WALRUS_DURATION`, and `BATCH` to explore different settings.
+- Run `cargo test --test <bench> -- --nocapture` for ad-hoc runs (e.g. `multithreaded_benchmark_writes`, `multithreaded_benchmark_reads`, `scaling_benchmark`); append the same env vars or pass CLI flags like `-- --batch-size 512`.
+- Plot CSV output with `make show-writes`, `make show-reads`, or `make show-scaling`; `scripts/` contains the underlying Python helpers that require `pandas` and `matplotlib`.
+- Remove generated artefacts with `make clean`.
 
 ### Benchmark Configuration Options
 
 #### Fsync Schedule Configuration
 
-Control when data is flushed to disk during benchmarks:
-
-- **`sync-each`**: Fsync after every write (slowest, most durable)
-- **`no-fsync`**: Disable fsyncing entirely (fastest, no durability)
-- **`none`**: Same as `no-fsync`
-- **`async`**: Async fsync every 1000ms (default)
-- **`<number>ms`**: Custom millisecond intervals (e.g., `100ms`, `500ms`, `2000ms`)
-- **`<number>`**: Same as above without "ms" suffix (e.g., `100`, `500`, `2000`)
+`WALRUS_FSYNC`/`FSYNC` accepts `sync-each`, `no-fsync` (`none`), `async` (1000 ms cadence), or a custom millisecond interval such as `100ms`/`500`.
 
 #### Duration Configuration
 
-Control how long benchmarks run:
-
-- **`WALRUS_DURATION`**: Set both write and read phase duration (e.g., `30s`, `2m`, `1h`)
-- **`WALRUS_WRITE_DURATION`**: Set write phase duration specifically
-- **`WALRUS_READ_DURATION`**: Set read phase duration specifically (reads benchmark only)
-- **`--duration <time>`**: Command line equivalent of `WALRUS_DURATION`
-- **`--write-duration <time>`**: Command line equivalent of `WALRUS_WRITE_DURATION`
-- **`--read-duration <time>`**: Command line equivalent of `WALRUS_READ_DURATION`
-
-**Duration Format:**
-- **`<number>s`**: Seconds (e.g., `30s`, `120s`)
-- **`<number>m`**: Minutes (e.g., `2m`, `5m`)
-- **`<number>h`**: Hours (e.g., `1h`, `2h`)
-- **`<number>`**: Raw seconds (e.g., `120`, `300`)
-
-**Defaults:**
-- Write benchmark: 2 minutes
-- Read benchmark: 1 minute write + 1 minute read
-- Scaling benchmark: 30 seconds per thread count
+Set overall runtime with `WALRUS_DURATION` (or `--duration`). For asymmetric phases use `WALRUS_WRITE_DURATION` / `WALRUS_READ_DURATION` and their CLI equivalents. Durations accept `s`, `m`, `h`, or raw seconds; defaults are 2 min for writes, 1 min write + 1 min read, and 30 s per scaling step.
 
 #### Thread Count Configuration (Scaling Benchmark Only)
 
-Configure how many threads to test in the scaling benchmark:
-
-- **`<number>`**: Test from 1 to N threads (e.g., `16` means test 1-16 threads)
-- **`<start-end>`**: Test specific range (e.g., `2-8`, `4-12`, `1-32`)
-- **Default**: `1-10` threads
-- **Maximum**: 128 threads
+`WALRUS_THREADS` (or `THREADS` for Make) accepts either a single number—testing `1..=N`—or a `start-end` range; defaults to `1-10` and caps at 128.
 
 #### Batch Size Configuration (Batch Benchmarks)
 
-- `WALRUS_BATCH_SIZE` sets entries per batch for batch-focused benchmarks; defaults are 2000 for `multithreaded_benchmark_batch` and 256 for `batch_scaling_benchmark`.
-- `BATCH=<entries>` on `make bench-batch-scaling` forwards to `WALRUS_BATCH_SIZE` for convenience.
-- `cargo test --test multithreaded_benchmark_batch -- --batch-size <entries>` overrides the batch size without environment variables.
+Set `WALRUS_BATCH_SIZE`/`BATCH` to control entries per batch (2000 for `multithreaded_benchmark_batch`, 256 for `batch_scaling_benchmark` by default); cargo users can also pass `-- --batch-size <entries>`.
 
 #### Configuration Methods
 
-**Environment Variables (Recommended for Makefile):**
-```bash
-export WALRUS_FSYNC=sync-each        # Set fsync schedule
-export WALRUS_FSYNC=no-fsync         # Disable fsyncing for max performance
-export WALRUS_THREADS=16             # Set thread range
-export WALRUS_DURATION=30s           # Set benchmark duration
-export WALRUS_WRITE_DURATION=2m      # Set write phase duration
-export WALRUS_READ_DURATION=1m       # Set read phase duration
-export WALRUS_BATCH_SIZE=512         # Set entries per batch (batch benchmarks)
-```
-
-**Makefile Parameters:**
-```bash
-FSYNC=sync-each make bench-writes
-FSYNC=no-fsync make bench-writes
-THREADS=16 make bench-scaling
-FSYNC=500ms THREADS=2-8 make bench-scaling-sync
-```
-
-**Command Line Arguments:**
-```bash
-# Scaling benchmark with custom fsync and threads
-cargo test --test scaling_benchmark -- --nocapture --fsync sync-each --threads 16
-
-# Write benchmark with no-fsync and custom duration
-cargo test --test multithreaded_benchmark_writes -- --nocapture --fsync no-fsync --duration 30s
-
-# Read benchmark with separate write/read durations
-cargo test --test multithreaded_benchmark_reads -- --nocapture --write-duration 2m --read-duration 1m
-```
+- Environment variables pair naturally with the Make targets, e.g. `FSYNC=sync-each THREADS=16 make bench-scaling`.
+- When using cargo directly, append the same switches after `--`, for example `cargo test --test scaling_benchmark -- --nocapture --fsync sync-each --threads 16`.
 
 #### Practical Duration Examples
 
-**Quick Performance Test (30 seconds):**
-```bash
-# Environment variable approach
-WALRUS_DURATION=30s WALRUS_FSYNC=no-fsync cargo test --test multithreaded_benchmark_writes -- --nocapture
+- Use short runs (`WALRUS_DURATION=30s`) to sanity-check performance.
+- Run for minutes (`WALRUS_DURATION=5m`) when evaluating durability modes like `sync-each`.
+- Mix and match `WALRUS_WRITE_DURATION` / `WALRUS_READ_DURATION` to emphasise a particular phase.
 
-# Command line approach  
-cargo test --test multithreaded_benchmark_writes -- --nocapture --duration 30s --fsync no-fsync
-```
+#### Machine-Specific Tips
 
-**Extended Durability Test (5 minutes):**
-```bash
-# Test sync-each performance over longer period
-WALRUS_DURATION=5m WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
-
-# Command line equivalent
-cargo test --test multithreaded_benchmark_writes -- --nocapture --duration 5m --fsync sync-each
-```
-
-**Read Benchmark with Different Phase Durations:**
-```bash
-# Long write phase, short read phase
-WALRUS_WRITE_DURATION=3m WALRUS_READ_DURATION=1m cargo test --test multithreaded_benchmark_reads -- --nocapture
-
-# Command line equivalent
-cargo test --test multithreaded_benchmark_reads -- --nocapture --write-duration 3m --read-duration 1m
-
-# Equal phases
-WALRUS_DURATION=2m cargo test --test multithreaded_benchmark_reads -- --nocapture
-```
-
-**Performance Comparison Suite:**
-```bash
-# Test different fsync modes with same duration
-WALRUS_DURATION=1m WALRUS_FSYNC=no-fsync cargo test --test multithreaded_benchmark_writes -- --nocapture
-WALRUS_DURATION=1m WALRUS_FSYNC=async cargo test --test multithreaded_benchmark_writes -- --nocapture  
-WALRUS_DURATION=1m WALRUS_FSYNC=sync-each cargo test --test multithreaded_benchmark_writes -- --nocapture
-```
-
-#### Machine-Specific Recommendations
-
-**Laptops/Small Systems:**
-```bash
-THREADS=4 make bench-scaling        # Test 1-4 threads
-THREADS=1-6 make bench-scaling-fast # Test 1-6 threads with fast fsync
-```
-
-**Workstations:**
-```bash
-THREADS=16 make bench-scaling       # Test 1-16 threads
-THREADS=2-12 make bench-scaling     # Skip single-thread test
-```
-
-**Servers/High-end Systems:**
-```bash
-THREADS=32 make bench-scaling       # Test 1-32 threads
-THREADS=4-24 make bench-scaling     # Focus on multi-thread performance
-```
+- **Laptops/small systems**: keep `THREADS` in the 1–6 range.
+- **Workstations**: 1–16 threads covers most desktop workloads.
+- **Servers**: push to 32+ threads to stress the pipeline.
 
 ### Benchmark Data Generation
 
-All benchmarks use the following data generation strategy:
-
-```rust
-// Random entry size between 500B and 1KB
-let size = rng.gen_range(500..=1024);
-let data = vec![(counter % 256) as u8; size];
-```
-
-This creates realistic variable-sized entries with predictable content for verification.
+Benchmarks emit pseudo-random payloads between 500 B and 1 KB using deterministic byte patterns so verification stays cheap.
 
 ### Dirty Pages Monitoring
 
-All benchmarks now include real-time monitoring of system dirty pages to understand memory pressure and I/O behavior:
-
-**What is monitored:**
-- **Dirty Pages**: Memory pages that have been modified but not yet written to disk
-- **Dirty Ratio**: Percentage of total system memory that is dirty
-- **Platform Support**: macOS (via `vm_stat`) and Linux (via `/proc/meminfo`)
-
-**CSV Output includes:**
-- `dirty_pages_kb`: Current dirty pages in kilobytes
-- `dirty_ratio_percent`: Percentage of total memory that is dirty
-
-**Console Output example:**
-```
-[Monitor] 15.0s: 45230 writes/sec, 43.2 MB/sec, total: 678450 writes, dirty: 2.1% (524288 KB)
-```
-
-**Why this matters:**
-- High dirty ratios indicate memory pressure and potential I/O bottlenecks
-- `sync-each` mode keeps dirty pages low (immediate flushing)
-- `no-fsync` mode may show higher dirty ratios (data stays in memory)
-- `async` mode shows periodic spikes when background flusher runs
-
-**Platform-specific details:**
-- **macOS**: Uses `sysctl hw.memsize` and `vm_stat` to get memory info
-- **Linux**: Reads `/proc/meminfo` for `MemTotal` and `Dirty` fields
-- **Other OS**: Reports zeros (monitoring disabled)
+Benchmarks log dirty-page counts and ratios to highlight memory pressure, pulling metrics from `vm_stat` on macOS and `/proc/meminfo` on Linux. Expect `sync-each` runs to stay low, `no-fsync` to spike, and `async` to oscillate as the flusher catches up.
 
 ### Visualization Scripts
 
-The `scripts/` directory contains Python visualization tools:
-
-- `visualize_throughput.py` - Write benchmark graphs
-- `show_reads_graph.py` - Read benchmark graphs  
-- `show_scaling_graph_writes.py` - Scaling results
-- `live_scaling_plot.py` - Live scaling monitoring
-- `compare_walrus_rocksdb.py` - Overlay Walrus vs RocksDB benchmark throughput
-
-Requirements: `pandas`, `matplotlib`
-
-```bash
-pip install pandas matplotlib
-```
+`scripts/` contains plotting helpers (`visualize_throughput.py`, `show_reads_graph.py`, `show_scaling_graph_writes.py`, `live_scaling_plot.py`, `compare_walrus_rocksdb.py`); install `pandas` and `matplotlib` to use them.
 
 ## Architecture
 
@@ -667,8 +451,8 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 ### Development Setup
 
 ```bash
-git clone https://github.com/your-username/walrus.git
-cd walrus
+git clone <repo-url>
+cd walrus-unstable
 cargo build
 cargo test
 ```

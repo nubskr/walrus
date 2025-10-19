@@ -334,8 +334,8 @@ fn integration_large_topic_names() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let long_topic = "a".repeat(15); // Reduced to stay within metadata limits
-    let very_long_topic = "b".repeat(18); // Reduced to stay within metadata limits
+    let long_topic = "a".repeat(15);
+    let very_long_topic = "b".repeat(18);
 
     wal.append_for_topic(&long_topic, b"long topic data")
         .unwrap();
@@ -358,7 +358,7 @@ fn integration_memory_pressure_test() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let num_topics = 100;
-    let large_entry_size = 1024 * 1024; // 1MB per entry
+    let large_entry_size = 1024 * 1024;
 
     for topic_id in 0..num_topics {
         let topic = format!("memory_pressure_{}", topic_id);
@@ -396,7 +396,7 @@ fn integration_file_rollover_stress() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     let topic = "rollover_stress";
 
-    let entry_size = 50 * 1024 * 1024; // 50MB entries to force rollovers
+    let entry_size = 50 * 1024 * 1024;
     let num_entries = 5;
 
     for entry_id in 0..num_entries {
@@ -447,7 +447,7 @@ fn integration_corruption_detection_comprehensive() {
     {
         for i in 0..5 {
             if pos + i < file_data.len() {
-                file_data[pos + i] ^= 0xFF; // Flip all bits
+                file_data[pos + i] ^= 0xFF;
             }
         }
 
@@ -476,7 +476,7 @@ fn integration_extreme_topic_count() {
         FsyncSchedule::SyncEach,
     )
     .unwrap();
-    let num_topics = 5000; // Extreme number of topics
+    let num_topics = 5000;
 
     for topic_id in 0..num_topics {
         let topic = format!("extreme_topic_{:06}", topic_id);
@@ -587,7 +587,7 @@ fn integration_persistence_stress_with_validation() {
                 wal.read_next(&topic, true).unwrap().unwrap();
             }
         }
-    } // WAL instance dropped here
+    }
 
     {
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -732,8 +732,8 @@ fn exactly_once_delivery_guarantee() {
 
     drop(wal);
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
-    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+
+
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();

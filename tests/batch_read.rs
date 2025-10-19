@@ -14,9 +14,9 @@ fn cleanup_test_env() {
     let _ = std::fs::remove_dir_all(current_wal_dir());
 }
 
-// ============================================================================
-// BLOCK BOUNDARY TESTS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_spans_multiple_blocks() {
@@ -29,14 +29,14 @@ fn test_batch_read_spans_multiple_blocks() {
     )
     .unwrap();
 
-    // Write large entries to force block sealing (10MB block size)
-    // Write 3 x 8MB entries -> should span 3 blocks
+
+
     for i in 0..3 {
         let data = vec![i as u8; 8 * 1024 * 1024];
         wal.append_for_topic("span_blocks", &data).unwrap();
     }
 
-    // Batch read all entries in one call
+
     let entries = wal
         .batch_read_for_topic("span_blocks", 30 * 1024 * 1024, true)
         .unwrap();
@@ -51,7 +51,7 @@ fn test_batch_read_spans_multiple_blocks() {
         assert_eq!(entry.data[0], i as u8, "Entry {} has wrong pattern", i);
     }
 
-    // Verify nothing left
+
     let remaining = wal.batch_read_for_topic("span_blocks", 1000, true).unwrap();
     assert!(remaining.is_empty(), "Should have no remaining entries");
 
@@ -69,13 +69,13 @@ fn test_batch_read_stops_mid_block() {
     )
     .unwrap();
 
-    // Write 100 small entries within one block
+
     for i in 0..100 {
         let data = format!("entry_{:04}", i);
         wal.append_for_topic("mid_block", data.as_bytes()).unwrap();
     }
 
-    // Read in chunks, ensuring we stop mid-block each time
+
     let mut total_read = 0;
     for chunk_num in 0..10 {
         let chunk = wal.batch_read_for_topic("mid_block", 100, true).unwrap();
@@ -99,9 +99,9 @@ fn test_batch_read_stops_mid_block() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// TAIL/SEALED BOUNDARY TESTS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_crosses_sealed_to_tail() {
@@ -114,18 +114,18 @@ fn test_batch_read_crosses_sealed_to_tail() {
     )
     .unwrap();
 
-    // Write large entry to seal a block
+
     let large = vec![0xAA; 9 * 1024 * 1024];
     wal.append_for_topic("tail_boundary", &large).unwrap();
 
-    // Write small entries in new (tail) block
+
     for i in 0..10 {
         let data = format!("tail_entry_{}", i);
         wal.append_for_topic("tail_boundary", data.as_bytes())
             .unwrap();
     }
 
-    // Read nothing yet
+
     let all = wal
         .batch_read_for_topic("tail_boundary", 20 * 1024 * 1024, true)
         .unwrap();
@@ -152,20 +152,20 @@ fn test_batch_read_tail_only() {
     )
     .unwrap();
 
-    // Write only to tail (no sealing)
+
     for i in 0..20 {
         let data = format!("tail_only_{}", i);
         wal.append_for_topic("tail_only", data.as_bytes()).unwrap();
     }
 
-    // Batch read from tail
+
     let batch1 = wal.batch_read_for_topic("tail_only", 200, true).unwrap();
     assert!(!batch1.is_empty(), "Should read from tail");
 
     let batch2 = wal.batch_read_for_topic("tail_only", 200, true).unwrap();
     assert!(!batch2.is_empty(), "Should continue reading from tail");
 
-    // Verify no overlap
+
     for entry in &batch2 {
         for prev_entry in &batch1 {
             assert_ne!(
@@ -178,9 +178,9 @@ fn test_batch_read_tail_only() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// ENTRY LIMIT
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_respects_entry_cap() {
@@ -195,7 +195,7 @@ fn test_batch_read_respects_entry_cap() {
 
     const LIMIT: usize = 2000;
 
-    // Prepare two full batches so we exceed the read limit.
+
     let batch_one_storage: Vec<Vec<u8>> = (0..LIMIT)
         .map(|i| format!("entry_{:04}", i).into_bytes())
         .collect();
@@ -211,7 +211,7 @@ fn test_batch_read_respects_entry_cap() {
     wal.batch_append_for_topic("entry_cap", &batch_two)
         .expect("batch append 2 should succeed");
 
-    // Request an enormous byte budget; we still expect only LIMIT entries.
+
     let first_read = wal
         .batch_read_for_topic("entry_cap", usize::MAX, true)
         .expect("batch read should succeed");
@@ -231,7 +231,7 @@ fn test_batch_read_respects_entry_cap() {
         "last batch entry mismatch"
     );
 
-    // The remaining entries should be returned on the next call.
+
     let second_read = wal
         .batch_read_for_topic("entry_cap", usize::MAX, true)
         .expect("second batch read should succeed");
@@ -251,7 +251,7 @@ fn test_batch_read_respects_entry_cap() {
         "last entry of second batch mismatch"
     );
 
-    // Nothing should remain afterwards.
+
     let third_read = wal
         .batch_read_for_topic("entry_cap", usize::MAX, true)
         .expect("third batch read should succeed");
@@ -278,7 +278,7 @@ fn test_batch_read_without_checkpoint() {
     let refs: Vec<&[u8]> = entries.iter().map(|v| v.as_slice()).collect();
     wal.batch_append_for_topic("peek_batch", &refs).unwrap();
 
-    // Read without checkpointing; repeated calls should return identical data.
+
     let first = wal
         .batch_read_for_topic("peek_batch", usize::MAX, false)
         .unwrap();
@@ -291,13 +291,13 @@ fn test_batch_read_without_checkpoint() {
     assert_eq!(again.len(), 3);
     assert_eq!(again[0].data, b"item_0");
 
-    // Checkpoint to advance and consume the buffered entries.
+
     let committed = wal
         .batch_read_for_topic("peek_batch", usize::MAX, true)
         .unwrap();
     assert_eq!(committed.len(), 3);
 
-    // Nothing should remain afterwards.
+
     let empty = wal
         .batch_read_for_topic("peek_batch", usize::MAX, true)
         .unwrap();
@@ -306,9 +306,9 @@ fn test_batch_read_without_checkpoint() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// CONCURRENT WRITE/READ CHAOS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_during_concurrent_writes() {
@@ -325,7 +325,7 @@ fn test_batch_read_during_concurrent_writes() {
 
     let barrier = Arc::new(Barrier::new(3));
 
-    // Writer thread 1: continuous small writes
+
     let wal1 = wal.clone();
     let barrier1 = barrier.clone();
     let writer1 = thread::spawn(move || {
@@ -337,7 +337,7 @@ fn test_batch_read_during_concurrent_writes() {
         }
     });
 
-    // Writer thread 2: occasional large writes (force sealing)
+
     let wal2 = wal.clone();
     let barrier2 = barrier.clone();
     let writer2 = thread::spawn(move || {
@@ -349,12 +349,12 @@ fn test_batch_read_during_concurrent_writes() {
         }
     });
 
-    // Reader thread: continuous batch reads
+
     let wal3 = wal.clone();
     let barrier3 = barrier.clone();
     let reader = thread::spawn(move || {
         barrier3.wait();
-        thread::sleep(std::time::Duration::from_millis(5)); // Let writers get ahead
+        thread::sleep(std::time::Duration::from_millis(5));
 
         let mut total_read = 0;
         let mut seen = std::collections::HashSet::new();
@@ -362,7 +362,7 @@ fn test_batch_read_during_concurrent_writes() {
         for _ in 0..50 {
             if let Ok(batch) = wal3.batch_read_for_topic("chaos", 1024 * 1024, true) {
                 for entry in batch {
-                    // Verify we haven't seen this exact data before
+
                     assert!(seen.insert(entry.data.clone()), "Duplicate read detected!");
                     total_read += 1;
                 }
@@ -377,7 +377,7 @@ fn test_batch_read_during_concurrent_writes() {
     writer2.join().unwrap();
     let read_count = reader.join().unwrap();
 
-    // Should have read at least some entries (exact count varies due to timing)
+
     assert!(
         read_count > 0,
         "Reader should have read some entries during concurrent writes"
@@ -399,7 +399,7 @@ fn test_concurrent_batch_reads_same_topic() {
         .unwrap(),
     );
 
-    // Pre-populate with 500 entries (reduced from 1000)
+
     test_println!("Writing 500 entries for concurrent reads test...");
     for i in 0..500 {
         let data = format!("entry_{:05}", i);
@@ -408,7 +408,7 @@ fn test_concurrent_batch_reads_same_topic() {
     }
     test_println!("Finished writing entries");
 
-    // Multiple readers competing for same topic
+
     let barrier = Arc::new(Barrier::new(5));
     let mut handles = vec![];
 
@@ -465,7 +465,7 @@ fn test_concurrent_batch_reads_same_topic() {
     test_println!("Concurrent reads results: {:?}", results);
     test_println!("Total entries read: {}", total);
 
-    // All entries should be read exactly once (due to StrictlyAtOnce) - updated to 500
+
     assert_eq!(
         total, 500,
         "Concurrent readers should read all entries exactly once"
@@ -474,9 +474,9 @@ fn test_concurrent_batch_reads_same_topic() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// MIXED ENTRY SIZES - STRESS THE BUDGET CALCULATION
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_mixed_entry_sizes() {
@@ -489,7 +489,7 @@ fn test_batch_read_mixed_entry_sizes() {
     )
     .unwrap();
 
-    // Write entries with wildly varying sizes
+
     let sizes = vec![
         10, 1000, 50, 10000, 100, 500000, 20, 2000000, 30, 100000, 5, 50000, 15, 1000000, 25,
         300000, 40, 150000, 8, 75000,
@@ -500,7 +500,7 @@ fn test_batch_read_mixed_entry_sizes() {
         wal.append_for_topic("mixed_sizes", &data).unwrap();
     }
 
-    // Read in small batches (budget will cut off at different entry boundaries)
+
     let mut total_entries = 0;
     let mut _total_bytes = 0;
 
@@ -538,9 +538,9 @@ fn test_batch_read_mixed_entry_sizes() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// RECOVERY AND PERSISTENCE TESTS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_recovery_mid_read() {
@@ -549,7 +549,7 @@ fn test_batch_read_recovery_mid_read() {
 
     test_println!("Starting recovery test...");
 
-    // Phase 1: Write data and partially read
+
     let read_before_crash = {
         test_println!("Phase 1: Writing and partially reading data");
         let wal = Walrus::with_consistency_and_schedule(
@@ -558,14 +558,14 @@ fn test_batch_read_recovery_mid_read() {
         )
         .unwrap();
 
-        // Reduced from 100 to 50 entries for faster testing
+
         for i in 0..50 {
             let data = format!("recovery_{:04}", i);
             wal.append_for_topic("recovery", data.as_bytes()).unwrap();
         }
         test_println!("Written 50 entries");
 
-        // Read first 20 entries (reduced from 30)
+
         let mut read_so_far = 0;
         let mut batch_count = 0;
         while read_so_far < 20 {
@@ -586,15 +586,15 @@ fn test_batch_read_recovery_mid_read() {
         }
         test_println!("Phase 1 complete: read {} entries", read_so_far);
 
-        // Drop (simulates crash)
+
         read_so_far
     };
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
-    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+
+
     thread::sleep(Duration::from_millis(50));
 
-    // Phase 2: Recover and continue reading
+
     {
         test_println!("Phase 2: Recovering and continuing read");
         let wal = Walrus::with_consistency_and_schedule(
@@ -603,11 +603,11 @@ fn test_batch_read_recovery_mid_read() {
         )
         .unwrap();
 
-        // Should continue right after the entries consumed before the crash
+
         let remaining = wal.batch_read_for_topic("recovery", 10000, true).unwrap();
         test_println!("Recovery read: got {} entries", remaining.len());
 
-        // Expect remaining entries after the pre-crash reads
+
         let expected_remaining = 50 - read_before_crash;
         assert_eq!(
             remaining.len(),
@@ -617,7 +617,7 @@ fn test_batch_read_recovery_mid_read() {
             remaining.len()
         );
 
-        // Verify we got entries 20-49 (adjusted)
+
         for (i, entry) in remaining.iter().enumerate() {
             let expected = format!("recovery_{:04}", read_before_crash + i);
             let actual = String::from_utf8_lossy(&entry.data);
@@ -650,16 +650,16 @@ fn test_batch_read_at_least_once_duplicates() {
 
     test_println!("Starting AtLeastOnce duplicates test...");
 
-    // Phase 1: Write and read with AtLeastOnce
+
     {
         test_println!("Phase 1: Writing and reading with AtLeastOnce");
         let wal = Walrus::with_consistency_and_schedule(
-            ReadConsistency::AtLeastOnce { persist_every: 5 }, // Reduced from 10 to 5
+            ReadConsistency::AtLeastOnce { persist_every: 5 },
             FsyncSchedule::NoFsync,
         )
         .unwrap();
 
-        // Reduced from 50 to 25 entries for faster testing
+
         for i in 0..25 {
             let data = format!("alo_{:04}", i);
             wal.append_for_topic("at_least_once", data.as_bytes())
@@ -667,7 +667,7 @@ fn test_batch_read_at_least_once_duplicates() {
         }
         test_println!("Written 25 entries");
 
-        // Read 8 entries (only persists after 5th, so some will be re-read)
+
         let mut count = 0;
         let mut batch_num = 0;
         while count < 8 {
@@ -690,14 +690,14 @@ fn test_batch_read_at_least_once_duplicates() {
         }
         test_println!("Phase 1 complete: read {} entries", count);
 
-        // Crash without reading more
+
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
-    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+
+
     thread::sleep(Duration::from_millis(50));
 
-    // Phase 2: Recover - should see duplicates due to AtLeastOnce
+
     {
         test_println!("Phase 2: Recovering with AtLeastOnce (expecting duplicates)");
         let wal = Walrus::with_consistency_and_schedule(
@@ -720,7 +720,7 @@ fn test_batch_read_at_least_once_duplicates() {
             all_entries.extend(batch);
             batch_num += 1;
 
-            // Safety break to prevent infinite loops
+
             if batch_num > 50 {
                 test_println!("WARNING: Too many batches, breaking to prevent infinite loop");
                 break;
@@ -729,14 +729,14 @@ fn test_batch_read_at_least_once_duplicates() {
 
         test_println!("Phase 2 complete: read {} total entries", all_entries.len());
 
-        // Should have read at least 25 (may have duplicates of entries 5-8)
+
         assert!(
             all_entries.len() >= 25,
             "Should read at least all original entries, got {}",
             all_entries.len()
         );
 
-        // Print first few and last few entries for debugging
+
         test_println!("First 5 entries:");
         for (i, entry) in all_entries.iter().take(5).enumerate() {
             test_println!("  {}: {}", i, String::from_utf8_lossy(&entry.data));
@@ -748,7 +748,7 @@ fn test_batch_read_at_least_once_duplicates() {
             test_println!("  {}: {}", start + i, String::from_utf8_lossy(&entry.data));
         }
 
-        // Last entry should definitely be entry 24 (adjusted from 49)
+
         let last = &all_entries[all_entries.len() - 1];
         let expected_last = b"alo_0024";
         test_println!(
@@ -763,16 +763,16 @@ fn test_batch_read_at_least_once_duplicates() {
     test_println!("AtLeastOnce duplicates test completed successfully");
 }
 
-// ============================================================================
-// ROLLBACK INTERACTION TESTS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_with_zeroed_headers() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-    // Phase 1: Write entries and manually zero some headers (simulates rollback)
+
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -787,12 +787,12 @@ fn test_batch_read_with_zeroed_headers() {
 
         drop(wal);
 
-        // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
-        // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+
+
         thread::sleep(Duration::from_millis(50));
     }
 
-    // Phase 2: Manually zero headers of entries 10-15 (simulates partial rollback)
+
     {
         use std::os::unix::fs::FileExt;
 
@@ -809,16 +809,16 @@ fn test_batch_read_with_zeroed_headers() {
                 .open(&file_path)
                 .unwrap();
 
-            // Calculate offset of entry 10 (each entry is ~64 + data_len bytes)
-            // This is approximate - zero a range in the middle
-            let approx_offset = 10 * (64 + 12); // 12 is ~size of "zeroed_XXXX"
-            let zeros = vec![0u8; 64 * 6]; // Zero 6 headers
+
+
+            let approx_offset = 10 * (64 + 12);
+            let zeros = vec![0u8; 64 * 6];
             file.write_at(&zeros, approx_offset as u64).unwrap();
             file.sync_all().unwrap();
         }
     }
 
-    // Phase 3: Batch read should stop at zeroed header
+
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -835,7 +835,7 @@ fn test_batch_read_with_zeroed_headers() {
             all_entries.extend(batch);
         }
 
-        // Should have read fewer than 20 entries (stopped at zeroed header)
+
         assert!(
             all_entries.len() < 20,
             "Should stop reading at zeroed header, got {} entries",
@@ -850,9 +850,9 @@ fn test_batch_read_with_zeroed_headers() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// INTERLEAVED SINGLE/BATCH READS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_interleaved_single_and_batch_reads() {
@@ -865,7 +865,7 @@ fn test_interleaved_single_and_batch_reads() {
     )
     .unwrap();
 
-    // Write 100 entries
+
     for i in 0..100 {
         let data = format!("interleaved_{:04}", i);
         wal.append_for_topic("interleaved", data.as_bytes())
@@ -874,10 +874,10 @@ fn test_interleaved_single_and_batch_reads() {
 
     let mut next_expected = 0;
 
-    // Alternate between single and batch reads
+
     for round in 0..10 {
         if round % 2 == 0 {
-            // Batch read
+
             let batch = wal.batch_read_for_topic("interleaved", 150, true).unwrap();
             for entry in batch {
                 let expected = format!("interleaved_{:04}", next_expected);
@@ -890,7 +890,7 @@ fn test_interleaved_single_and_batch_reads() {
                 next_expected += 1;
             }
         } else {
-            // Single reads
+
             for _ in 0..5 {
                 if let Some(entry) = wal.read_next("interleaved", true).unwrap() {
                     let expected = format!("interleaved_{:04}", next_expected);
@@ -908,7 +908,7 @@ fn test_interleaved_single_and_batch_reads() {
         }
     }
 
-    // Drain any remaining entries to ensure we fully consume the stream.
+
     while next_expected < 100 {
         let batch = wal.batch_read_for_topic("interleaved", 150, true).unwrap();
         if batch.is_empty() {
@@ -946,9 +946,9 @@ fn test_interleaved_single_and_batch_reads() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// CONCURRENT BATCH WRITES VS BATCH READS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_during_batch_writes() {
@@ -965,7 +965,7 @@ fn test_batch_read_during_batch_writes() {
 
     let barrier = Arc::new(Barrier::new(4));
 
-    // 3 concurrent batch writers
+
     let mut writers = vec![];
     for writer_id in 0..3 {
         let wal_clone = wal.clone();
@@ -988,12 +988,12 @@ fn test_batch_read_during_batch_writes() {
         writers.push(handle);
     }
 
-    // 1 concurrent batch reader
+
     let wal_clone = wal.clone();
     let barrier_clone = barrier.clone();
     let reader = thread::spawn(move || {
         barrier_clone.wait();
-        thread::sleep(std::time::Duration::from_millis(10)); // Let some writes happen
+        thread::sleep(std::time::Duration::from_millis(10));
 
         let mut total_read = 0;
         let mut seen = std::collections::HashSet::new();
@@ -1016,7 +1016,7 @@ fn test_batch_read_during_batch_writes() {
     }
     let read_count = reader.join().unwrap();
 
-    // Should have read at least some entries (exact count varies)
+
     assert!(
         read_count > 0,
         "Should have read some entries during concurrent batch writes"
@@ -1025,9 +1025,9 @@ fn test_batch_read_during_batch_writes() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// EDGE CASE: EXACT BUDGET BOUNDARIES
-// ============================================================================
+
+
+
 
 #[test]
 fn test_batch_read_exact_budget_boundary() {
@@ -1040,13 +1040,13 @@ fn test_batch_read_exact_budget_boundary() {
     )
     .unwrap();
 
-    // Write entries of exactly 100 bytes each
+
     for i in 0..20 {
         let data = vec![i as u8; 100];
         wal.append_for_topic("exact_budget", &data).unwrap();
     }
 
-    // Budget for exactly 3 entries (300 bytes)
+
     let batch1 = wal.batch_read_for_topic("exact_budget", 300, true).unwrap();
     assert_eq!(
         batch1.len(),
@@ -1054,7 +1054,7 @@ fn test_batch_read_exact_budget_boundary() {
         "Should read exactly 3 entries with 300-byte budget"
     );
 
-    // Budget for exactly 5 more entries
+
     let batch2 = wal.batch_read_for_topic("exact_budget", 500, true).unwrap();
     assert_eq!(
         batch2.len(),
@@ -1062,7 +1062,7 @@ fn test_batch_read_exact_budget_boundary() {
         "Should read exactly 5 entries with 500-byte budget"
     );
 
-    // Budget of 1 byte - still returns at least one entry (oversized entries are still delivered)
+
     let batch3 = wal.batch_read_for_topic("exact_budget", 1, true).unwrap();
     assert_eq!(
         batch3.len(),
@@ -1070,7 +1070,7 @@ fn test_batch_read_exact_budget_boundary() {
         "Should return a single entry even if it exceeds the budget"
     );
 
-    // Budget that would include partial entry - should stop before it
+
     let batch4 = wal.batch_read_for_topic("exact_budget", 350, true).unwrap();
     assert_eq!(
         batch4.len(),
@@ -1081,9 +1081,9 @@ fn test_batch_read_exact_budget_boundary() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// STRESS: RAPID FIRE BATCH READS
-// ============================================================================
+
+
+
 
 #[test]
 fn test_rapid_fire_batch_reads() {
@@ -1096,7 +1096,7 @@ fn test_rapid_fire_batch_reads() {
     )
     .unwrap();
 
-    // Pre-populate with many entries (reduced from 10000 to 1000)
+
     test_println!("Writing 1000 entries for rapid fire test...");
     for i in 0..1000 {
         let data = format!("{:06}", i);
@@ -1104,7 +1104,7 @@ fn test_rapid_fire_batch_reads() {
     }
     test_println!("Finished writing entries");
 
-    // Rapid fire batch reads with tiny budgets
+
     let mut total_read = 0;
     let mut iterations = 0;
 
@@ -1142,9 +1142,9 @@ fn test_rapid_fire_batch_reads() {
     cleanup_test_env();
 }
 
-// ============================================================================
-// CHAOS: EVERYTHING AT ONCE
-// ============================================================================
+
+
+
 
 #[test]
 fn test_simple_deadlock_repro() {
@@ -1163,15 +1163,15 @@ fn test_simple_deadlock_repro() {
 
     let barrier = Arc::new(Barrier::new(3));
 
-    // Writer thread: writes data that will trigger sealing
+
     let wal1 = wal.clone();
     let barrier1 = barrier.clone();
     let writer = thread::spawn(move || {
         barrier1.wait();
         test_println!("Writer starting...");
         for i in 0..10 {
-            // Write large entries to force sealing
-            let data = vec![i as u8; 1024 * 1024]; // 1MB entries
+
+            let data = vec![i as u8; 1024 * 1024];
             match wal1.append_for_topic("deadlock_test", &data) {
                 Ok(_) => test_println!("Writer: wrote entry {}", i),
                 Err(e) => test_println!("Writer: error on entry {}: {:?}", i, e),
@@ -1180,7 +1180,7 @@ fn test_simple_deadlock_repro() {
         test_println!("Writer finished");
     });
 
-    // Reader thread 1: continuous batch reads
+
     let wal2 = wal.clone();
     let barrier2 = barrier.clone();
     let reader1 = thread::spawn(move || {
@@ -1196,7 +1196,7 @@ fn test_simple_deadlock_repro() {
         test_println!("Reader 1 finished");
     });
 
-    // Reader thread 2: continuous single reads
+
     let wal3 = wal.clone();
     let barrier3 = barrier.clone();
     let reader2 = thread::spawn(move || {
@@ -1213,7 +1213,7 @@ fn test_simple_deadlock_repro() {
         test_println!("Reader 2 finished");
     });
 
-    // Wait for all threads with timeout
+
     let timeout = std::time::Duration::from_secs(30);
 
     match writer.join() {
@@ -1254,7 +1254,7 @@ fn test_full_chaos_all_operations() {
 
     test_println!("Starting chaos test with 8 threads...");
 
-    // 2 single-entry writers (reduced from 200 to 50 entries each)
+
     for writer_id in 0..2 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1272,7 +1272,7 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-    // 2 batch writers (reduced from 20 batches to 10, and 15 entries to 10)
+
     for writer_id in 2..4 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1291,7 +1291,7 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-    // 2 single readers (reduced from 500 to 100 attempts)
+
     for reader_id in 4..6 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1316,7 +1316,7 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-    // 2 batch readers (reduced from 100 to 50 attempts)
+
     for reader_id in 6..8 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1337,18 +1337,18 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-    // Wait for all threads
+
     let mut total_written = 0;
     let mut total_read = 0;
 
-    // Wait for writers
+
     for handle in writer_handles {
         handle.join().unwrap();
     }
-    total_written += 50 * 2; // 2 single writers, 50 entries each
-    total_written += 10 * 10 * 2; // 2 batch writers, 10 batches * 10 entries each
+    total_written += 50 * 2;
+    total_written += 10 * 10 * 2;
 
-    // Wait for readers
+
     for handle in reader_handles {
         let (_, count) = handle.join().unwrap();
         total_read += count;
@@ -1356,8 +1356,8 @@ fn test_full_chaos_all_operations() {
 
     test_println!("Chaos test: wrote {}, read {}", total_written, total_read);
 
-    // Due to AtLeastOnce and concurrent access, we can't guarantee exact counts,
-    // but we should have read something
+
+
     assert!(total_read > 0, "Readers should have read some entries");
 
     cleanup_test_env();

@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Macro for test output that respects WALRUS_QUIET
+
 #[macro_export]
 macro_rules! test_println {
     ($($arg:tt)*) => {

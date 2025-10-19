@@ -16,7 +16,7 @@ fn e2e_sustained_mixed_workload() {
     let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let duration = Duration::from_secs(15); // Reduced duration for CI
+    let duration = Duration::from_secs(15);
     let start_time = Instant::now();
 
     let mut write_counts = HashMap::<String, u64>::new();
@@ -49,7 +49,7 @@ fn e2e_sustained_mixed_workload() {
         if write_counts.values().sum::<u64>() % 10 == 0 {
             let topic = "low_freq_large".to_string();
             let counter = write_counts.get(&topic).unwrap_or(&0);
-            let data = vec![*counter as u8; 50_000]; // 50KB entries (reduced for CI)
+            let data = vec![*counter as u8; 50_000];
             if wal.append_for_topic(&topic, &data).is_ok() {
                 *write_counts.entry(topic).or_insert(0) += 1;
             }
@@ -74,7 +74,7 @@ fn e2e_sustained_mixed_workload() {
                 } else if topic.starts_with("med_freq_") {
                     data_str.contains("medium_frequency_data_with_more_content_")
                 } else if topic == "low_freq_large" {
-                    entry.data.len() == 50_000 // Should be 50KB
+                    entry.data.len() == 50_000
                 } else {
                     false
                 };
@@ -85,7 +85,7 @@ fn e2e_sustained_mixed_workload() {
             }
         }
 
-        thread::sleep(Duration::from_millis(10)); // Small delay to prevent tight loop
+        thread::sleep(Duration::from_millis(10));
     }
 
     let total_writes: u64 = write_counts.values().sum();
@@ -116,7 +116,7 @@ fn e2e_realistic_application_simulation() {
     let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let duration = Duration::from_secs(20); // Reduced duration for CI
+    let duration = Duration::from_secs(20);
     let start_time = Instant::now();
 
     let mut processed_count = 0u64;
@@ -224,7 +224,7 @@ fn e2e_realistic_application_simulation() {
         }
 
         iteration += 1;
-        thread::sleep(Duration::from_millis(10)); // Small delay to prevent tight loop
+        thread::sleep(Duration::from_millis(10));
     }
 
     test_println!("E2E Realistic Application Results:");
@@ -274,7 +274,7 @@ fn e2e_recovery_and_persistence_marathon() {
                     cycle,
                     entry_id,
                     topic_idx,
-                    "x".repeat((entry_id % 100) + 1) // Variable length
+                    "x".repeat((entry_id % 100) + 1)
                 );
 
                 wal.append_for_topic(topic, data.as_bytes()).unwrap();
@@ -283,7 +283,7 @@ fn e2e_recovery_and_persistence_marathon() {
         }
 
         for topic in &topics {
-            let read_count = (entries_per_cycle * (cycle + 1)) / 2; // Read half
+            let read_count = (entries_per_cycle * (cycle + 1)) / 2;
             for _ in 0..read_count {
                 if wal.read_next(topic, true).unwrap().is_none() {
                     break;
@@ -307,7 +307,7 @@ fn e2e_recovery_and_persistence_marathon() {
                 && data_str.contains("_entry_")
                 && data_str.contains("_topic_")
                 && data_str.contains("_data_")
-                && data_str.ends_with(&"x".repeat(1)); // At least one 'x'
+                && data_str.ends_with(&"x".repeat(1));
 
             if !is_valid {
                 validation_errors += 1;
@@ -322,13 +322,13 @@ fn e2e_recovery_and_persistence_marathon() {
     test_println!("  Remaining entries read: {}", total_read);
     test_println!("  Validation errors: {}", validation_errors);
 
-    // let expected_remaining = (total_cycles * entries_per_cycle * topics.len()) / 2;
-    // assert!(
-    //     total_read >= expected_remaining / 2, // Allow some tolerance
-    //     "Expected at least {} remaining entries, got {}",
-    //     expected_remaining / 2,
-    //     total_read
-    // );
+
+
+
+
+
+
+
 
     assert_eq!(
         validation_errors, 0,
@@ -342,7 +342,7 @@ fn e2e_massive_data_throughput_test() {
     let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let duration = Duration::from_secs(25); // Reduced duration for CI
+    let duration = Duration::from_secs(25);
     let start_time = Instant::now();
 
     let mut bytes_written = 0u64;
@@ -465,7 +465,7 @@ fn e2e_system_stress_and_stability() {
     let _env = setup_env();
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-    let duration = Duration::from_secs(30); // Reduced duration for CI
+    let duration = Duration::from_secs(30);
     let start_time = Instant::now();
 
     let mut write_errors = 0u64;
@@ -482,11 +482,11 @@ fn e2e_system_stress_and_stability() {
             let topic = &topics[worker_id % 3];
 
             let size = match counter % 5 {
-                0 => 10,      // Tiny
-                1 => 1_000,   // Small
-                2 => 25_000,  // Medium (reduced)
-                3 => 100_000, // Large (reduced)
-                4 => 500_000, // Very large (reduced)
+                0 => 10,
+                1 => 1_000,
+                2 => 25_000,
+                3 => 100_000,
+                4 => 500_000,
                 _ => 1_000,
             };
 
@@ -531,10 +531,10 @@ fn e2e_system_stress_and_stability() {
         counter += 1;
 
         let delay = match counter % 7 {
-            0 => 0,     // No delay
-            1..=3 => 1, // Short delay
-            4..=5 => 5, // Medium delay (reduced)
-            6 => 20,    // Long delay (reduced)
+            0 => 0,
+            1..=3 => 1,
+            4..=5 => 5,
+            6 => 20,
             _ => 1,
         };
 
@@ -594,7 +594,7 @@ fn e2e_performance_benchmark() {
     test_println!("=== WAL Performance Benchmark ===");
 
     let start = Instant::now();
-    let duration = Duration::from_secs(10); // Reduced duration for CI
+    let duration = Duration::from_secs(10);
     let mut write_count = 0u64;
     let mut write_bytes = 0u64;
 

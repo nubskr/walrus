@@ -231,7 +231,7 @@ fn rocksdb_multithreaded_benchmark() {
     options.create_if_missing(true);
     options.set_wal_dir(&wal_path);
     options.set_keep_log_file_num(10);
-    options.optimize_level_style_compaction(512 * 1024 * 1024);
+    options.optimize_level_style_compaction(16 * 1024 * 1024 * 1024); // this should be enough to never flush the memtable and have a fair benchmark
 
     let db = Arc::new(DB::open(&options, db_path).expect("Failed to open RocksDB"));
 

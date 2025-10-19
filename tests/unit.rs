@@ -50,9 +50,9 @@ fn large_entry_forces_block_seal() {
     let _guard = setup_wal_env();
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let large_data_1 = vec![0x42u8; 9 * 1024 * 1024]; // 9MB of 0x42
-    let large_data_2 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
-    let large_data_3 = vec![0x43u8; 9 * 1024 * 1024]; // 9MB of 0x43
+    let large_data_1 = vec![0x42u8; 9 * 1024 * 1024];
+    let large_data_2 = vec![0x43u8; 9 * 1024 * 1024];
+    let large_data_3 = vec![0x43u8; 9 * 1024 * 1024];
 
     wal.append_for_topic("t", &large_data_1).unwrap();
     wal.append_for_topic("t", &large_data_2).unwrap();
@@ -69,7 +69,7 @@ fn large_entry_forces_block_seal() {
     assert_eq!(
         wal.read_next("t", true).unwrap().unwrap().data,
         large_data_3
-    ); // it will fail because it's in the write block still :))
+    );
 }
 
 #[test]
@@ -100,8 +100,8 @@ fn persists_read_offsets_across_restart() {
     wal.append_for_topic("t", b"a").unwrap();
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"a");
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
-    // Even with fsync + directory sync, the kernel needs time to make files visible to fs::read_dir()
+
+
     thread::sleep(Duration::from_millis(50));
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t", true).unwrap().unwrap().data, b"b");
@@ -141,7 +141,7 @@ fn stress_massive_single_entry() {
     let _guard = setup_wal_env();
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let size = 100 * 1024 * 1024; // 100MB
+    let size = 100 * 1024 * 1024;
     let mut massive_data = Vec::with_capacity(size);
 
     for i in 0..size {
@@ -166,22 +166,22 @@ fn read_next_without_checkpoint_does_not_advance() {
     wal.append_for_topic("peek_topic", b"first").unwrap();
     wal.append_for_topic("peek_topic", b"second").unwrap();
 
-    // Peek without advancing
+
     let first = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first.data, b"first");
 
-    // The same entry should still be returned until we checkpoint
+
     let first_again = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first_again.data, b"first");
 
-    // Checkpointing advances to the next entry
+
     let committed_first = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(committed_first.data, b"first");
 
     let second = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(second.data, b"second");
 
-    // No more data after consuming both entries
+
     assert!(wal.read_next("peek_topic", true).unwrap().is_none());
 }
 
@@ -242,7 +242,7 @@ fn stress_rapid_write_read_cycles() {
     for cycle in 0..cycles {
         let mut data = Vec::new();
         data.extend_from_slice(&(cycle as u64).to_le_bytes());
-        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // Magic bytes
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
 
         let payload_size = (cycle % 100) + 1;
         for i in 0..payload_size {
@@ -282,20 +282,20 @@ fn stress_boundary_conditions() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let test_sizes = vec![
-        0,               // Empty
-        1,               // Single byte
-        63,              // Just under metadata size
-        64,              // Exactly metadata size
-        65,              // Just over metadata size
-        1023,            // Just under 1KB
-        1024,            // Exactly 1KB
-        1025,            // Just over 1KB
-        65535,           // Just under 64KB
-        65536,           // Exactly 64KB
-        65537,           // Just over 64KB
-        1024 * 1024 - 1, // Just under 1MB
-        1024 * 1024,     // Exactly 1MB
-        1024 * 1024 + 1, // Just over 1MB
+        0,
+        1,
+        63,
+        64,
+        65,
+        1023,
+        1024,
+        1025,
+        65535,
+        65536,
+        65537,
+        1024 * 1024 - 1,
+        1024 * 1024,
+        1024 * 1024 + 1,
     ];
 
     for (i, &size) in test_sizes.iter().enumerate() {
@@ -416,15 +416,15 @@ fn stress_extreme_topic_names() {
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     let extreme_topics = vec![
-        "a".to_string(),                                      // Single char
-        "a".repeat(10),                                       // Short
-        "topic_with_underscores_and_numbers_123".to_string(), // Mixed
-        "UPPERCASE_TOPIC".to_string(),                        // Uppercase
-        "mixed_Case_Topic_123".to_string(),                   // Mixed case
-        "topic.with.dots".to_string(),                        // Dots
-        "topic-with-dashes".to_string(),                      // Dashes
-        "0123456789".to_string(),                             // Numbers only
-        "topic_with_unicode_café".to_string(),                // Unicode (if supported)
+        "a".to_string(),
+        "a".repeat(10),
+        "topic_with_underscores_and_numbers_123".to_string(),
+        "UPPERCASE_TOPIC".to_string(),
+        "mixed_Case_Topic_123".to_string(),
+        "topic.with.dots".to_string(),
+        "topic-with-dashes".to_string(),
+        "0123456789".to_string(),
+        "topic_with_unicode_café".to_string(),
     ];
 
     for (i, topic) in extreme_topics.iter().enumerate() {
@@ -476,7 +476,7 @@ mod checksum_tests {
                 test_data[2] ^ 0xFF,
             ];
             f.write_all(&corrupted).unwrap();
-            f.sync_all().unwrap(); // Ensure the corruption is written to disk
+            f.sync_all().unwrap();
         } else {
             panic!("Test data not found in file for corruption");
         }
@@ -518,7 +518,7 @@ mod entry_tests {
 
     #[test]
     fn entry_with_large_data() {
-        let large_data = vec![42u8; 1024 * 1024]; // 1MB
+        let large_data = vec![42u8; 1024 * 1024];
         let entry = Entry {
             data: large_data.clone(),
         };
@@ -550,7 +550,7 @@ mod wal_index_tests {
         let mut idx = WalIndex::new("test_update").unwrap();
 
         idx.set("key1".to_string(), 10, 20).unwrap();
-        idx.set("key1".to_string(), 30, 40).unwrap(); // Update
+        idx.set("key1".to_string(), 30, 40).unwrap();
 
         let pos = idx.get("key1").unwrap();
         assert_eq!(pos.cur_block_idx, 30);
@@ -568,7 +568,7 @@ mod wal_index_tests {
         assert_eq!(removed.cur_block_offset, 20);
 
         assert!(idx.get("key1").is_none());
-        assert!(idx.remove("key1").unwrap().is_none()); // Remove non-existent
+        assert!(idx.remove("key1").unwrap().is_none());
     }
 
     #[test]
@@ -677,7 +677,7 @@ mod walrus_integration_tests {
         let _guard = setup_wal_env();
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-        let sizes = vec![1024, 64 * 1024, 512 * 1024, 1024 * 1024]; // 1KB to 1MB
+        let sizes = vec![1024, 64 * 1024, 512 * 1024, 1024 * 1024];
 
         for (i, size) in sizes.iter().enumerate() {
             let data = vec![i as u8 + 1; *size];
@@ -782,7 +782,7 @@ mod walrus_integration_tests {
         let _guard = setup_wal_env();
         let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-        let large_data = vec![0xAA; 100 * 1024]; // 100KB
+        let large_data = vec![0xAA; 100 * 1024];
         wal.append_for_topic("topic_large", &large_data).unwrap();
         wal.append_for_topic("topic_large", &large_data).unwrap();
 
@@ -830,7 +830,7 @@ mod error_handling_tests {
         {
             let mut f = OpenOptions::new().write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(0)).unwrap();
-            f.write_all(&[0xFF, 0xFF]).unwrap(); // Invalid metadata length
+            f.write_all(&[0xFF, 0xFF]).unwrap();
         }
 
         let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();

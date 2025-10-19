@@ -26,7 +26,7 @@ fn test_strictly_at_once_consistency() {
 
     drop(wal);
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -38,7 +38,7 @@ fn test_strictly_at_once_consistency() {
 fn test_at_least_once_consistency() {
     let _env = setup_env();
 
-    // Test that AtLeastOnce mode can be created successfully
+
     let _wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 }
 
@@ -64,7 +64,7 @@ fn test_fsync_schedule_sync_each() {
     )
     .unwrap();
 
-    // Test that SyncEach mode works correctly
+
     wal.append_for_topic("sync_each_test", b"msg1").unwrap();
     wal.append_for_topic("sync_each_test", b"msg2").unwrap();
     wal.append_for_topic("sync_each_test", b"msg3").unwrap();
@@ -78,7 +78,7 @@ fn test_fsync_schedule_sync_each() {
     let entry3 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry3.data, b"msg3");
 
-    // Verify no more entries
+
     assert!(wal.read_next("sync_each_test", true).unwrap().is_none());
 }
 
@@ -118,7 +118,7 @@ fn test_crash_recovery_strictly_at_once() {
         assert_eq!(entry2.data, b"recovery_msg_2");
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -158,7 +158,7 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry2.data, b"at_least_once_msg_2");
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -175,7 +175,7 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry3.data, b"at_least_once_msg_3");
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -203,7 +203,7 @@ fn test_multiple_topics_different_consistency_behavior() {
 
     drop(wal);
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 2 }).unwrap();
@@ -283,7 +283,7 @@ fn test_persist_every_zero_clamping() {
 
     drop(wal);
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 0 }).unwrap();
@@ -298,17 +298,17 @@ fn test_log_file_deletion_with_fast_fsync() {
 
     let wal = Walrus::with_consistency_and_schedule(
         ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(1), // Ultra-fast 1ms fsync
+        FsyncSchedule::Milliseconds(1),
     )
     .unwrap();
 
     test_println!("Creating first 999MB entry...");
-    let large_data_1 = vec![0xAA; 999 * 1024 * 1024]; // 999MB of 0xAA bytes
+    let large_data_1 = vec![0xAA; 999 * 1024 * 1024];
     wal.append_for_topic("deletion_test", &large_data_1)
         .unwrap();
 
     test_println!("Creating second 999MB entry...");
-    let large_data_2 = vec![0xBB; 999 * 1024 * 1024]; // 999MB of 0xBB bytes
+    let large_data_2 = vec![0xBB; 999 * 1024 * 1024];
     wal.append_for_topic("deletion_test", &large_data_2)
         .unwrap();
 
@@ -339,7 +339,7 @@ fn test_log_file_deletion_with_fast_fsync() {
     test_println!("Reading first entry (999MB)...");
     let entry1 = wal.read_next("deletion_test", true).unwrap().unwrap();
     assert_eq!(entry1.data.len(), 999 * 1024 * 1024);
-    assert_eq!(entry1.data[0], 0xAA); // Verify it's the first entry
+    assert_eq!(entry1.data[0], 0xAA);
 
     test_println!("First entry read successfully. Waiting for file cleanup...");
 
@@ -399,7 +399,7 @@ fn test_log_file_deletion_with_fast_fsync() {
     test_println!("Reading second entry to verify WAL integrity...");
     let entry2 = wal.read_next("deletion_test", true).unwrap().unwrap();
     assert_eq!(entry2.data.len(), 999 * 1024 * 1024);
-    assert_eq!(entry2.data[0], 0xBB); // Verify it's the second entry
+    assert_eq!(entry2.data[0], 0xBB);
 
     test_println!("Test completed successfully!");
 }
@@ -414,8 +414,8 @@ fn test_log_file_deletion_with_large_data() {
     )
     .unwrap();
 
-    let data_size = 1024; // 1KB per entry
-    let num_entries = 1000; // 1MB total
+    let data_size = 1024;
+    let num_entries = 1000;
 
     for i in 0..num_entries {
         let data = format!("large_test_entry_{:04}_", i).repeat(data_size / 20);
@@ -582,7 +582,7 @@ fn key_based_instances_recover_independently() {
         wal.append_for_topic("tx", b"b").unwrap();
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -591,7 +591,7 @@ fn key_based_instances_recover_independently() {
         wal.append_for_topic("events", b"x").unwrap();
     }
 
-    // Small delay to allow Linux kernel dcache/io_uring cleanup to complete
+
     thread::sleep(Duration::from_millis(50));
 
     let wal_tx =
