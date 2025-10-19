@@ -42,7 +42,7 @@ Add Walrus to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-walrus-rust = "0.1.0"
+walrus-rust = "0.2.0"
 ```
 
 ### Basic Usage
