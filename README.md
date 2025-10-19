@@ -17,7 +17,7 @@
 - **Topic-based Organization**: Separate read/write streams per topic
 - **Configurable Consistency**: Choose between strict and relaxed consistency models
 - **Batched I/O**: Atomic batch append and capped batch read APIs with io_uring acceleration on Linux
-- **Memory-mapped I/O**: Efficient file operations using memory mapping
+- **Dual Storage Backends**: FD backend with pread/pwrite (default) or mmap backend
 - **Persistent Read Offsets**: Read positions survive process restarts
 - **Coordination-free Deletion**: Atomic file cleanup without blocking operations
 - **Comprehensive Benchmarking**: Built-in performance testing suite
@@ -78,16 +78,13 @@ let wal = Walrus::with_consistency_and_schedule(
 
 // Write and read operations work the same way
 wal.append_for_topic("events", b"event data")?;
-
-// Explicitly select the fd + io_uring backend (Linux; enabled by default)
-enable_fd_backend();
 ```
 
 ## Configuration Basics
 
 - **Read consistency**: `StrictlyAtOnce` persists every checkpoint; `AtLeastOnce { persist_every }` favours throughput and tolerates replays.
 - **Fsync schedule**: choose `SyncEach`, `Milliseconds(n)`, or `NoFsync` when constructing `Walrus` to balance durability vs latency.
-- **Storage backend**: `enable_fd_backend()` switches to the io_uring fast-path on Linux; `disable_fd_backend()` forces the mmap fallback.
+- **Storage backend**: FD backend (default) uses pread/pwrite syscalls and enables io_uring for batch operations on Linux; `disable_fd_backend()` switches to the mmap backend.
 - **Namespacing & data dir**: set `WALRUS_INSTANCE_KEY` or use the `_for_key` constructors to isolate workloads; `WALRUS_DATA_DIR` relocates the entire tree.
 - **Noise control**: `WALRUS_QUIET=1` mutes debug logging from internal helpers.
 
@@ -97,7 +94,7 @@ Benchmark targets (`make bench-writes`, etc.) honour flags like `FSYNC`, `THREAD
 
 ### Constructors
 
-- `Walrus::new() -> io::Result<Self>` – StrictlyAtOnce reads, 1 s fsync cadence.
+- `Walrus::new() -> io::Result<Self>` – StrictlyAtOnce reads, 200ms fsync cadence.
 - `Walrus::with_consistency(mode: ReadConsistency) -> io::Result<Self>` – Pick the read checkpoint model.
 - `Walrus::with_consistency_and_schedule(mode: ReadConsistency, schedule: FsyncSchedule) -> io::Result<Self>` – Set both read consistency and fsync policy explicitly.
 - `Walrus::new_for_key(key: &str) -> io::Result<Self>` – Namespace files under `wal_files/<sanitized-key>/`.
