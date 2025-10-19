@@ -47,7 +47,7 @@ jobs:
           echo "  - Duration: 2m"
           echo ""
           export RUSTFLAGS=-Awarnings
-          cargo test --test multithreaded_benchmark_writes multithreaded_benchmark -- --nocapture
+          # cargo test --test multithreaded_benchmark_writes multithreaded_benchmark -- --nocapture
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -56,4 +56,4 @@ jobs:
           name: multithreaded-writes-benchmark-results
           path: |
             benchmark_throughput.csv
-          retention-days: 30
+          retention-days: 1

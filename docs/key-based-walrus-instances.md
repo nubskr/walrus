@@ -20,6 +20,7 @@ sanitized version of the key you supply.
 use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
 
 # fn main() -> std::io::Result<()> {
+
 let wal = Walrus::with_consistency_and_schedule_for_key(
     "transactions",
     ReadConsistency::StrictlyAtOnce,
@@ -27,6 +28,7 @@ let wal = Walrus::with_consistency_and_schedule_for_key(
 )?;
 
 wal.append_for_topic("payments", b"txn-42 completed")?;
+
 # Ok(())
 # }
 ```

@@ -4,7 +4,7 @@
 Add atomic batch write capability to Walrus WAL, enabling multiple entries to be written atomically to a topic with all-or-nothing semantics across scattered blocks and files.
 
 ## Problem Statement
-Current `append_for_topic()` writes single entries. Users need to write multiple related entries atomically - either all entries are durably written, or none are. This is challenging because:
+Current `append_for_topic()` writes single entries. Users need to write multiple related entries atomically, either all entries are durably written, or none are. This is challenging because:
 - Walrus uses variable-sized blocks scattered across multiple files
 - A batch may span multiple blocks and files
 - Writers allocate blocks dynamically during writes
@@ -22,7 +22,7 @@ pub fn batch_append_for_topic(
 ```
 
 **Constraints:**
-- Maximum entries per batch: 2,000 (hard cap shared with batch reads)
+- Maximum entries per batch: 2,000 (hard cap shared with batch reads due to the default size limitations of io_uring submission ring)
 - Maximum batch size: 10GB total (sum of all entries + metadata)
 - Returns `ErrorKind::InvalidInput` if batch exceeds limit
 - Returns `ErrorKind::WouldBlock` if another batch write is in progress for this topic
@@ -33,9 +33,9 @@ pub fn batch_append_for_topic(
 ### Key Design Decisions
 
 #### 1. Bounded Batch Size (10GB)
-- Makes the problem tractable - can pre-compute exact block requirements
+- Makes the problem tractable, can pre-compute exact block requirements
 - Prevents unbounded memory allocation during planning phase
-- Still large enough for most real-world use cases
+- Still large enough for most real world use cases
 
 #### 2. Atomic Flag for Concurrency Control
 Add to `Writer` struct:
@@ -47,11 +47,11 @@ is_batch_writing: AtomicBool
 - Regular `write()` checks flag, fails fast with `WouldBlock` if batch is in progress
 - `batch_append_for_topic()` uses compare-exchange to acquire exclusive access
 - RAII guard ensures flag is released even on panic
-- No blocking - fail fast and let clients retry
+- No blocking, fail fast and let clients retry
 
 **Why not mutex?**
 - Batch writes can take significant time (10GB of I/O)
-- Don't want to block regular writes - fail fast is better UX
+- Don't want to block regular writes, fail fast is better UX
 - Simpler reasoning about deadlocks
 
 #### 3. Four-Phase Execution
@@ -109,11 +109,11 @@ is_batch_writing: AtomicBool
 - No partial batch will ever be visible
 
 **How we achieve it:**
-1. **io_uring batched submission** - kernel-level atomicity for write operations
-2. **Pre-allocation** - no mid-batch allocation failures
-3. **Held locks** - no concurrent modifications to writer state during batch
-4. **Atomic flag** - prevents concurrent regular writes
-5. **Rollback on failure** - restore exact pre-batch state
+1. **io_uring batched submission**, kernel-level atomicity for write operations
+2. **Pre-allocation**, no mid-batch allocation failures
+3. **Held locks**, no concurrent modifications to writer state during batch
+4. **Atomic flag**, prevents concurrent regular writes
+5. **Rollback on failure**, restore exact pre-batch state
 
 ### Failure Modes & Recovery
 
@@ -126,7 +126,7 @@ is_batch_writing: AtomicBool
 | fsync fails | Rollback offsets, mark blocks unlocked | Original state restored |
 | Panic during batch | RAII guard releases flag | Flag released, may have partial writes* |
 
-*Panic during batch is considered catastrophic - process restart will trigger normal recovery
+*Panic during batch is considered catastrophic, process restart will trigger normal recovery
 
 ## Impact on Existing System
 
@@ -261,7 +261,7 @@ If issues arise:
 2. System returns to original behavior
 3. Remove feature in next release
 
-No data loss or corruption risk - worst case is failed batch writes that clients must retry.
+No data loss or corruption risk, worst case is failed batch writes that clients must retry.
 
 ---
 
@@ -274,264 +274,3 @@ This design adds atomic batch writes to Walrus by:
 - Maintaining rollback information for failure recovery
 
 The approach is elegant because it works **with** the existing variable-sized block architecture rather than against it, and leverages kernel-level atomicity guarantees from io_uring rather than building complex coordination logic in userspace.
-
-example code:
-
-```rust
-struct Writer {
-    allocator: Arc<BlockAllocator>,
-    current_block: Mutex<Block>,
-    reader: Arc<Reader>,
-    col: String,
-    publisher: Arc<mpsc::Sender<String>>,
-    current_offset: Mutex<u64>,
-    fsync_schedule: FsyncSchedule,
-    is_batch_writing: AtomicBool, // ADD THIS
-}
-
-impl Writer {
-    pub fn new(
-        allocator: Arc<BlockAllocator>,
-        current_block: Block,
-        reader: Arc<Reader>,
-        col: String,
-        publisher: Arc<mpsc::Sender<String>>,
-        fsync_schedule: FsyncSchedule,
-    ) -> Self {
-        Writer {
-            allocator,
-            current_block: Mutex::new(current_block),
-            reader,
-            col: col.clone(),
-            publisher,
-            current_offset: Mutex::new(0),
-            fsync_schedule,
-            is_batch_writing: AtomicBool::new(false), // INIT
-        }
-    }
-
-    pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
-        // Check if batch write is in progress
-        if self.is_batch_writing.load(Ordering::Acquire) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "batch write in progress for this topic"
-            ));
-        }
-        
-        // ... rest of your existing write logic ...
-        let mut block = self.current_block.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
-        })?;
-        // ... etc ...
-    }
-}
-
-impl Walrus {
-    pub fn batch_append_for_topic(
-        &self, 
-        col_name: &str, 
-        batch: &[&[u8]]
-    ) -> std::io::Result<()> {
-        // Validate batch size
-        let total_bytes: u64 = batch.iter()
-            .map(|data| (PREFIX_META_SIZE as u64) + (data.len() as u64))
-            .sum();
-        
-        if total_bytes > 10 * 1024 * 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "batch exceeds 10GB limit"
-            ));
-        }
-        
-        let writer = self.get_or_create_writer(col_name)?;
-        
-        // Try to acquire batch write flag
-        if writer.is_batch_writing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err() 
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "another batch write already in progress"
-            ));
-        }
-        
-        // Ensure we release the flag even if we panic
-        struct BatchGuard<'a> {
-            flag: &'a AtomicBool,
-        }
-        impl<'a> Drop for BatchGuard<'a> {
-            fn drop(&mut self) {
-                self.flag.store(false, Ordering::Release);
-                debug_print!("[batch] released batch_writing flag");
-            }
-        }
-        let _guard = BatchGuard { flag: &writer.is_batch_writing };
-        
-        // Now we have exclusive batch access!
-        let mut block = writer.current_block.lock().unwrap();
-        let mut cur_offset = writer.current_offset.lock().unwrap();
-        
-        let mut revert_info = BatchRevertInfo {
-            topic: col_name.to_string(),
-            original_block_id: block.id,
-            original_offset: *cur_offset,
-            allocated_block_ids: Vec::new(),
-        };
-        
-        let mut write_plan = Vec::new();
-        
-        // Phase 1: Pre-allocate
-        let mut batch_idx = 0;
-        let mut remaining = total_bytes;
-        
-        while batch_idx < batch.len() {
-            let data = batch[batch_idx];
-            let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
-            let available = block.limit - *cur_offset;
-            
-            if available >= need {
-                write_plan.push((block.clone(), *cur_offset, batch_idx));
-                *cur_offset += need;
-                remaining -= need;
-                batch_idx += 1;
-            } else {
-                // Seal current block
-                FileStateTracker::set_block_unlocked(block.id as usize);
-                let mut sealed = block.clone();
-                sealed.used = *cur_offset;
-                sealed.mmap.flush()?;
-                let _ = writer.reader.append_block_to_chain(&writer.col, sealed);
-                
-                // Allocate new block
-                let new_block = unsafe { 
-                    self.allocator.alloc_block(remaining.min(MAX_ALLOC))? 
-                };
-                
-                revert_info.allocated_block_ids.push(new_block.id);
-                *block = new_block;
-                *cur_offset = 0;
-            }
-        }
-        
-        // Phase 2: Prepare io_uring writes
-        let mut ring = io_uring::IoUring::new(write_plan.len() + 64)?;
-        let mut buffers = Vec::new();
-        
-        for (blk, offset, data_idx) in write_plan.iter() {
-            let data = batch[*data_idx];
-            
-            // Prepare metadata
-            let new_meta = Metadata {
-                read_size: data.len(),
-                owned_by: col_name.to_string(),
-                next_block_start: blk.offset + blk.limit,
-                checksum: checksum64(data),
-            };
-            
-            let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("serialize metadata failed: {:?}", e),
-                )
-            })?;
-            
-            let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-            meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
-            meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
-            meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-            
-            let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-            combined.extend_from_slice(&meta_buffer);
-            combined.extend_from_slice(data);
-            
-            let file_offset = blk.offset + offset;
-            
-            // Get raw FD
-            let fd = if let StorageImpl::Fd(fd_backend) = &blk.mmap.storage {
-                io_uring::types::Fd(fd_backend.file.as_raw_fd())
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "batch writes require FD backend"
-                ));
-            };
-            
-            let write_op = io_uring::opcode::Write::new(
-                fd,
-                combined.as_ptr(),
-                combined.len() as u32,
-            )
-            .offset(file_offset)
-            .build()
-            .user_data(*data_idx as u64);
-            
-            buffers.push(combined);
-            
-            unsafe {
-                ring.submission().push(&write_op)?;
-            }
-        }
-        
-        // Phase 3: Submit io_uring batch
-        match ring.submit_and_wait(write_plan.len()) {
-            Ok(_) => {
-                let mut all_success = true;
-                for _ in 0..write_plan.len() {
-                    if let Some(cqe) = ring.completion().next() {
-                        if cqe.result() < 0 {
-                            all_success = false;
-                            debug_print!(
-                                "[batch] write failed for entry {}: error {}",
-                                cqe.user_data(),
-                                cqe.result()
-                            );
-                            break;
-                        }
-                    }
-                }
-                
-                if !all_success {
-                    // Rollback
-                    *cur_offset = revert_info.original_offset;
-                    for block_id in revert_info.allocated_block_ids {
-                        BlockStateTracker::set_block_unlocked(block_id as usize);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "batch write failed, rolled back"
-                    ));
-                }
-                
-                // Success - fsync all touched files
-                let mut fsynced = std::collections::HashSet::new();
-                for (blk, _, _) in write_plan.iter() {
-                    if !fsynced.contains(&blk.file_path) {
-                        blk.mmap.flush()?;
-                        fsynced.insert(blk.file_path.clone());
-                    }
-                }
-                
-                debug_print!(
-                    "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
-                    batch.len(),
-                    total_bytes,
-                    col_name
-                );
-                Ok(())
-            }
-            Err(e) => {
-                // Rollback
-                *cur_offset = revert_info.original_offset;
-                for block_id in revert_info.allocated_block_ids {
-                    BlockStateTracker::set_block_unlocked(block_id as usize);
-                }
-                Err(e)
-            }
-        }
-        // _guard drops here, releases flag automatically
-    }
-}
-```

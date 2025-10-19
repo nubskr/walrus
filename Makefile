@@ -3,6 +3,7 @@
 
 WALRUS_CSV ?= walrus.csv
 ROCKSDB_CSV ?= rocksdb.csv
+KAFKA_CSV ?= kafka.csv
 
 help:
 	@echo "Walrus Benchmarks"
@@ -15,12 +16,12 @@ help:
 	@echo "  bench-batch-scaling   Run batch scaling benchmark across thread counts"
 	@echo "  bench-walrus-vs-rocksdb   Run Walrus + RocksDB WAL benchmarks and plot comparison"
 	@echo ""
-	@echo "Benchmarks (Sync each write - most durable, slowest):"
+	@echo "Benchmarks (Sync each write, most durable, slowest):"
 	@echo "  bench-writes-sync    Run write benchmark with sync-each"
 	@echo "  bench-reads-sync     Run read benchmark with sync-each"
 	@echo "  bench-scaling-sync   Run scaling benchmark with sync-each"
 	@echo ""
-	@echo "Benchmarks (Fast async - 100ms fsync interval):"
+	@echo "Benchmarks (Fast async, 100ms fsync interval):"
 	@echo "  bench-writes-fast    Run write benchmark with 100ms fsync"
 	@echo "  bench-reads-fast     Run read benchmark with 100ms fsync"
 	@echo "  bench-scaling-fast   Run scaling benchmark with 100ms fsync"
@@ -238,7 +239,7 @@ show-batch-writes:
 	python3 scripts/visualize_batch_benchmark.py
 
 show-walrus-vs-rocksdb:
-	@echo "Comparing Walrus and RocksDB benchmark CSVs..."
+	@echo "Comparing Walrus, RocksDB, and Kafka benchmark CSVs..."
 	@if [ ! -f "$(WALRUS_CSV)" ]; then \
 		echo "$(WALRUS_CSV) not found. Run 'WALRUS_DURATION=1s WALRUS_FSYNC=no-fsync make bench-walrus-vs-rocksdb' first, or set WALRUS_CSV=<path>."; \
 		exit 1; \
@@ -247,7 +248,12 @@ show-walrus-vs-rocksdb:
 		echo "$(ROCKSDB_CSV) not found. Run 'WALRUS_DURATION=1s WALRUS_FSYNC=no-fsync make bench-walrus-vs-rocksdb' first, or set ROCKSDB_CSV=<path>."; \
 		exit 1; \
 	fi
-	python3 scripts/compare_walrus_rocksdb.py --walrus "$(WALRUS_CSV)" --rocksdb "$(ROCKSDB_CSV)" --out walrus_vs_rocksdb.png
+	@if [ ! -f "$(KAFKA_CSV)" ]; then \
+		echo "$(KAFKA_CSV) not found. Set KAFKA_CSV=<path> or the comparison will only include Walrus and RocksDB."; \
+		python3 scripts/compare_walrus_rocksdb.py --walrus "$(WALRUS_CSV)" --rocksdb "$(ROCKSDB_CSV)" --out walrus_vs_rocksdb_kafka.png; \
+	else \
+		python3 scripts/compare_walrus_rocksdb.py --walrus "$(WALRUS_CSV)" --rocksdb "$(ROCKSDB_CSV)" --kafka "$(KAFKA_CSV)" --out walrus_vs_rocksdb_kafka.png; \
+	fi
 
 # Live monitoring targets
 live-writes:

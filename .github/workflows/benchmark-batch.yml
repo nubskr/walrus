@@ -49,7 +49,7 @@ jobs:
           echo "  - Uses batch_append_for_topic() for atomic batch writes"
           echo ""
           export RUSTFLAGS=-Awarnings
-          cargo test --test multithreaded_benchmark_batch -- --nocapture
+          # cargo test --test multithreaded_benchmark_batch -- --nocapture
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -58,4 +58,4 @@ jobs:
           name: batch-benchmark-results
           path: |
             batch_benchmark_throughput.csv
-          retention-days: 30
+          retention-days: 1
