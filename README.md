@@ -6,6 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
+[![CI](https://github.com/nubskr/walrus/actions/workflows/ci.yml/badge.svg)](https://github.com/nubskr/walrus/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 
@@ -134,6 +135,19 @@ We welcome patches, check [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow.
 This project is licensed under the MIT License, see the [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.2.0
+- **New**: Atomic batch write operations (`batch_append_for_topic`)
+- **New**: Batch read operations (`batch_read_for_topic`)
+- **New**: io_uring support for batch operations on Linux
+- **New**: Dual storage backends (FD backend with pread/pwrite, mmap backend)
+- **New**: Namespace isolation via `_for_key` constructors
+- **New**: `FsyncSchedule::SyncEach` and `FsyncSchedule::NoFsync` modes
+- **New**: Environment variables (`WALRUS_INSTANCE_KEY`, `WALRUS_DATA_DIR`, `WALRUS_QUIET`)
+- **Improved**: Comprehensive documentation with architecture and design docs
+- **Improved**: Enhanced benchmarking suite with batch operation benchmarks
+- **Fixed**: Tail read offset tracking in concurrent scenarios
+- **Fixed**: Reader persistence during concurrent batch writes
 
 ### Version 0.1.0
 - Initial release
