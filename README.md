@@ -91,7 +91,7 @@ enable_fd_backend();
 - **Namespacing & data dir**: set `WALRUS_INSTANCE_KEY` or use the `_for_key` constructors to isolate workloads; `WALRUS_DATA_DIR` relocates the entire tree.
 - **Noise control**: `WALRUS_QUIET=1` mutes debug logging from internal helpers.
 
-Benchmark targets (`make bench-writes`, etc.) honour flags like `FSYNC`, `THREADS`, `WALRUS_DURATION`, and `WALRUS_BATCH_SIZE`—check the `Makefile` for the full list.
+Benchmark targets (`make bench-writes`, etc.) honour flags like `FSYNC`, `THREADS`, `WALRUS_DURATION`, and `WALRUS_BATCH_SIZE`, check the `Makefile` for the full list.
 
 ## API Reference
 
@@ -130,7 +130,7 @@ you need more than the basics above.
 
 ## Contributing
 
-We welcome patches—check [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow.
+We welcome patches, check [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow.
 
 ## License
 
