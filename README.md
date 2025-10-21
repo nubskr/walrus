@@ -2,7 +2,7 @@
   <img src="./figures/walrus1.png"
        alt="walrus"
        width="30%">
-    <div>Walrus: A high performance Write Ahead Log (WAL) in Rust</div>
+    <div>Walrus: A high performance storage engine in Rust</div>
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
