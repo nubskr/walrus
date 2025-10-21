@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use rand::Rng;
 use rocksdb::{Options, WriteOptions, DB};
 use std::env;
@@ -226,6 +227,8 @@ fn rocksdb_multithreaded_benchmark() {
 
     let fsync_mode = parse_fsync_mode();
     let write_duration = parse_duration();
+
+    #[cfg(target_os = "linux")]
 
     let mut options = Options::default();
     options.create_if_missing(true);

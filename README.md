@@ -121,6 +121,32 @@ pub struct Entry {
 }
 ```
 
+# benchmarks
+
+I benchmarked the latest version of walrus against single kafka broker(without replication, no networking overhead) and rocksdb's WAL
+
+![alt text](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_no_fsync.png)
+this performance is with the legacy `append_for_topic()` endpoint which uses `pwrite()` syscall for each write operation, no io_uring batching is used for these benchmarks
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|------------------------|
+| Walrus   | 1,205,762                  | 876.22                | 1,593,984                   | 1,158.62              |
+| Kafka    | 1,112,120                  | 808.33                | 1,424,073                   | 1,035.74              |
+| RocksDB  | 432,821                    | 314.53                | 1,000,000                   | 726.53                |
+
+
+### for synced writes
+
+![alt text](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.png)
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|------------------------|
+| RocksDB  | 5,222                      | 3.79                  | 10,486                      | 7.63                  |
+| Walrus   | 4,980                      | 3.60                  | 11,389                      | 8.19                  |
+| Kafka    | 4,921                      | 3.57                  | 11,224                      | 8.34                  |
+
+---
+
 ## Further Reading
 
 Older deep dives live under `docs/` (architecture, batch design notes, etc.) if

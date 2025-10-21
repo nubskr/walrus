@@ -27,7 +27,7 @@ libc = "0.2.177"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.10"
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 rocksdb = { version = "0.23", default-features = false }
 
 [[test]]
@@ -52,4 +52,4 @@ path = "benchmarks/batch_scaling_benchmark.rs"
 
 [[test]]
 name = "rocksdb_multithreaded_benchmark_writes"
-path = "rocksdb_benchmarks/multithreaded_benchmark_writes.rs"
+path = "benchmarks/multithreaded_benchmark_writes_rocksdb.rs"
