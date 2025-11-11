@@ -1,6 +1,7 @@
 use crate::wal::block::{Block, Metadata};
 use crate::wal::config::{
     DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_FILE_SIZE, PREFIX_META_SIZE, debug_print,
+    sanitize_namespace,
 };
 use crate::wal::paths::WalPathManager;
 use crate::wal::storage::{SharedMmapKeeper, set_fsync_schedule};
@@ -94,6 +95,33 @@ impl Walrus {
         };
         instance.startup_chore()?;
         Ok(instance)
+    }
+
+    fn clean_marker_path(&self, topic: &str) -> std::path::PathBuf {
+        let mut dir = self.paths.root().to_path_buf();
+        dir.push("clean");
+        let file = sanitize_namespace(topic);
+        dir.push(file);
+        dir
+    }
+
+    pub fn mark_topic_dirty(&self, topic: &str) {
+        let path = self.clean_marker_path(topic);
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    pub fn mark_topic_clean(&self, topic: &str) {
+        let path = self.clean_marker_path(topic);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::File::create(path);
+    }
+
+    pub fn topic_is_clean(&self, topic: &str) -> bool {
+        self.clean_marker_path(topic).exists()
     }
 
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
@@ -300,3 +328,4 @@ impl Walrus {
         Ok(())
     }
 }
+

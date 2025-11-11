@@ -110,7 +110,14 @@ impl Walrus {
             persisted_tail = None;
         }
 
-        // Important: release the per-column lock; we'll reacquire each iteration
+        // Important: release the per-column lock; we'll reacquire each iteration.
+        // Persisted tail entries mean the last sealed block is already fully consumed,
+        // so mark them checkpointed before starting the main loop.
+        if info.cur_block_idx >= info.chain.len() && info.cur_block_idx > 0 {
+            if let Some(prev_block) = info.chain.get(info.cur_block_idx - 1).cloned() {
+                BlockStateTracker::set_checkpointed_true(prev_block.id as usize);
+            }
+        }
         drop(info);
 
         loop {
@@ -814,3 +821,4 @@ impl Walrus {
         Ok(entries)
     }
 }
+
