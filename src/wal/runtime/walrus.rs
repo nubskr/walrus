@@ -9,6 +9,7 @@ use std::fs;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
+use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::WalIndex;
 use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
 use super::background::start_background_workers;
@@ -31,6 +32,7 @@ pub struct Walrus {
     pub(super) read_consistency: ReadConsistency,
     pub(super) fsync_schedule: FsyncSchedule,
     pub(super) paths: Arc<WalPathManager>,
+    topic_clean_tracker: Arc<TopicCleanTracker>,
 }
 
 impl Walrus {
@@ -80,6 +82,9 @@ impl Walrus {
         let allocator = Arc::new(BlockAllocator::new(paths.clone())?);
         let reader = Arc::new(Reader::new());
         let tx_arc = start_background_workers(fsync_schedule);
+        let clean_store = Arc::new(CleanMarkerStore::new_in(&paths, "topic_clean")?);
+        let topic_clean_tracker = TopicCleanTracker::new(clean_store.clone());
+        topic_clean_tracker.hydrate(clean_store.snapshot());
 
         let idx = WalIndex::new_in(&paths, "read_offset_idx")?;
         let instance = Walrus {
@@ -91,9 +96,27 @@ impl Walrus {
             read_consistency: mode,
             fsync_schedule,
             paths,
+             topic_clean_tracker,
         };
         instance.startup_chore()?;
         Ok(instance)
+    }
+
+    pub fn mark_topic_dirty(&self, topic: &str) {
+        self.topic_clean_tracker.mark_dirty(topic);
+    }
+
+    pub fn mark_topic_clean(&self, topic: &str) {
+        self.topic_clean_tracker.mark_clean(topic);
+    }
+
+    pub fn topic_is_clean(&self, topic: &str) -> bool {
+        self.topic_clean_tracker.topic_is_clean(topic)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_flush_clean_markers_for_test(&self) -> std::io::Result<()> {
+        self.topic_clean_tracker.force_flush_for_test()
     }
 
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
@@ -298,5 +321,86 @@ impl Walrus {
             flush_check(f);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::random;
+    use std::fs;
+    use std::path::Path;
+
+    fn unique_key() -> String {
+        format!("topic_clean_test_{}", random::<u64>())
+    }
+
+    fn cleanup_key(key: &str) {
+        let path = Path::new("wal_files").join(key);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn append_marks_topic_dirty() {
+        let key = unique_key();
+        let wal = Walrus::with_consistency_and_schedule_for_key(
+            &key,
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::Milliseconds(5),
+        )
+        .unwrap();
+
+        assert!(wal.topic_is_clean("alpha"));
+        wal.append_for_topic("alpha", b"hello world").unwrap();
+        assert!(!wal.topic_is_clean("alpha"));
+
+        wal.mark_topic_clean("alpha");
+        wal.force_flush_clean_markers_for_test().unwrap();
+        assert!(wal.topic_is_clean("alpha"));
+
+        drop(wal);
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn cleanliness_survives_restart() {
+        let key = unique_key();
+
+        {
+            let wal = Walrus::with_consistency_and_schedule_for_key(
+                &key,
+                ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::Milliseconds(5),
+            )
+            .unwrap();
+            wal.append_for_topic("beta", b"bytes").unwrap();
+            wal.force_flush_clean_markers_for_test().unwrap();
+            assert!(!wal.topic_is_clean("beta"));
+        }
+
+        {
+            let wal = Walrus::with_consistency_and_schedule_for_key(
+                &key,
+                ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::Milliseconds(5),
+            )
+            .unwrap();
+            assert!(!wal.topic_is_clean("beta"));
+            wal.mark_topic_clean("beta");
+            wal.force_flush_clean_markers_for_test().unwrap();
+            assert!(wal.topic_is_clean("beta"));
+        }
+
+        {
+            let wal = Walrus::with_consistency_and_schedule_for_key(
+                &key,
+                ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::Milliseconds(5),
+            )
+            .unwrap();
+            assert!(wal.topic_is_clean("beta"));
+        }
+
+        cleanup_key(&key);
     }
 }
