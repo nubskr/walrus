@@ -5,6 +5,7 @@ mod allocator;
 mod background;
 mod index;
 mod reader;
+mod topic_clean;
 mod walrus;
 mod walrus_read;
 mod walrus_write;
