@@ -1,7 +1,7 @@
 use crate::wal::block::Block;
 use crate::wal::config::{checksum64, checksum64_update};
 use crate::wal::kv_store::config::*;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, IoSlice, Result};
 
 /// A wrapper around the generic WAL Block to enforce KV-specific serialization.
 #[derive(Clone, Debug)]
@@ -39,20 +39,18 @@ impl KvBlock {
         csum = checksum64_update(key, csum);
         csum = checksum64_update(value, csum);
         let csum32 = csum as u32;
+        let csum_bytes = csum32.to_le_bytes();
         
-        // Write parts directly
-        let mut current_file_offset = self.0.offset + offset;
+        // Vectored write: Single syscall, zero allocation
+        let bufs = [
+            IoSlice::new(&header),
+            IoSlice::new(key),
+            IoSlice::new(value),
+            IoSlice::new(&csum_bytes),
+        ];
         
-        self.0.mmap.write(current_file_offset as usize, &header);
-        current_file_offset += KV_HEADER_SIZE as u64;
-        
-        self.0.mmap.write(current_file_offset as usize, key);
-        current_file_offset += key.len() as u64;
-        
-        self.0.mmap.write(current_file_offset as usize, value);
-        current_file_offset += value.len() as u64;
-        
-        self.0.mmap.write(current_file_offset as usize, &csum32.to_le_bytes());
+        let file_offset = self.0.offset + offset;
+        self.0.storage.write_vectored(file_offset as usize, &bufs);
 
         Ok(offset + total_len as u64)
     }
@@ -67,7 +65,7 @@ impl KvBlock {
 
         let mut buffer = vec![0u8; len];
         let file_offset = self.0.offset + offset;
-        self.0.mmap.read(file_offset as usize, &mut buffer);
+        self.0.storage.read(file_offset as usize, &mut buffer);
 
         // Verify Checksum
         let stored_csum_bytes = &buffer[len - KV_CHECKSUM_SIZE..];

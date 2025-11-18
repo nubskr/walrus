@@ -1,7 +1,7 @@
 use crate::wal::block::Block;
 use crate::wal::config::{DEFAULT_BLOCK_SIZE, MAX_ALLOC, MAX_FILE_SIZE, debug_print};
 use crate::wal::paths::WalPathManager;
-use crate::wal::storage::{SharedMmap, SharedMmapKeeper};
+use crate::wal::storage::{Storage, StorageKeeper};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -18,7 +18,7 @@ pub(crate) struct BlockAllocator {
 impl BlockAllocator {
     pub(crate) fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
         let file1 = paths.create_new_file()?;
-        let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
+        let storage: Arc<Storage> = StorageKeeper::get_storage_arc(&file1)?;
         debug_print!(
             "[alloc] init: created file={}, max_file_size={}B, block_size={}B",
             file1,
@@ -31,7 +31,7 @@ impl BlockAllocator {
                 offset: 0,
                 limit: DEFAULT_BLOCK_SIZE,
                 file_path: file1,
-                mmap,
+                storage,
                 used: 0,
             }),
             lock: AtomicBool::new(false),
@@ -54,7 +54,7 @@ impl BlockAllocator {
             // mark previous file as fully allocated before switching
             FileStateTracker::set_fully_allocated(prev_block_file_path);
             data.file_path = self.paths.create_new_file()?;
-            data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            data.storage = StorageKeeper::get_storage_arc(&data.file_path)?;
             data.offset = 0;
             data.used = 0;
             debug_print!("[alloc] rolled over to new file: {}", data.file_path);
@@ -105,7 +105,7 @@ impl BlockAllocator {
         if data.offset + alloc_size > MAX_FILE_SIZE {
             let prev_block_file_path = data.file_path.clone();
             data.file_path = self.paths.create_new_file()?;
-            data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            data.storage = StorageKeeper::get_storage_arc(&data.file_path)?;
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
@@ -119,7 +119,7 @@ impl BlockAllocator {
             file_path: data.file_path.clone(),
             offset: data.offset,
             limit: alloc_size,
-            mmap: data.mmap.clone(),
+            storage: data.storage.clone(),
             used: 0,
         };
         // register the new block before handing it out

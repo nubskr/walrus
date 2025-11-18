@@ -5,7 +5,7 @@ use crate::wal::kv_store::hint::{self, HintEntry};
 use crate::wal::paths::WalPathManager;
 use std::io::Write;
 use crate::wal::runtime::allocator::BlockAllocator;
-use crate::wal::storage::SharedMmapKeeper;
+use crate::wal::storage::StorageKeeper;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
@@ -133,8 +133,8 @@ impl KvStore {
 
             // SLOW PATH: Scan data file
             let path_str = path.to_string_lossy().to_string();
-            let mmap = SharedMmapKeeper::get_mmap_arc(&path_str)?;
-            let len = mmap.len();
+            let storage = StorageKeeper::get_storage_arc(&path_str)?;
+            let len = storage.len();
             let mut offset = 0;
             
             // We will collect entries to write a hint file if this is NOT the active file.
@@ -151,7 +151,7 @@ impl KvStore {
 
             while offset + KV_OVERHEAD <= len {
                 let mut header = [0u8; KV_HEADER_SIZE];
-                mmap.read(offset, &mut header);
+                storage.read(offset, &mut header);
 
                 let flags = header[0];
                 let k_len = u16::from_le_bytes(header[1..3].try_into().unwrap()) as usize;
@@ -165,7 +165,7 @@ impl KvStore {
 
                 // Verify Checksum (Slow but safe)
                 let mut entry_buf = vec![0u8; total_len];
-                mmap.read(offset, &mut entry_buf);
+                storage.read(offset, &mut entry_buf);
                 
                 // ... (Checksum verification omitted for brevity in reasoning, but strictly should be here) ...
                 // Re-using existing verification logic
@@ -315,13 +315,13 @@ impl KvStore {
              
              let path_str = path.to_string_lossy().to_string();
              let path_str = path.to_string_lossy().to_string();
-             let mmap = SharedMmapKeeper::get_mmap_arc(&path_str)?;
-             let len = mmap.len();
+             let storage = StorageKeeper::get_storage_arc(&path_str)?;
+             let len = storage.len();
              let mut offset = 0;
              
              while offset + KV_OVERHEAD <= len {
                   let mut header = [0u8; KV_HEADER_SIZE];
-                  mmap.read(offset, &mut header);
+                  storage.read(offset, &mut header);
 
                   let flags = header[0];
                   let k_len = u16::from_le_bytes(header[1..3].try_into().unwrap()) as usize;
@@ -333,7 +333,7 @@ impl KvStore {
 
                   // Verify Checksum
                   let mut entry_buf = vec![0u8; total_len];
-                  mmap.read(offset, &mut entry_buf);
+                  storage.read(offset, &mut entry_buf);
                   
                   let stored_csum_bytes = &entry_buf[total_len - KV_CHECKSUM_SIZE..];
                   let stored_csum = u32::from_le_bytes(stored_csum_bytes.try_into().unwrap());
@@ -393,19 +393,19 @@ impl KvStore {
         let path_str = path.to_string_lossy().to_string();
         
         // If file doesn't exist, return None (shouldn't happen if Index is consistent)
-        let mmap = match SharedMmapKeeper::get_mmap_arc(&path_str) {
+        let storage = match StorageKeeper::get_storage_arc(&path_str) {
             Ok(m) => m,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
 
         let len = loc.len as usize;
-        if loc.offset as usize + len > mmap.len() {
+        if loc.offset as usize + len > storage.len() {
              return Err(Error::new(ErrorKind::InvalidData, "Index points past EOF"));
         }
 
         let mut buffer = vec![0u8; len];
-        mmap.read(loc.offset as usize, &mut buffer);
+        storage.read(loc.offset as usize, &mut buffer);
 
         // Verify Checksum
         let stored_csum_bytes = &buffer[len - KV_CHECKSUM_SIZE..];

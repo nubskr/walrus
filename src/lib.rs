@@ -1,15 +1,15 @@
 //! # Walrus 🦭
 //!
 //! A high-performance Write-Ahead Log (WAL) implementation in Rust designed for concurrent
-//! workloads with topic-based organization, configurable consistency models, and dual storage backends.
+//! workloads with topic-based organization and configurable consistency models.
 //!
 //! ## Features
 //!
 //! - **High Performance**: Optimized for concurrent writes and reads
 //! - **Topic-based Organization**: Separate read/write streams per topic
 //! - **Configurable Consistency**: Choose between strict and relaxed consistency models
-//! - **Batched I/O**: Atomic batch append and read APIs (uses io_uring on Linux with FD backend)
-//! - **Dual Storage Backends**: FD backend with pread/pwrite (default) or mmap backend
+//! - **Batched I/O**: Atomic batch append and read APIs (uses io_uring on Linux)
+//! - **FD Backend**: Uses file descriptors (pwritev/pread) for maximum efficiency
 //! - **Persistent Read Offsets**: Read positions survive process restarts
 //! - **Namespace Isolation**: Separate WAL instances with per-key directories
 //!
@@ -40,9 +40,9 @@
 //!
 //! ## Batch Operations
 //!
-//! Walrus supports efficient batch writes and reads. On Linux with the FD backend (default),
-//! batch operations automatically use io_uring for parallel I/O submission. On other platforms
-//! or with the mmap backend, batches fall back to sequential operations.
+//! Walrus supports efficient batch writes and reads. On Linux, batch operations automatically
+//! use io_uring for parallel I/O submission. On other platforms, batches fall back to sequential
+//! but efficient vectored operations.
 //!
 //! **Limits:**
 //! - Maximum 2,000 entries per batch
@@ -149,50 +149,13 @@
 //! # }
 //! ```
 //!
-//! ## Storage Backends
+//! ## Storage Backend
 //!
-//! Walrus supports two storage backends that can be selected at runtime:
+//! Walrus exclusively uses a highly optimized FD (File Descriptor) backend.
 //!
-//! ### FD Backend (File Descriptor) - Default
-//!
-//! Uses file descriptors with `pread`/`pwrite` syscalls for I/O operations. This is the
-//! default backend and requires Unix-specific APIs.
-//!
-//! **Batch Operations on Linux:**
-//! - When running on Linux, batch operations (`batch_append_for_topic` and `batch_read_for_topic`)
-//!   automatically use io_uring for high-performance parallel I/O submission
-//! - Regular single-entry operations use standard `pread`/`pwrite` syscalls
-//!
-//! **O_SYNC Mode:**
-//! - When `FsyncSchedule::SyncEach` is configured, files are opened with the `O_SYNC` flag,
-//!   making every write synchronous
-//!
-//! - **Works on**: Unix systems (Linux, macOS, BSD)
-//! - **Best for**: Batch operations on Linux (io_uring), general-purpose workloads
-//! - **Default**: Enabled
-//!
-//! ### Mmap Backend (Memory-Mapped Files)
-//!
-//! Uses memory-mapped files for direct memory access. Batch operations fall back to
-//! sequential reads/writes without io_uring acceleration.
-//!
-//! - **Works on**: All platforms
-//! - **Best for**: Windows, or when FD backend is incompatible
-//! - **Default**: Disabled (use `disable_fd_backend()` to enable)
-//!
-//! ### Selecting a Backend
-//!
-//! ```rust,no_run
-//! use walrus_rust::{enable_fd_backend, disable_fd_backend};
-//!
-//! // Use FD backend (default - uses io_uring for batches on Linux)
-//! enable_fd_backend();
-//!
-//! // Use mmap backend (no io_uring, sequential batch operations)
-//! disable_fd_backend();
-//! ```
-//!
-//! **Important**: Backend selection must be done before creating any `Walrus` instances.
+//! - **FD Backend**: Uses `pread`/`pwrite` (and `pwritev` for vectored writes) for efficient I/O.
+//! - **io_uring**: On Linux, batch operations automatically utilize `io_uring` for maximum throughput and parallelism.
+//! - **O_SYNC**: When `FsyncSchedule::SyncEach` is enabled, files are opened with `O_SYNC` (on Unix) for immediate durability.
 //!
 //! ## Environment Variables
 //!
@@ -251,6 +214,4 @@
 
 #![recursion_limit = "256"]
 pub mod wal;
-pub use wal::{
-    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, disable_fd_backend, enable_fd_backend,
-};
+pub use wal::{Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus};

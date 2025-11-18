@@ -4,7 +4,7 @@ use crate::wal::config::{
 };
 use crate::wal::kv_store::store::KvStore;
 use crate::wal::paths::WalPathManager;
-use crate::wal::storage::{SharedMmapKeeper, set_fsync_schedule};
+use crate::wal::storage::{StorageKeeper, set_fsync_schedule};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::mpsc;
@@ -77,7 +77,7 @@ impl Walrus {
     ) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
 
-        // Store the fsync schedule globally for SharedMmap::new to access
+        // Store the fsync schedule globally for Storage::new to access
         set_fsync_schedule(fsync_schedule);
 
         let allocator = Arc::new(BlockAllocator::new(paths.clone())?);
@@ -193,10 +193,10 @@ impl Walrus {
         let mut seen_files = HashSet::new();
 
         for file_path in files.iter() {
-            let mmap = match SharedMmapKeeper::get_mmap_arc(file_path) {
+            let storage = match StorageKeeper::get_storage_arc(file_path) {
                 Ok(m) => m,
                 Err(e) => {
-                    debug_print!("[recovery] mmap open failed for {}: {}", file_path, e);
+                    debug_print!("[recovery] storage open failed for {}: {}", file_path, e);
                     continue;
                 }
             };
@@ -208,7 +208,7 @@ impl Walrus {
             while block_offset + DEFAULT_BLOCK_SIZE <= MAX_FILE_SIZE {
                 // heuristic: if first bytes are zero, assume no more blocks
                 let mut probe = [0u8; 8];
-                mmap.read(block_offset as usize, &mut probe);
+                storage.read(block_offset as usize, &mut probe);
                 if probe.iter().all(|&b| b == 0) {
                     break;
                 }
@@ -217,7 +217,7 @@ impl Walrus {
 
                 // try to read first metadata to get column name (with 2-byte length prefix)
                 let mut meta_buf = vec![0u8; PREFIX_META_SIZE];
-                mmap.read(block_offset as usize, &mut meta_buf);
+                storage.read(block_offset as usize, &mut meta_buf);
                 let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
                     break;
@@ -243,7 +243,7 @@ impl Walrus {
                     file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
+                    storage: storage.clone(),
                     used: 0,
                 };
                 let mut in_block_off: u64 = 0;
@@ -268,7 +268,7 @@ impl Walrus {
                     file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
+                    storage: storage.clone(),
                     used,
                 };
                 // register and append

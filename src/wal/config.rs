@@ -1,19 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-// Global flag to choose backend
-pub(crate) static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
-
-// Public function to enable FD backend
-pub fn enable_fd_backend() {
-    USE_FD_BACKEND.store(true, Ordering::Relaxed);
-}
-
-// Public function to disable FD backend (use mmap instead)
-pub fn disable_fd_backend() {
-    USE_FD_BACKEND.store(false, Ordering::Relaxed);
-}
 
 // Macro to conditionally print debug messages
 macro_rules! debug_print {
