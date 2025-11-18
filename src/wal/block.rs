@@ -66,13 +66,12 @@ impl Block {
         // Copy actual metadata starting at byte 2
         meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
 
-        // Combine and write
-        let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-        combined.extend_from_slice(&meta_buffer);
-        combined.extend_from_slice(data);
-
         let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &combined);
+        
+        // Direct write: Metadata then Data
+        self.mmap.write(file_offset as usize, &meta_buffer);
+        self.mmap.write((file_offset as usize) + PREFIX_META_SIZE, data);
+        
         Ok(())
     }
 

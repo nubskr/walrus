@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 
-mod allocator;
+pub(crate) mod allocator;
 mod background;
 mod index;
 mod reader;

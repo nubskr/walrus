@@ -1,5 +1,6 @@
 mod block;
 mod config;
+pub mod kv_store;
 mod paths;
 mod runtime;
 mod storage;

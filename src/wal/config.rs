@@ -67,10 +67,12 @@ pub(crate) fn now_millis_str() -> String {
 }
 
 pub(crate) fn checksum64(data: &[u8]) -> u64 {
-    // FNV-1a 64-bit checksum
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    checksum64_update(data, FNV_OFFSET)
+}
+
+pub(crate) fn checksum64_update(data: &[u8], mut hash: u64) -> u64 {
     const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET;
     for &b in data {
         hash ^= b as u64;
         hash = hash.wrapping_mul(FNV_PRIME);

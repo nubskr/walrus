@@ -2,6 +2,7 @@
 !scripts/*.py
 .DS_Store
 /target
+/wal_kv
 /wal_files
 digest.txt
 *.csv

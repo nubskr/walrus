@@ -2,6 +2,7 @@ use crate::wal::block::{Block, Metadata};
 use crate::wal::config::{
     DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_FILE_SIZE, PREFIX_META_SIZE, debug_print,
 };
+use crate::wal::kv_store::store::KvStore;
 use crate::wal::paths::WalPathManager;
 use crate::wal::storage::{SharedMmapKeeper, set_fsync_schedule};
 use std::collections::{HashMap, HashSet};
@@ -112,6 +113,10 @@ impl Walrus {
 
     pub fn topic_is_clean(&self, topic: &str) -> bool {
         self.topic_clean_tracker.topic_is_clean(topic)
+    }
+
+    pub fn kv_store(&self, namespace: &str) -> std::io::Result<KvStore> {
+        KvStore::new(namespace)
     }
 
     #[cfg(test)]

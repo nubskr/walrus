@@ -9,14 +9,14 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use super::DELETION_TX;
 
-pub(super) struct BlockAllocator {
+pub(crate) struct BlockAllocator {
     next_block: UnsafeCell<Block>,
     lock: AtomicBool,
     paths: Arc<WalPathManager>,
 }
 
 impl BlockAllocator {
-    pub(super) fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
+    pub(crate) fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
         let file1 = paths.create_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
         debug_print!(
@@ -44,7 +44,7 @@ impl BlockAllocator {
     /// ensures exclusive mutable access to `next_block` while computing the
     /// next allocation, so the interior `UnsafeCell` is not concurrently
     /// accessed mutably.
-    pub(super) unsafe fn get_next_available_block(&self) -> std::io::Result<Block> {
+    pub(crate) unsafe fn get_next_available_block(&self) -> std::io::Result<Block> {
         self.lock();
         // SAFETY: Guarded by `self.lock()` above, providing exclusive access
         // to `next_block` so creating a `&mut` from `UnsafeCell` is sound.
@@ -82,7 +82,7 @@ impl BlockAllocator {
     /// SAFETY: Caller must ensure the resulting `Block` remains uniquely used
     /// by one writer and not read concurrently while being written. The
     /// internal spin lock provides exclusive access to mutate allocator state.
-    pub(super) unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
+    pub(crate) unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
         if want_bytes == 0 || want_bytes > MAX_ALLOC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
