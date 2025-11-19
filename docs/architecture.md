@@ -137,12 +137,9 @@ sequenceDiagram
 
 ## Backend Selection
 
-- `enable_fd_backend()` flips a process-wide atomic that forces new blocks to
-  use the fd-backed storage (and therefore enables `io_uring` batching on Linux).
-- `disable_fd_backend()` reverts to mmap-backed accesses; batch writes fall back
-  to sequential writes and batch reads use direct mmap parsing.
-- The default is FD+`io_uring` when supported; non-Linux builds automatically
-  live on the mmap backend.
+- The FD backend uses fd-backed storage and enables `io_uring` batching on Linux.
+- The mmap backend uses mmap-backed accesses; batch writes fall back to sequential writes and batch reads use direct mmap parsing.
+- The default is FD+`io_uring` when supported; non-Linux builds automatically live on the mmap backend.
 
 ## Concurrency & Synchronization
 

@@ -201,7 +201,7 @@ pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
 
 ### Required
 - `io-uring` crate (already in use)
-- FD backend must be enabled (`enable_fd_backend()`)
+- FD backend (enabled by default on Linux)
 - Linux kernel with io_uring support
 
 ### Not Required
