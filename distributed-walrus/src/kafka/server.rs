@@ -99,6 +99,13 @@ async fn handle_request(
                 topics,
             );
         }
+        50 => {
+            let topics = decode_string_array(buf)?;
+            encode_internal_state_response(&mut res, controller.metadata.snapshot_state(), topics);
+        }
+        1 => {
+            encode_fetch_response(&mut res, buf, controller).await?;
+        }
         0 => {
             encode_produce_response(&mut res, buf, controller).await?;
         }
@@ -213,19 +220,102 @@ async fn encode_produce_response(
     Ok(())
 }
 
+async fn encode_fetch_response(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+) -> Result<()> {
+    let _replica_id = i32::decode(buf)?; // unused
+    let _max_wait = i32::decode(buf)?; // unused
+    let _min_bytes = i32::decode(buf)?; // unused
+    let topic_count = i32::decode(buf)?;
+    if topic_count < 0 {
+        return Err(anyhow!("invalid topic count"));
+    }
+
+    let mut topic_results = Vec::with_capacity(topic_count as usize);
+    for _ in 0..topic_count {
+        let topic = String::decode(buf)?;
+        let partition_count = i32::decode(buf)?;
+        if partition_count < 0 {
+            return Err(anyhow!("invalid partition count"));
+        }
+        let mut parts = Vec::with_capacity(partition_count as usize);
+        for _ in 0..partition_count {
+            let partition = i32::decode(buf)?;
+            let fetch_offset = i64::decode(buf)?;
+            let max_bytes = i32::decode(buf)?;
+            let entries = controller
+                .route_and_read(&topic, partition as u32, max_bytes as usize)
+                .await;
+            match entries {
+                Ok(data) => {
+                    let start = fetch_offset.max(0) as usize;
+                    let payload = data.get(start).cloned().unwrap_or_default();
+                    parts.push((partition, 0i16, fetch_offset, payload));
+                }
+                Err(e) => {
+                    error!("Fetch failure for {}-{}: {}", topic, partition, e);
+                    parts.push((partition, 1i16, 0i64, Vec::new()));
+                }
+            }
+        }
+        topic_results.push((topic, parts));
+    }
+
+    res.put_i32(topic_results.len() as i32);
+    for (topic, partitions) in topic_results {
+        topic.encode(res);
+        res.put_i32(partitions.len() as i32);
+        for (partition, error_code, high_watermark, payload) in partitions {
+            res.put_i32(partition);
+            res.put_i16(error_code);
+            res.put_i64(high_watermark);
+            res.put_i32(payload.len() as i32);
+            res.extend_from_slice(&payload);
+        }
+    }
+    Ok(())
+}
+
 fn encode_api_versions_response(res: &mut BytesMut) {
     res.put_i16(0);
-    res.put_i32(3);
+    let supported = [(0i16, 0i16), (3, 0), (18, 0), (50, 0)];
+    res.put_i32(supported.len() as i32);
+    for (api, version) in supported {
+        res.put_i16(api);
+        res.put_i16(version);
+        res.put_i16(version);
+    }
+}
 
-    res.put_i16(0);
-    res.put_i16(0);
-    res.put_i16(0);
-
-    res.put_i16(3);
-    res.put_i16(0);
-    res.put_i16(0);
-
-    res.put_i16(18);
-    res.put_i16(0);
-    res.put_i16(0);
+fn encode_internal_state_response(
+    res: &mut BytesMut,
+    state: ClusterState,
+    topics_filter: Vec<String>,
+) {
+    let requested: HashSet<String> = topics_filter.into_iter().collect();
+    let use_filter = !requested.is_empty();
+    let mut topics: Vec<_> = state.topics.into_iter().collect();
+    topics.sort_by(|a, b| a.0.cmp(&b.0));
+    res.put_i32(
+        topics
+            .iter()
+            .filter(|(name, _)| !use_filter || requested.contains(name))
+            .count() as i32,
+    );
+    for (name, info) in topics.into_iter() {
+        if use_filter && !requested.contains(&name) {
+            continue;
+        }
+        name.encode(res);
+        let mut parts: Vec<_> = info.partition_states.into_iter().collect();
+        parts.sort_by_key(|(id, _)| *id);
+        res.put_i32(parts.len() as i32);
+        for (partition_id, state) in parts {
+            res.put_i32(partition_id as i32);
+            res.put_i32(state.leader_node as i32);
+            res.put_i64(state.current_generation as i64);
+        }
+    }
 }

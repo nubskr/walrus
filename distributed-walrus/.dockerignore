@@ -1,0 +1,9 @@
+target
+*/target
+**/target
+debug
+.git
+test_data
+node*.log
+*.pyc
+.pytest_cache

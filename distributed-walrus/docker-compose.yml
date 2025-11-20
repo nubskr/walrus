@@ -1,0 +1,144 @@
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: distributed-walrus/Dockerfile
+    image: distributed-walrus-node
+    container_name: walrus-1
+    hostname: node1
+    command:
+      - "--node-id"
+      - "1"
+      - "--data-dir"
+      - "/data"
+      - "--raft-host"
+      - "0.0.0.0"
+      - "--raft-advertise-host"
+      - "node1"
+      - "--raft-port"
+      - "6001"
+      - "--port"
+      - "9091"
+    environment:
+      - RUST_LOG=info
+      - WALRUS_DISABLE_IO_URING=1
+      - WALRUS_MONITOR_CHECK_MS=1000
+      - WALRUS_MAX_SEGMENT_BYTES=32768
+      - WALRUS_RETENTION_GENERATIONS=0
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./test_data/node1:/data
+    ports:
+      - "9091:9091"
+    networks:
+      - walrus-net
+
+  node2:
+    image: distributed-walrus-node
+    container_name: walrus-2
+    hostname: node2
+    depends_on:
+      - node1
+    command:
+      - "--node-id"
+      - "2"
+      - "--data-dir"
+      - "/data"
+      - "--raft-host"
+      - "0.0.0.0"
+      - "--raft-advertise-host"
+      - "node2"
+      - "--raft-port"
+      - "6002"
+      - "--port"
+      - "9092"
+      - "--join"
+      - "node1:6001"
+    environment:
+      - RUST_LOG=info
+      - WALRUS_DISABLE_IO_URING=1
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./test_data/node2:/data
+    ports:
+      - "9092:9092"
+    networks:
+      - walrus-net
+
+  node3:
+    image: distributed-walrus-node
+    container_name: walrus-3
+    hostname: node3
+    depends_on:
+      - node1
+    command:
+      - "--node-id"
+      - "3"
+      - "--data-dir"
+      - "/data"
+      - "--raft-host"
+      - "0.0.0.0"
+      - "--raft-advertise-host"
+      - "node3"
+      - "--raft-port"
+      - "6003"
+      - "--port"
+      - "9093"
+      - "--join"
+      - "node1:6001"
+    environment:
+      - RUST_LOG=info
+      - WALRUS_DISABLE_IO_URING=1
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./test_data/node3:/data
+    ports:
+      - "9093:9093"
+    networks:
+      - walrus-net
+
+  # Hot-join test node (only started when --profile hotjoin is set)
+  node4:
+    profiles: ["hotjoin"]
+    image: distributed-walrus-node
+    container_name: walrus-4
+    hostname: node4
+    depends_on:
+      - node1
+    command:
+      - "--node-id"
+      - "4"
+      - "--data-dir"
+      - "/data"
+      - "--raft-host"
+      - "0.0.0.0"
+      - "--raft-advertise-host"
+      - "node4"
+      - "--raft-port"
+      - "6004"
+      - "--port"
+      - "9094"
+      - "--join"
+      - "node1:6001"
+    environment:
+      - RUST_LOG=info
+      - WALRUS_DISABLE_IO_URING=1
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./test_data/node4:/data
+    ports:
+      - "9094:9094"
+    networks:
+      - walrus-net
+
+networks:
+  walrus-net:
+    driver: bridge
