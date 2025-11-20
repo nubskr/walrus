@@ -99,6 +99,9 @@ async fn handle_request(
                 topics,
             );
         }
+        19 => {
+            encode_create_topics_response(&mut res, buf, controller).await?;
+        }
         50 => {
             let topics = decode_string_array(buf)?;
             encode_internal_state_response(&mut res, controller.metadata.snapshot_state(), topics);
@@ -108,6 +111,9 @@ async fn handle_request(
         }
         0 => {
             encode_produce_response(&mut res, buf, controller).await?;
+        }
+        51 => {
+            encode_membership_response(&mut res, buf, controller).await?;
         }
         18 => {
             encode_api_versions_response(&mut res);
@@ -245,14 +251,25 @@ async fn encode_fetch_response(
             let partition = i32::decode(buf)?;
             let fetch_offset = i64::decode(buf)?;
             let max_bytes = i32::decode(buf)?;
-            let entries = controller
+            let read_res = controller
                 .route_and_read(&topic, partition as u32, max_bytes as usize)
                 .await;
-            match entries {
-                Ok(data) => {
+            match read_res {
+                Ok((data, observed_high_watermark)) => {
                     let start = fetch_offset.max(0) as usize;
-                    let payload = data.get(start).cloned().unwrap_or_default();
-                    parts.push((partition, 0i16, fetch_offset, payload));
+                    let high_watermark = observed_high_watermark as i64;
+                    let total_available = observed_high_watermark as usize;
+                    if total_available > 0 && start >= total_available {
+                        parts.push((partition, 1i16, high_watermark, Vec::new()));
+                    } else if start < data.len() {
+                        let payload = data[start].clone();
+                        parts.push((partition, 0i16, high_watermark, payload));
+                    } else if data.is_empty() {
+                        parts.push((partition, 0i16, high_watermark, Vec::new()));
+                    } else {
+                        // Offset beyond available entries: surface error; keep high watermark visible.
+                        parts.push((partition, 1i16, high_watermark, Vec::new()));
+                    }
                 }
                 Err(e) => {
                     error!("Fetch failure for {}-{}: {}", topic, partition, e);
@@ -280,7 +297,7 @@ async fn encode_fetch_response(
 
 fn encode_api_versions_response(res: &mut BytesMut) {
     res.put_i16(0);
-    let supported = [(0i16, 0i16), (3, 0), (18, 0), (50, 0)];
+    let supported = [(0i16, 0i16), (1, 0i16), (3, 0), (18, 0), (19, 0), (50, 0), (51, 0)];
     res.put_i32(supported.len() as i32);
     for (api, version) in supported {
         res.put_i16(api);
@@ -318,4 +335,80 @@ fn encode_internal_state_response(
             res.put_i64(state.current_generation as i64);
         }
     }
+}
+
+async fn encode_create_topics_response(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+) -> Result<()> {
+    let requested = i32::decode(buf)?;
+    if requested < 0 {
+        return Err(anyhow!("invalid topic count"));
+    }
+    let mut results = Vec::with_capacity(requested as usize);
+    for _ in 0..requested {
+        let name = String::decode(buf)?;
+        let partitions = i32::decode(buf)?;
+        let replication = i16::decode(buf)?;
+        let assignment_count = i32::decode(buf)?;
+        for _ in 0..assignment_count {
+            let _ = i32::decode(buf)?; // partition id
+            let replica_count = i32::decode(buf)?;
+            for _ in 0..replica_count {
+                let _ = i32::decode(buf)?;
+            }
+        }
+        let config_count = i32::decode(buf)?;
+        for _ in 0..config_count {
+            let _ = String::decode(buf)?;
+            let _ = String::decode(buf)?;
+        }
+
+        let err = if replication != 1 {
+            40i16 // invalid replication factor
+        } else if partitions <= 0 {
+            21i16 // invalid partitions
+        } else {
+            match controller.create_topic(name.clone(), partitions as u32).await {
+                Ok(_) => 0i16,
+                Err(e) => {
+                    error!("CreateTopic failed for {}: {}", name, e);
+                    6i16
+                }
+            }
+        };
+        results.push((name, err));
+    }
+    // Consume optional timeout (v0: required)
+    let _timeout = i32::decode(buf).unwrap_or(0);
+
+    res.put_i32(0); // throttle time
+    res.put_i32(results.len() as i32);
+    for (name, code) in results {
+        name.encode(res);
+        res.put_i16(code);
+        "".to_string().encode(res); // error message
+        res.put_i32(0); // configs count in response
+    }
+    Ok(())
+}
+
+async fn encode_membership_response(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+) -> Result<()> {
+    // op_code: i16 (0 = remove voter), payload: node_id (i32)
+    let op = i16::decode(buf)?;
+    let target = i32::decode(buf)?;
+    let mut code = 0i16;
+    if op != 0 {
+        code = 42; // unsupported op
+    } else if let Err(e) = controller.remove_node_from_membership(target as u64).await {
+        error!("membership change failed: {}", e);
+        code = 6;
+    }
+    res.put_i16(code);
+    Ok(())
 }

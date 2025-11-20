@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
-use tracing_log::LogTracer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -101,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         bucket: bucket.clone(),
         metadata: metadata.clone(),
         raft: raft.clone(),
+        offsets: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     let controller_rpc = controller.clone();
@@ -197,8 +197,8 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             info!("Append routed through controller");
 
-            let reads = controller.route_and_read("logs", 0, 1024).await?;
-            info!("Read {} entries", reads.len());
+            let (reads, high_watermark) = controller.route_and_read("logs", 0, 1024).await?;
+            info!("Read {} entries (hw={})", reads.len(), high_watermark);
             for (i, data) in reads.iter().enumerate() {
                 info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
             }
