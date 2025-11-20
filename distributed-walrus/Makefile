@@ -2,6 +2,7 @@ PYTHON ?= $(VENV)/bin/python
 PYTEST ?= $(PYTHON) -m pytest
 PIP ?= $(PYTHON) -m pip
 UV ?= uv
+UV_VENV_FLAGS ?= --if-exists reuse
 VENV ?= .venv
 PYFLAGS ?= -vv
 
@@ -37,16 +38,19 @@ TESTS := \
 
 .PHONY: deps all-tests $(TESTS)
 
-deps:
+deps: $(VENV)/.deps-installed
+
+$(VENV)/.deps-installed:
 	@if command -v $(UV) >/dev/null 2>&1; then \
 		echo "Using uv to manage virtualenv..."; \
-		$(UV) venv $(VENV); \
+		$(UV) venv $(UV_VENV_FLAGS) $(VENV); \
 		$(UV) pip install --python $(PYTHON) -r tests/requirements.txt; \
 	else \
 		echo "uv not found; falling back to python -m venv"; \
 		python3 -m venv $(VENV); \
 		$(PIP) install -r tests/requirements.txt; \
 	fi
+	@touch $(VENV)/.deps-installed
 
 all-tests: deps
 	@for t in $(TESTS); do \
