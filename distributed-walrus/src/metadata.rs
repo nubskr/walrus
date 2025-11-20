@@ -79,6 +79,19 @@ impl MetadataStateMachine {
         }
         out
     }
+
+    /// If a node is removed from membership, reassign any leaderships it held to the provided replacement.
+    pub fn reassign_leader(&self, removed: NodeId, replacement: NodeId) {
+        if let Ok(mut guard) = self.state.write() {
+            for (_topic, info) in guard.topics.iter_mut() {
+                for (_id, part) in info.partition_states.iter_mut() {
+                    if part.leader_node == removed {
+                        part.leader_node = replacement;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl StateMachineTrait for MetadataStateMachine {

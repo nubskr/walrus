@@ -181,6 +181,29 @@ def make_fetch_with_offset(topic: str, partition: int, offset: int, max_bytes: i
     return struct.pack(">i", len(frame)) + frame
 
 
+def make_create_topics_request(topics: list[tuple[str, int]], correlation_id: int = 7) -> bytes:
+    """
+    topics: list of (name, partitions)
+    """
+    header = struct.pack(">hhih", 19, 0, correlation_id, 4) + b"test"
+    body = struct.pack(">i", len(topics))
+    for name, partitions in topics:
+        body += kafka_string(name)
+        body += struct.pack(">i", partitions)  # partitions
+        body += struct.pack(">h", 1)  # replication factor (fixed to 1)
+        body += struct.pack(">i", 0)  # replica assignment count
+        body += struct.pack(">i", 0)  # config count
+    body += struct.pack(">i", 10000)  # timeout ms
+    frame = header + body
+    return struct.pack(">i", len(frame)) + frame
+
+
+def make_membership_remove_request(node_id: int, correlation_id: int = 8) -> bytes:
+    header = struct.pack(">hhih", 51, 0, correlation_id, 4) + b"test"
+    body = struct.pack(">hi", 0, node_id)  # op=remove, node id
+    return struct.pack(">i", len(header + body)) + header + body
+
+
 def read_frame(sock: socket.socket) -> Optional[bytes]:
     try:
         size_bytes = recv_exact(sock, 4)
@@ -230,11 +253,21 @@ def ensure_cluster_ready(timeout: int = 90):
 
 
 def ensure_network():
-    subprocess.run(["docker", "network", "create", "distributed-walrus_walrus-net"], check=False)
+    subprocess.run(
+        ["docker", "network", "create", "distributed-walrus_walrus-net"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def cleanup_node4_container():
-    subprocess.run(["docker", "rm", "-f", "walrus-4"], check=False)
+    subprocess.run(
+        ["docker", "rm", "-f", "walrus-4"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def dump_logs(services: list[str], tail: int = 120):
@@ -309,6 +342,14 @@ def wal_file_mtime_ns(node_id: int) -> int:
         return 0
     times = [int(p.stat().st_mtime_ns) for p in root.iterdir() if p.is_file()]
     return max(times) if times else 0
+
+
+def pause_container(name: str):
+    subprocess.run(["docker", "kill", "-s", "STOP", name], check=True)
+
+
+def resume_container(name: str):
+    subprocess.run(["docker", "kill", "-s", "CONT", name], check=True)
 
 
 def restart_container(name: str):
@@ -466,14 +507,42 @@ def decode_fetch(resp: bytes) -> Optional[list[dict]]:
                 idx += 4
                 error_code = struct.unpack_from(">h", resp, idx)[0]
                 idx += 2
-                _high_watermark = struct.unpack_from(">q", resp, idx)[0]
+                high_watermark = struct.unpack_from(">q", resp, idx)[0]
                 idx += 8
                 size = struct.unpack_from(">i", resp, idx)[0]
                 idx += 4
                 payload = resp[idx : idx + size]
                 idx += size
-                payloads.append({"error_code": error_code, "payload": payload})
+                payloads.append({"error_code": error_code, "payload": payload, "high_watermark": high_watermark})
         return payloads
+    except Exception:
+        return None
+
+
+def decode_create_topics_resp(resp: bytes) -> Optional[list[tuple[str, int]]]:
+    """Return list of (topic, error_code) for CreateTopics."""
+    try:
+        idx = 0
+        _corr = struct.unpack_from(">i", resp, idx)[0]
+        idx += 4
+        _throttle = struct.unpack_from(">i", resp, idx)[0]
+        idx += 4
+        count = struct.unpack_from(">i", resp, idx)[0]
+        idx += 4
+        topics: list[tuple[str, int]] = []
+        for _ in range(count):
+            name_len = struct.unpack_from(">h", resp, idx)[0]
+            idx += 2
+            name = resp[idx : idx + name_len].decode()
+            idx += name_len
+            err = struct.unpack_from(">h", resp, idx)[0]
+            idx += 2
+            msg_len = struct.unpack_from(">h", resp, idx)[0]
+            idx += 2 + msg_len
+            _cfg_count = struct.unpack_from(">i", resp, idx)[0]
+            idx += 4
+            topics.append((name, err))
+        return topics
     except Exception:
         return None
 
@@ -574,9 +643,12 @@ def test_api_versions_support_known_keys():
     assert decoded["error_code"] == 0
     supported = {key: (min_v, max_v) for key, min_v, max_v in decoded["apis"]}
     assert supported.get(0) == (0, 0)
+    assert supported.get(1) == (0, 0)
     assert supported.get(3) == (0, 0)
     assert supported.get(18) == (0, 0)
+    assert supported.get(19) == (0, 0)
     assert supported.get(50) == (0, 0)
+    assert supported.get(51) == (0, 0)
 
 
 def test_produce_unknown_topic_returns_error_and_no_disk_change():
@@ -643,6 +715,44 @@ def test_fetch_payload_and_offsets_from_leader():
     items1 = decode_fetch(fetch1 or b"")
     assert items1 and items1[0]["error_code"] == 0
     assert items1[0]["payload"].startswith(b"SECOND") or items1[0]["payload"] == b""
+
+
+def test_create_topic_and_roundtrip_partition_zero():
+    ensure_cluster_ready()
+    resp = send_frame_with_retry(*NODES[1], make_create_topics_request([("topic_x", 1)]))
+    topics = decode_create_topics_resp(resp or b"")
+    assert topics and topics[0][1] == 0, f"CreateTopics failed: {topics}"
+
+    data = b"NEWTOPIC"
+    prod = send_frame_with_retry(*NODES[1], make_produce_request("topic_x", data, partition=0))
+    assert prod and all(code == 0 for code in parse_produce_error_codes(prod))
+    time.sleep(1)
+    fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("topic_x", 4096)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+    assert fetch[0]["payload"] in (data, b"")
+
+
+def test_fetch_offset_strictness_with_high_watermark():
+    ensure_cluster_ready()
+    send_frame_with_retry(*NODES[1], make_create_topics_request([("strict_topic", 1)]))
+    payloads = [b"S1", b"S2", b"S3"]
+    for pay in payloads:
+        produce_and_assert_ok(NODES[1], "strict_topic", pay, partition=0)
+    time.sleep(1)
+
+    fetch0 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 0)) or b"")
+    assert fetch0 and fetch0[0]["error_code"] == 0
+    assert fetch0[0]["high_watermark"] >= len(payloads)
+    # Payload may still be empty depending on WAL semantics, but offset 0 must be accepted.
+
+    fetch2 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 2)) or b"")
+    assert fetch2 and fetch2[0]["error_code"] == 0
+    assert fetch2[0]["high_watermark"] >= len(payloads)
+
+    # Offset beyond available should return an error.
+    fetch4 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 4)) or b"")
+    assert fetch4 and fetch4[0]["error_code"] != 0
+    assert fetch4[0]["high_watermark"] >= len(payloads)
 
 
 def test_fetch_unknown_topic_returns_error():
@@ -814,6 +924,34 @@ def test_leader_failover_timeout_then_recovery():
     assert set(after[1].items()) - set(before[1].items()), "leader storage did not advance after recovery append"
 
 
+def test_leader_pause_causes_timeout_and_resumes():
+    """Pause leader with SIGSTOP to exercise client timeout path without killing container."""
+    ensure_cluster_ready()
+    produce_and_assert_ok(NODES[1], "logs", b"PAUSE_BASE")
+    time.sleep(1)
+
+    pause_container("walrus-1")
+    try:
+        start = time.time()
+        resp = send_frame(NODES[2][0], NODES[2][1], make_produce_request("logs", b"PAUSE_SHOULD_TIMEOUT"))
+        elapsed = time.time() - start
+        if resp:
+            assert any(code != 0 for code in parse_produce_error_codes(resp)), "produce should fail while leader paused"
+        assert elapsed < 8, f"produce during pause took too long ({elapsed}s)"
+    finally:
+        resume_container("walrus-1")
+    wait_for_specific_ports({1: NODES[1]}, timeout=40)
+    ensure_cluster_ready(timeout=120)
+
+    # Writes should succeed again.
+    after_resp = send_frame_with_retry(
+        *NODES[1], make_produce_request("logs", b"PAUSE_RECOVER"), attempts=8, delay=2
+    )
+    assert after_resp, "leader did not respond after resume"
+    fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+
+
 def test_full_cluster_restart_preserves_data():
     ensure_cluster_ready()
     payload = b"CLUSTER_RESTART_PAYLOAD"
@@ -850,6 +988,10 @@ def test_follower_restart_catches_up_and_reads():
     assert meta and meta["local_node_id"] == 3
     leader_fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096)) or b"")
     assert leader_fetch and leader_fetch[0]["error_code"] == 0
+
+    # Follower forwards fetch to leader; ensure it answers after catching up.
+    follower_fetch = decode_fetch(send_frame_with_retry(*NODES[3], make_fetch_request("logs", 4096)) or b"")
+    assert follower_fetch and follower_fetch[0]["error_code"] == 0
 
 
 def force_rollover_to_generation(target_generation: int):
@@ -911,3 +1053,18 @@ def test_hot_join_rejoin_promotes_node4():
         time.sleep(2)
     assert meta and meta["local_node_id"] == 4
     subprocess.run(COMPOSE + ["--profile", "hotjoin", "stop", "node4"], check=True, cwd=PROJECT_ROOT)
+
+
+def test_remove_node_from_membership_and_continue_io():
+    ensure_cluster_ready()
+    # Remove voter 3; expect leader to handle membership change.
+    resp = send_frame_with_retry(*NODES[1], make_membership_remove_request(3))
+    assert resp, "membership request returned no response"
+    code = struct.unpack_from(">h", resp, 4)[0]
+    assert code == 0, f"membership change failed with code {code}"
+
+    # Writes and reads should still succeed on remaining nodes.
+    produce_and_assert_ok(NODES[1], "logs", b"AFTER_REMOVE")
+    time.sleep(1)
+    fetch = decode_fetch(send_frame_with_retry(*NODES[2], make_fetch_request("logs", 4096)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0

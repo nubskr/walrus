@@ -12,6 +12,6 @@ pub enum InternalOp {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum InternalResp {
     Ok,
-    ReadResult(Vec<Vec<u8>>),
+    ReadResult { data: Vec<Vec<u8>>, high_watermark: u64 },
     Error(String),
 }
