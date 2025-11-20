@@ -45,45 +45,68 @@ impl NodeController {
             }
             InternalOp::JoinCluster { node_id, addr } => {
                 tracing::info!("Received JoinCluster request from node {} at {}", node_id, addr);
-                match addr.parse::<std::net::SocketAddr>() {
-                    Ok(socket_addr) => {
-                        match self.raft.add_learner(node_id, socket_addr).await {
-                            Ok(_) => {
-                                tracing::info!("Node {}: Added learner {}", self.node_id, node_id);
-                                // Spawn task to promote learner once caught up
-                                let raft_clone = self.raft.clone();
-                                let node_id_clone = node_id;
-                                tokio::spawn(async move {
-                                    // Poll until caught up
-                                    for _ in 0..20 {
-                                        // check every 500ms for 10s
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
-                                        match raft_clone.is_learner_caught_up(node_id_clone).await {
-                                            Ok(true) => {
-                                                tracing::info!("Node {} caught up, promoting...", node_id_clone);
-                                                if let Err(e) = raft_clone.promote_learner(node_id_clone).await {
-                                                    tracing::error!("Failed to promote node {}: {}", node_id_clone, e);
-                                                } else {
-                                                    tracing::info!("Node {}: Promoted learner {}", raft_clone.id(), node_id_clone);
-                                                }
-                                                return;
-                                            }
-                                            Ok(false) => {
-                                                tracing::debug!("Node {} not caught up yet", node_id_clone);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("Error checking learner status: {}", e);
-                                            }
-                                        }
-                                    }
-                                    tracing::warn!("Timeout waiting for node {} to catch up", node_id_clone);
-                                });
-                                InternalResp::Ok
+                let socket_addr = match addr.parse::<std::net::SocketAddr>() {
+                    Ok(socket_addr) => socket_addr,
+                    Err(parse_err) => {
+                        tracing::info!(
+                            "JoinCluster: resolving hostname {} due to parse error {}",
+                            addr,
+                            parse_err
+                        );
+                        match tokio::net::lookup_host(&addr).await {
+                            Ok(mut hosts) => match hosts.next() {
+                                Some(resolved) => resolved,
+                                None => {
+                                    return InternalResp::Error(format!(
+                                        "Could not resolve join addr {}",
+                                        addr
+                                    ))
+                                }
+                            },
+                            Err(e) => {
+                                return InternalResp::Error(format!(
+                                    "Failed to resolve addr {}: {}",
+                                    addr, e
+                                ))
                             }
-                            Err(e) => InternalResp::Error(format!("Failed to add learner: {}", e)),
                         }
                     }
-                    Err(e) => InternalResp::Error(format!("Invalid address: {}", e)),
+                };
+
+                match self.raft.add_learner(node_id, socket_addr).await {
+                    Ok(_) => {
+                        tracing::info!("Node {}: Added learner {}", self.node_id, node_id);
+                        // Spawn task to promote learner once caught up
+                        let raft_clone = self.raft.clone();
+                        let node_id_clone = node_id;
+                        tokio::spawn(async move {
+                            // Poll until caught up
+                            for _ in 0..20 {
+                                // check every 500ms for 10s
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                match raft_clone.is_learner_caught_up(node_id_clone).await {
+                                    Ok(true) => {
+                                        tracing::info!("Node {} caught up, promoting...", node_id_clone);
+                                        if let Err(e) = raft_clone.promote_learner(node_id_clone).await {
+                                            tracing::error!("Failed to promote node {}: {}", node_id_clone, e);
+                                        } else {
+                                            tracing::info!("Node {}: Promoted learner {}", raft_clone.id(), node_id_clone);
+                                        }
+                                        return;
+                                    }
+                                    Ok(false) => {
+                                        tracing::debug!("Node {} not caught up yet", node_id_clone);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Error checking learner status: {}", e);
+                                    }
+                                }
+                            }
+                            tracing::warn!("Timeout waiting for node {} to catch up", node_id_clone);
+                        });
+                        InternalResp::Ok
+                    }
+                    Err(e) => InternalResp::Error(format!("Failed to add learner: {}", e)),
                 }
             }
         }

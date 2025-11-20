@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
-use walrus_rust::{Entry, Walrus};
+use walrus_rust::{disable_fd_backend, Entry, Walrus};
 
 pub const DATA_NAMESPACE: &str = "data_plane";
 
@@ -39,6 +39,11 @@ impl BucketService {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir_all(&storage_path)?;
+
+        // io_uring is unavailable in many containerized environments; allow opting into mmap.
+        if std::env::var("WALRUS_DISABLE_IO_URING").is_ok() {
+            disable_fd_backend();
+        }
         std::env::set_var("WALRUS_DATA_DIR", &storage_path);
 
         let engine = Arc::new(Walrus::new_for_key(DATA_NAMESPACE)?);

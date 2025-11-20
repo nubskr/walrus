@@ -41,19 +41,30 @@ async fn main() -> anyhow::Result<()> {
     info!("Node {} booting", node_config.node_id);
 
     let data_path = node_config.data_wal_dir();
-    if data_path.exists() {
-        std::fs::remove_dir_all(&data_path)?;
-    }
     std::fs::create_dir_all(&data_path)?;
     let bucket = Arc::new(BucketService::new(data_path).await?);
 
     let metadata = Arc::new(MetadataStateMachine::new());
 
     let meta_path = node_config.meta_wal_dir();
-    if meta_path.exists() {
-        std::fs::remove_dir_all(&meta_path)?;
-    }
     std::fs::create_dir_all(&meta_path)?;
+
+    let advertise_host = node_config
+        .raft_advertise_host
+        .clone()
+        .unwrap_or_else(|| node_config.raft_host.clone());
+    let raft_bind_addr = format!("{}:{}", node_config.raft_host, node_config.raft_port);
+
+    let mut join_target_resolved: Option<std::net::SocketAddr> = None;
+    if let Some(join_target) = &node_config.join_addr {
+        join_target_resolved = match join_target.parse() {
+            Ok(addr) => Some(addr),
+            Err(_) => {
+                let mut resolved = tokio::net::lookup_host(join_target).await?;
+                resolved.next()
+            }
+        };
+    }
 
     let mut oct_peers = vec![];
     if node_config.node_id == 1 && node_config.join_addr.is_none() {
@@ -62,11 +73,13 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|s| s.parse())
             .collect::<Result<_, _>>()?;
+    } else if let Some(addr) = join_target_resolved {
+        oct_peers.push(addr);
     }
 
     let oct_cfg = OctopiiConfig {
         node_id: node_config.node_id,
-        bind_addr: format!("127.0.0.1:{}", node_config.raft_port).parse()?,
+        bind_addr: raft_bind_addr.parse()?,
         peers: oct_peers,
         wal_dir: meta_path,
         is_initial_leader: node_config.node_id == 1 && node_config.join_addr.is_none(),
@@ -127,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         info!("--- Create topic via Raft ---");
         let cmd = MetadataCmd::CreateTopic {
             name: "logs".into(),
-            partitions: 1,
+            partitions: 2,
             initial_leader: 1,
         };
         
@@ -184,13 +197,15 @@ async fn main() -> anyhow::Result<()> {
     // Join logic
     if let Some(join_target) = &node_config.join_addr {
         info!("Joining cluster via {}", join_target);
-        let my_addr = format!("127.0.0.1:{}", node_config.raft_port);
+        let my_addr = format!("{}:{}", advertise_host, node_config.raft_port);
         let op = InternalOp::JoinCluster {
             node_id: node_config.node_id,
             addr: my_addr,
         };
         let payload = bytes::Bytes::from(bincode::serialize(&op)?);
-        let target_sock: std::net::SocketAddr = join_target.parse()?;
+        let target_sock: std::net::SocketAddr = join_target_resolved.ok_or_else(|| {
+            anyhow::anyhow!("could not resolve join target {}", join_target)
+        })?;
 
         let rpc = raft.rpc_handler();
         let mut joined = false;

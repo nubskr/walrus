@@ -28,6 +28,14 @@ pub struct NodeConfig {
     #[arg(long = "raft-port", default_value = "6000")]
     pub raft_port: u16,
 
+    /// Host/interface to bind the Raft listener on (use 0.0.0.0 inside Docker).
+    #[arg(long = "raft-host", default_value = "127.0.0.1")]
+    pub raft_host: String,
+
+    /// Hostname/IP advertised to peers for Raft RPCs. Defaults to `raft_host`.
+    #[arg(long = "raft-advertise-host")]
+    pub raft_advertise_host: Option<String>,
+
     /// Optional file to write logs to. If not specified, logs go to stdout.
     #[arg(long = "log-file")]
     pub log_file: Option<PathBuf>,
