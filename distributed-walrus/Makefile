@@ -1,6 +1,8 @@
-PYTHON ?= python3
+PYTHON ?= $(VENV)/bin/python
 PYTEST ?= $(PYTHON) -m pytest
 PIP ?= $(PYTHON) -m pip
+UV ?= uv
+VENV ?= .venv
 PYFLAGS ?= -vv
 
 # Run each cluster test individually to keep runs isolated.
@@ -36,7 +38,15 @@ TESTS := \
 .PHONY: deps all-tests $(TESTS)
 
 deps:
-	@$(PIP) install -r tests/requirements.txt
+	@if command -v $(UV) >/dev/null 2>&1; then \
+		echo "Using uv to manage virtualenv..."; \
+		$(UV) venv $(VENV); \
+		$(UV) pip install --python $(PYTHON) -r tests/requirements.txt; \
+	else \
+		echo "uv not found; falling back to python -m venv"; \
+		python3 -m venv $(VENV); \
+		$(PIP) install -r tests/requirements.txt; \
+	fi
 
 all-tests: deps
 	@for t in $(TESTS); do \
