@@ -5,6 +5,7 @@ UV ?= uv
 UV_VENV_FLAGS ?= --if-exists reuse
 VENV ?= .venv
 PYFLAGS ?= -vv
+SKIP_BUILD ?= 1
 
 # Run each cluster test individually to keep runs isolated.
 TESTS := \
@@ -36,7 +37,7 @@ TESTS := \
 	test_hot_join_rejoin_promotes_node4 \
 	test_remove_node_from_membership_and_continue_io
 
-.PHONY: deps all-tests $(TESTS)
+.PHONY: deps all-tests all-tests-one-by-one $(TESTS)
 
 deps: $(VENV)/.deps-installed
 
@@ -53,10 +54,14 @@ $(VENV)/.deps-installed:
 	@touch $(VENV)/.deps-installed
 
 all-tests: deps
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py $(PYFLAGS)
+
+# Original behaviour: run each test separately (slower; many container restarts).
+all-tests-one-by-one: deps
 	@for t in $(TESTS); do \
 		echo "Running $$t"; \
 		$(MAKE) $$t || exit $$?; \
 	done
 
 $(TESTS): deps
-	@$(PYTEST) tests/test_cluster.py::$@ $(PYFLAGS)
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py::$@ $(PYFLAGS)
