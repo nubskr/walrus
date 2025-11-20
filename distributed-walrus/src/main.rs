@@ -48,6 +48,10 @@ async fn main() -> anyhow::Result<()> {
 
     let meta_path = node_config.meta_wal_dir();
     std::fs::create_dir_all(&meta_path)?;
+    let has_existing_meta = std::fs::read_dir(&meta_path)
+        .ok()
+        .and_then(|mut it| it.next())
+        .is_some();
 
     let advertise_host = node_config
         .raft_advertise_host
@@ -82,7 +86,9 @@ async fn main() -> anyhow::Result<()> {
         bind_addr: raft_bind_addr.parse()?,
         peers: oct_peers,
         wal_dir: meta_path,
-        is_initial_leader: node_config.node_id == 1 && node_config.join_addr.is_none(),
+        is_initial_leader: node_config.node_id == 1
+            && node_config.join_addr.is_none()
+            && !has_existing_meta,
         ..Default::default()
     };
 
@@ -133,64 +139,71 @@ async fn main() -> anyhow::Result<()> {
     raft.start().await?;
 
     if node_config.node_id == 1 {
-        info!("Node 1: Campaigning for leadership");
+        info!(
+            "Node 1: Campaigning for leadership (fresh_meta={})",
+            !has_existing_meta
+        );
         raft.campaign().await?;
         tokio::time::sleep(Duration::from_secs(20)).await;
 
-        info!("--- Create topic via Raft ---");
-        let cmd = MetadataCmd::CreateTopic {
-            name: "logs".into(),
-            partitions: 2,
-            initial_leader: 1,
-        };
-        
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match raft.propose(bincode::serialize(&cmd)?).await {
-                Ok(res) => {
-                    info!("CreateTopic result: {:?}", String::from_utf8_lossy(&res));
-                    break;
-                }
-                Err(e) => {
-                    error!("CreateTopic failed (attempt {}): {}. Retrying in 2s...", attempts, e);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        }
-
-        // Always rollover to self (1) initially since we don't know if peers joined yet
-        let next_leader = 1; 
-        info!("--- Rollover partition to Node {} ---", next_leader);
-        let roll = MetadataCmd::RolloverPartition {
-            name: "logs".into(),
-            partition: 0,
-            new_leader: next_leader,
-        };
-        
-        loop {
-            match raft.propose(bincode::serialize(&roll)?).await {
-                Ok(_) => break,
-                Err(e) => {
-                    error!("Rollover failed: {}. Retrying...", e);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+        if !has_existing_meta {
+            info!("--- Create topic via Raft ---");
+            let cmd = MetadataCmd::CreateTopic {
+                name: "logs".into(),
+                partitions: 2,
+                initial_leader: 1,
+            };
+            
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match raft.propose(bincode::serialize(&cmd)?).await {
+                    Ok(res) => {
+                        info!("CreateTopic result: {:?}", String::from_utf8_lossy(&res));
+                        break;
+                    }
+                    Err(e) => {
+                        error!("CreateTopic failed (attempt {}): {}. Retrying in 2s...", attempts, e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
                 }
             }
-        }
 
-        // Allow time for state machine and sync leases
-        tokio::time::sleep(Duration::from_secs(1)).await;
+            // Always rollover to self (1) initially since we don't know if peers joined yet
+            let next_leader = 1; 
+            info!("--- Rollover partition to Node {} ---", next_leader);
+            let roll = MetadataCmd::RolloverPartition {
+                name: "logs".into(),
+                partition: 0,
+                new_leader: next_leader,
+            };
+            
+            loop {
+                match raft.propose(bincode::serialize(&roll)?).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        error!("Rollover failed: {}. Retrying...", e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
 
-        controller.sync_leases_now().await;
-        controller
-            .route_and_append("logs", 0, b"payload-from-node1".to_vec())
-            .await?;
-        info!("Append routed through controller");
+            // Allow time for state machine and sync leases
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let reads = controller.route_and_read("logs", 0, 1024).await?;
-        info!("Read {} entries", reads.len());
-        for (i, data) in reads.iter().enumerate() {
-            info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
+            controller.sync_leases_now().await;
+            controller
+                .route_and_append("logs", 0, b"payload-from-node1".to_vec())
+                .await?;
+            info!("Append routed through controller");
+
+            let reads = controller.route_and_read("logs", 0, 1024).await?;
+            info!("Read {} entries", reads.len());
+            for (i, data) in reads.iter().enumerate() {
+                info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
+            }
+        } else {
+            info!("Existing metadata detected; skipping topic bootstrap");
         }
     }
 
@@ -209,8 +222,8 @@ async fn main() -> anyhow::Result<()> {
 
         let rpc = raft.rpc_handler();
         let mut joined = false;
-        for i in 0..5 {
-            info!("Join attempt {}/5...", i + 1);
+        for i in 0..10 {
+            info!("Join attempt {}/10...", i + 1);
             match rpc
                 .request(
                     target_sock,
@@ -218,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
                         operation: "Forward".into(),
                         data: payload.clone(),
                     },
-                    Duration::from_secs(2),
+                    Duration::from_secs(5),
                 )
                 .await
             {

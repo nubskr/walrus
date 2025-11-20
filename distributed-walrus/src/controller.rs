@@ -152,7 +152,7 @@ impl NodeController {
                         operation: "Forward".into(),
                         data: payload,
                     },
-                    Duration::from_secs(2),
+                    Duration::from_secs(5),
                 )
                 .await?;
             match resp.payload {
@@ -219,7 +219,7 @@ impl NodeController {
                         operation: "Forward".into(),
                         data: payload,
                     },
-                    Duration::from_secs(2),
+                    Duration::from_secs(5),
                 )
                 .await?;
             match resp.payload {
