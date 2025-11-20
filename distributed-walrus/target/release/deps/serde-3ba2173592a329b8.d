@@ -1,0 +1,14 @@
+/Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/deps/serde-3ba2173592a329b8.d: /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/build/serde-1448fa9d73730883/out/private.rs
+
+/Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/deps/libserde-3ba2173592a329b8.rlib: /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/build/serde-1448fa9d73730883/out/private.rs
+
+/Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/deps/libserde-3ba2173592a329b8.rmeta: /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/build/serde-1448fa9d73730883/out/private.rs
+
+/Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/daksh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/build/serde-1448fa9d73730883/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/daksh/pxrs/megatron/walrus/distributed-walrus/target/release/build/serde-1448fa9d73730883/out

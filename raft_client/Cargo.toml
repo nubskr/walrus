@@ -1,0 +1,13 @@
+[package]
+name = "raft_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+octopii = { path = "../octopii", features = ["openraft"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tempfile = "3.23.0"
+openraft = { path = "../octopii/openraft/openraft" }
