@@ -1,2 +1,0 @@
-cargo:rustc-cfg=has_std_error
-cargo:rustc-check-cfg=cfg(has_std_error)
