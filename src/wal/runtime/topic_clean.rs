@@ -61,10 +61,7 @@ impl CleanMarkerStore {
             .unwrap_or_default()
     }
 
-    pub fn persist_updates(
-        &self,
-        updates: &[(String, CleanMarkerRecord)],
-    ) -> std::io::Result<()> {
+    pub fn persist_updates(&self, updates: &[(String, CleanMarkerRecord)]) -> std::io::Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -78,10 +75,7 @@ impl CleanMarkerStore {
         Self::persist_map(&self.path, &guard)
     }
 
-    fn persist_map(
-        path: &str,
-        map: &HashMap<String, CleanMarkerRecord>,
-    ) -> std::io::Result<()> {
+    fn persist_map(path: &str, map: &HashMap<String, CleanMarkerRecord>) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", path);
         let bytes = rkyv::to_bytes::<_, 256>(map).map_err(|e| {
             std::io::Error::new(

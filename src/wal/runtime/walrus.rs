@@ -9,11 +9,11 @@ use std::fs;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
-use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::WalIndex;
 use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
 use super::background::start_background_workers;
 use super::reader::Reader;
+use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::writer::Writer;
 use rkyv::Deserialize;
 
@@ -96,7 +96,7 @@ impl Walrus {
             read_consistency: mode,
             fsync_schedule,
             paths,
-             topic_clean_tracker,
+            topic_clean_tracker,
         };
         instance.startup_chore()?;
         Ok(instance)
