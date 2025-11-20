@@ -1,0 +1,47 @@
+[package]
+name = "raft-kv-rocksdb"
+version = "0.1.0"
+readme = "README.md"
+
+edition = "2021"
+authors = [
+  "drdr xp <drdr.xp@gmail.com>",
+  "Pedro Paulo de Amorim <pepa.amorim@gmail.com>",
+  "The Tremor Team",
+]
+categories = ["algorithms", "asynchronous", "data-structures"]
+description = "An example distributed key-value store built upon `openraft`."
+homepage = "https://github.com/databendlabs/openraft"
+keywords = ["raft", "consensus"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/databendlabs/openraft"
+
+[[bin]]
+name = "raft-key-value-rocks"
+path = "src/bin/main.rs"
+
+[dependencies]
+client-http         = { path = "../client-http" }
+network-v1-http     = { path = "../network-v1-http" }
+openraft            = { path = "../../openraft", features = ["serde", "type-alias"] }
+openraft-rocksstore = { path = "../rocksstore" }
+
+actix-web          = { version = "4.0.0-rc.2" }
+clap               = { version = "4.1.11", features = ["derive", "env"] }
+futures            = { version = "0.3" }
+rocksdb            = { version = "0.22.0" }
+serde              = { version = "1.0.114", features = ["derive"] }
+serde_json         = { version = "1.0.57" }
+tokio              = { version = "1.35.1", features = ["full"] }
+tracing            = { version = "0.1.40" }
+tracing-subscriber = { version = "0.3.0", features = ["env-filter"] }
+
+[dev-dependencies]
+maplit = { version = "1.0.2" }
+tempfile = { version = "3.4.0" }
+
+
+[features]
+
+[package.metadata.docs.rs]
+all-features = true

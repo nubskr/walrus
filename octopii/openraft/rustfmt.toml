@@ -1,0 +1,42 @@
+# unstable_features = true
+# edition           = "2018"
+
+# fn_args_layout       = "Compressed"
+# use_small_heuristics = "Default"
+# use_try_shorthand    = true
+
+# # pre-unstable
+
+# single_line_if_else_max_width = 75
+# space_around_attr_eq          = false
+# struct_lit_width              = 50
+
+# # unstable
+
+# condense_wildcard_suffixes  = true
+# format_code_in_doc_comments = true
+# format_strings              = true
+# match_block_trailing_comma  = false
+# normalize_comments          = true
+# normalize_doc_attributes    = true
+# reorder_impl_items          = true
+# struct_lit_single_line      = true
+# use_field_init_shorthand    = true
+
+
+reorder_imports         = true
+imports_granularity     = "Item"
+group_imports           = "StdExternalCrate"
+where_single_line       = true
+trailing_comma          = "Vertical"
+overflow_delimited_expr = true
+wrap_comments           = true
+comment_width           = 100
+max_width               = 120
+inline_attribute_width  = 0
+
+merge_derives           = false
+
+# pre-unstable
+
+chain_width             = 100

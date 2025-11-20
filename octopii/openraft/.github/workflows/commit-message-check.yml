@@ -1,0 +1,58 @@
+name: 'commit-message-check'
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+  push:
+    branches:
+
+jobs:
+  check-commit-message:
+    name: check-subject
+    runs-on: ubuntu-latest
+    steps:
+      - name: check-subject-type
+        uses: gsactions/commit-message-checker@v1
+        with:
+          checkAllCommitMessages: 'true' # optional: this checks all commits associated with a pull request
+          excludeDescription: 'true' # optional: this excludes the description body of a pull request
+          excludeTitle: 'true' # optional: this excludes the title of a pull request
+          accessToken: ${{ secrets.GITHUB_TOKEN }}
+          pattern: '^(DataChange:|Change:|change:|Feature:|Improve:|improve:|Perf:|Dep:|Doc:|Test:|CI:|Refactor:|Fix:|Fixdoc:|Fixup:|Merge|BumpVer:|Chore:|fix:|feat:|perf:|refactor:|test:|docs:|deps:|chore:|ci:|Build\(deps\):) .+$'
+          flags: 'gm'
+          error: |
+            Subject line has to contain a commit type, e.g.: "Change: blabla" or a merge commit e.g.: "Merge xxx".
+            Valid types are:
+              DataChange    - Persistent data change
+              Change        - API breaking change
+              change        - API breaking change
+              Feature       - API compatible new feature
+              feat          - API compatible new feature
+              Improve       - Become better without functional changes
+              improve       - Become better without functional changes
+              Perf          - Performance improvement
+              perf          - Performance improvement
+              Dep           - dependency update
+              deps          - dependency update
+              Doc           - doc update
+              docs          - doc update
+              Test          - test udpate
+              test          - test udpate
+              CI            - CI workflow update
+              ci            - CI workflow update
+              Refactor      - refactor without function change.
+              refactor      - refactor without function change.
+              Fix           - fix bug
+              fix           - fix bug
+              Fixdoc        - fix doc
+              Fixup         - minor change: e.g., fix sth mentioned in a review.
+              BumpVer       - Bump to a new version.
+              Chore         - Nothing important.
+              chore         - Nothing important.
+              Build(deps)   - bot: dependabot.
+
+
+
