@@ -1,0 +1,244 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --lib --no-fail-fast
+
+  transport-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test transport_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* || true
+
+  rpc-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test rpc_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* || true
+
+  chunk-transfer-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chunk_transfer_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/chunk_test_* /tmp/octopii_test_* || true
+
+  chunk-error-handling-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chunk_error_handling_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/chunk_test_* /tmp/octopii_test_* || true
+
+  chunk-large-transfer-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chunk_large_transfer_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/chunk_test_* /tmp/octopii_test_* || true
+
+  chunk-mixed-scenarios-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chunk_mixed_scenarios_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/chunk_test_* /tmp/octopii_test_* || true
+
+  chunk-parallel-stress-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chunk_parallel_stress_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/chunk_test_* /tmp/octopii_test_* || true
+
+  integration-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test integration_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* || true
+
+  raft-cluster-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test raft_cluster_test --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  chaos-tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test chaos_tests --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  openraft-cluster-integration:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test openraft_cluster_integration --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  openraft-comprehensive-tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test openraft_comprehensive_tests --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  openraft-example-tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test openraft_example_tests --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  peer-sync-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test peer_sync_test --release -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  read-index-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test read_index_test --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  shipping-lane-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test shipping_lane_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* || true
+
+  simple-smoke-tests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test simple_smoke_tests --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  state-machine-persistence-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test state_machine_persistence_test --no-fail-fast -- --test-threads=1
+      - if: always()
+        run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
+
+  wal-persistence-test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      - run: cargo test --test wal_persistence_test --no-fail-fast
+      - if: always()
+        run: rm -rf /tmp/test_walrus_* /tmp/walrus_* || true
