@@ -1,5 +1,6 @@
 PYTHON ?= python3
 PYTEST ?= $(PYTHON) -m pytest
+PIP ?= $(PYTHON) -m pip
 PYFLAGS ?= -vv
 
 # Run each cluster test individually to keep runs isolated.
@@ -32,13 +33,16 @@ TESTS := \
 	test_hot_join_rejoin_promotes_node4 \
 	test_remove_node_from_membership_and_continue_io
 
-.PHONY: all-tests $(TESTS)
+.PHONY: deps all-tests $(TESTS)
 
-all-tests:
+deps:
+	@$(PIP) install -r tests/requirements.txt
+
+all-tests: deps
 	@for t in $(TESTS); do \
 		echo "Running $$t"; \
 		$(MAKE) $$t || exit $$?; \
 	done
 
-$(TESTS):
+$(TESTS): deps
 	@$(PYTEST) tests/test_cluster.py::$@ $(PYFLAGS)
