@@ -96,6 +96,15 @@ def wait_for_specific_ports(targets: dict[int, tuple[str, int]], timeout: int = 
     pytest.fail(f"Ports never became reachable for {list(targets.keys())}")
 
 
+def wait_until(predicate, timeout=10.0, interval=0.2, msg="Timeout waiting for condition"):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(interval)
+    pytest.fail(msg)
+
+
 def tcp_ready(host: str, port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(1.0)
@@ -459,7 +468,7 @@ def metadata_ready_for_node(node_id: int, host: str, port: int) -> bool:
         return False
     for topic in meta["topics"]:
         for part in topic["partitions"]:
-            if topic["name"] == "logs" and part["leader"] == 1:
+            if topic["name"] == "logs" and part["leader"] > 0:
                 return True
     return False
 
@@ -586,7 +595,7 @@ def test_write_forwarding():
     codes = parse_produce_error_codes(resp)
     assert all(code == 0 for code in codes), f"Produce returned errors: {codes}"
 
-    time.sleep(2)
+    wait_until(lambda: set(snapshot_data_plane_mtimes()[1].items()) - set(before[1].items()), msg="Leader storage did not update")
 
     after = snapshot_data_plane_mtimes()
     leader_changes = set(after[1].items()) - set(before[1].items())
@@ -617,7 +626,8 @@ def test_followers_forward_produce_to_leader():
         codes = parse_produce_error_codes(resp)
         assert all(code == 0 for code in codes), f"Produce via follower {follower} returned errors: {codes}"
 
-        time.sleep(2)
+        wait_until(lambda: set(snapshot_data_plane_mtimes()[1].items()) - set(before[1].items()), msg=f"Leader storage did not update for follower {follower}")
+
         after = snapshot_data_plane_mtimes()
         leader_changed = set(after[1].items()) - set(before[1].items())
         assert leader_changed, f"Leader storage did not change after follower {follower} forwarded produce"
@@ -685,7 +695,14 @@ def test_fetch_from_follower_reads_latest_entry():
     payload = b"READ_FORWARD_ME"
     resp = send_frame_with_retry(*NODES[1], make_produce_request("logs", payload))
     assert resp and all(code == 0 for code in parse_produce_error_codes(resp)), "produce failed"
-    time.sleep(2)
+
+    def check_fetch():
+        fetch_resp = send_frame(*NODES[3], make_fetch_request("logs", 4096))
+        if not fetch_resp: return False
+        items = decode_fetch(fetch_resp)
+        return items and all(item["error_code"] == 0 for item in items)
+
+    wait_until(check_fetch)
 
     fetch_resp = send_frame_with_retry(*NODES[3], make_fetch_request("logs", 4096))
     items = decode_fetch(fetch_resp or b"")
@@ -696,20 +713,24 @@ def test_fetch_from_follower_reads_latest_entry():
 
 
 def test_fetch_payload_and_offsets_from_leader():
-    resp1 = send_frame_with_retry(*NODES[1], make_produce_request("logs", b"FIRST"))
-    resp2 = send_frame_with_retry(*NODES[1], make_produce_request("logs", b"SECOND"))
+    topic = "offsets_topic"
+    send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)]))
+
+    resp1 = send_frame_with_retry(*NODES[1], make_produce_request(topic, b"FIRST"))
+    resp2 = send_frame_with_retry(*NODES[1], make_produce_request(topic, b"SECOND"))
     assert resp1 and resp2
     assert all(code == 0 for code in parse_produce_error_codes(resp1 + resp2))
-    time.sleep(1)
 
-    fetch0 = send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096, partition=0))
+    wait_until(lambda: decode_fetch(send_frame(*NODES[1], make_fetch_request(topic, 4096, partition=0)) or b""))
+
+    fetch0 = send_frame_with_retry(*NODES[1], make_fetch_request(topic, 4096, partition=0))
     items0 = decode_fetch(fetch0 or b"")
     assert items0 and items0[0]["error_code"] == 0
     assert items0[0]["payload"].startswith(b"FIRST") or items0[0]["payload"] == b""
 
     # Offset 1 should return the second payload
     header = struct.pack(">hhih", 1, 0, 100, 4) + b"test"
-    body = struct.pack(">iii", -1, 0, 0) + struct.pack(">i", 1) + kafka_string("logs")
+    body = struct.pack(">iii", -1, 0, 0) + struct.pack(">i", 1) + kafka_string(topic)
     body += struct.pack(">i", 1) + struct.pack(">i", 0) + struct.pack(">q", 1) + struct.pack(">i", 4096)
     fetch1 = send_frame_with_retry(*NODES[1], struct.pack(">i", len(header + body)) + header + body)
     items1 = decode_fetch(fetch1 or b"")
@@ -726,7 +747,13 @@ def test_create_topic_and_roundtrip_partition_zero():
     data = b"NEWTOPIC"
     prod = send_frame_with_retry(*NODES[1], make_produce_request("topic_x", data, partition=0))
     assert prod and all(code == 0 for code in parse_produce_error_codes(prod))
-    time.sleep(1)
+
+    def check_fetch():
+        f = decode_fetch(send_frame(*NODES[1], make_fetch_request("topic_x", 4096)) or b"")
+        return f and f[0]["error_code"] == 0 and f[0]["payload"] in (data, b"")
+
+    wait_until(check_fetch)
+
     fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("topic_x", 4096)) or b"")
     assert fetch and fetch[0]["error_code"] == 0
     assert fetch[0]["payload"] in (data, b"")
@@ -738,7 +765,8 @@ def test_fetch_offset_strictness_with_high_watermark():
     payloads = [b"S1", b"S2", b"S3"]
     for pay in payloads:
         produce_and_assert_ok(NODES[1], "strict_topic", pay, partition=0)
-    time.sleep(1)
+
+    wait_until(lambda: decode_fetch(send_frame(*NODES[1], make_fetch_with_offset("strict_topic", 0, 0)) or b""))
 
     fetch0 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 0)) or b"")
     assert fetch0 and fetch0[0]["error_code"] == 0
@@ -775,7 +803,13 @@ def test_partition_one_produce_and_fetch():
     payload = b"PARTITION_ONE_PAYLOAD"
     resp = send_frame_with_retry(*NODES[1], make_produce_request("logs", payload, partition=1))
     assert resp and all(code == 0 for code in parse_produce_error_codes(resp))
-    time.sleep(1)
+
+    def check_fetch():
+        f = decode_fetch(send_frame(*NODES[1], make_fetch_request("logs", 4096, partition=1)) or b"")
+        return f and f[0]["error_code"] == 0 and f[0]["payload"] in (payload, b"")
+
+    wait_until(check_fetch)
+
     fetch_resp = send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096, partition=1))
     items = decode_fetch(fetch_resp or b"")
     assert items and items[0]["error_code"] == 0
@@ -815,18 +849,20 @@ def test_monitor_rollover_and_gc_removes_old_generation():
     assert resp and all(code == 0 for code in parse_produce_error_codes(resp)), "produce failed"
 
     # Wait for monitor loop (configured to 1s) to detect oversize and roll over.
-    time.sleep(6)
-    state_resp = send_frame_with_retry(*NODES[1], make_internal_state_request(["logs"]))
-    state = decode_internal_state(state_resp or b"")
-    assert state, "failed to decode internal state response"
-    generations = [
-        part["generation"]
-        for topic in state["topics"]
-        if topic["name"] == "logs"
-        for part in topic["partitions"]
-    ]
-    assert generations, "no generations reported for logs"
-    assert max(generations) > 1, f"expected rollover to advance generation, got {generations}"
+    def check_rollover():
+        state_resp = send_frame(*NODES[1], make_internal_state_request(["logs"]))
+        if not state_resp: return False
+        state = decode_internal_state(state_resp)
+        if not state: return False
+        generations = [
+            part["generation"]
+            for topic in state["topics"]
+            if topic["name"] == "logs"
+            for part in topic["partitions"]
+        ]
+        return generations and max(generations) > 1
+
+    wait_until(check_rollover, timeout=10.0, msg="Rollover did not occur")
 
 
 def test_internal_state_reports_leader_and_generation():
@@ -867,7 +903,9 @@ def test_fetch_respects_offsets_and_payloads_from_leader():
     payloads = [b"OFFSET_A", b"OFFSET_B", b"OFFSET_C"]
     for pay in payloads:
         produce_and_assert_ok(NODES[1], "logs", pay, partition=1)
-    time.sleep(2)
+    
+    wait_until(lambda: set(snapshot_data_plane_mtimes()[1].items()) - set(before[1].items()), msg="Leader storage did not update")
+
     after = snapshot_data_plane_mtimes()
     assert set(after[1].items()) - set(before[1].items()), "leader storage did not change for partition 1 writes"
 
@@ -917,7 +955,9 @@ def test_leader_failover_timeout_then_recovery():
         *NODES[1], make_produce_request("logs", b"FAILOVER_RECOVER"), attempts=15, delay=2
     )
     assert resp, "leader did not respond after recovery"
-    time.sleep(2)
+
+    wait_until(lambda: decode_fetch(send_frame(*NODES[1], make_fetch_request("logs", 4096)) or b""))
+
     fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096)) or b"")
     assert fetch and fetch[0]["error_code"] == 0, "fetch after leader recovery failed"
     after = snapshot_data_plane_mtimes()
@@ -996,13 +1036,13 @@ def test_follower_restart_catches_up_and_reads():
 
 def force_rollover_to_generation(target_generation: int):
     """Write large payloads until the reported generation reaches target_generation."""
-    for _ in range(20):
+    for _ in range(40):
         ensure_cluster_ready()
         gens = list_generations(1)
         if gens and max(gens) >= target_generation:
             return
         produce_and_assert_ok(NODES[1], "logs", b"R" * 70000)
-        time.sleep(8)
+        time.sleep(1.2)
     pytest.fail(f"did not reach generation {target_generation}")
 
 
@@ -1012,7 +1052,7 @@ def test_retention_gc_prunes_old_generations():
     start_mtime = wal_file_mtime_ns(1)
 
     force_rollover_to_generation(2)
-    time.sleep(3)
+    wait_until(lambda: wal_file_count(1) <= start_count, timeout=10.0)
     gens = list_generations(1)
     assert gens, "no generations found after rollover"
     assert gens[-1] >= 2
@@ -1020,7 +1060,7 @@ def test_retention_gc_prunes_old_generations():
     assert wal_file_mtime_ns(1) >= start_mtime, "wal file mtime did not advance after rollover"
 
     force_rollover_to_generation(3)
-    time.sleep(3)
+    wait_until(lambda: wal_file_count(1) <= start_count, timeout=10.0)
     gens = list_generations(1)
     assert gens and gens[-1] >= 3
     assert wal_file_count(1) == start_count or wal_file_count(1) == 1
@@ -1065,6 +1105,12 @@ def test_remove_node_from_membership_and_continue_io():
 
     # Writes and reads should still succeed on remaining nodes.
     produce_and_assert_ok(NODES[1], "logs", b"AFTER_REMOVE")
-    time.sleep(1)
+    
+    def check_fetch_remove():
+        f = decode_fetch(send_frame(*NODES[2], make_fetch_request("logs", 4096)) or b"")
+        return f and f[0]["error_code"] == 0
+
+    wait_until(check_fetch_remove)
+
     fetch = decode_fetch(send_frame_with_retry(*NODES[2], make_fetch_request("logs", 4096)) or b"")
     assert fetch and fetch[0]["error_code"] == 0
