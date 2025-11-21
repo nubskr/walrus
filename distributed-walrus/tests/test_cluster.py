@@ -1269,6 +1269,7 @@ def test_fetch_offset_strictness_with_high_watermark():
     ensure_cluster_ready()
     send_frame_with_retry(*NODES[1], make_create_topics_request([("strict_topic", 1)]))
     payloads = [b"S1", b"S2", b"S3"]
+    total_bytes = sum(len(p) for p in payloads)
     for pay in payloads:
         produce_and_assert_ok(NODES[1], "strict_topic", pay, partition=0)
 
@@ -1276,17 +1277,19 @@ def test_fetch_offset_strictness_with_high_watermark():
 
     fetch0 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 0)) or b"")
     assert fetch0 and fetch0[0]["error_code"] == 0
-    assert fetch0[0]["high_watermark"] >= len(payloads)
+    assert fetch0[0]["high_watermark"] >= total_bytes
     # Payload may still be empty depending on WAL semantics, but offset 0 must be accepted.
 
     fetch2 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 2)) or b"")
     assert fetch2 and fetch2[0]["error_code"] == 0
-    assert fetch2[0]["high_watermark"] >= len(payloads)
+    assert fetch2[0]["high_watermark"] >= total_bytes
 
     # Offset beyond available should return an error.
-    fetch4 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, 4)) or b"")
+    fetch4 = decode_fetch(
+        send_frame_with_retry(*NODES[1], make_fetch_with_offset("strict_topic", 0, total_bytes + 1)) or b""
+    )
     assert fetch4 and fetch4[0]["error_code"] != 0
-    assert fetch4[0]["high_watermark"] >= len(payloads)
+    assert fetch4[0]["high_watermark"] >= total_bytes
 
 
 def test_fetch_with_too_small_max_bytes_returns_empty_payload():
@@ -2255,7 +2258,7 @@ def test_historical_fetch_reads_from_sealed_generation():
 
 def test_read_entire_multi_rollover_history():
     """
-    Write ~3GB to a topic (enough to trigger many rollovers with tiny segment threshold; override with WALRUS_HISTORY_STRESS_TARGET_MB),
+    Write a large backlog to a topic (multiple rollovers with tiny segment threshold; override with WALRUS_HISTORY_STRESS_TARGET_MB),
     then sequentially fetch from offset 0 to the high watermark to ensure all bytes are readable.
     """
     ensure_cluster_ready(timeout=180)
@@ -2273,7 +2276,7 @@ def test_read_entire_multi_rollover_history():
     wait_for_topics([topic], timeout=60)
     send_test_control(2)  # sync leases for the new topic
 
-    target_mb = int(os.getenv("WALRUS_HISTORY_STRESS_TARGET_MB", "3072"))
+    target_mb = int(os.getenv("WALRUS_HISTORY_STRESS_TARGET_MB", "128"))
     target_bytes = target_mb * 1024 * 1024
     chunk_size = min(8 * 1024 * 1024, target_bytes)  # shrink automatically for smaller targets
 
@@ -2327,7 +2330,7 @@ def test_read_entire_multi_rollover_history():
 
 def test_produce_large_payloads_up_to_cap():
     """
-    Produce increasingly large payloads (1MB doubling up to WALRUS_LARGE_PAYLOAD_MAX_MB, capped at 900MB)
+    Produce increasingly large payloads (1MB doubling up to WALRUS_LARGE_PAYLOAD_MAX_MB, capped at 900MB; default smaller for test speed)
     and ensure the cluster accepts and serves them.
     """
     ensure_cluster_ready(timeout=180)
@@ -2339,7 +2342,7 @@ def test_produce_large_payloads_up_to_cap():
     wait_for_topics([topic], timeout=60)
     send_test_control(2)  # sync leases for the new topic
 
-    max_mb = min(int(os.getenv("WALRUS_LARGE_PAYLOAD_MAX_MB", "900")), 900)
+    max_mb = min(int(os.getenv("WALRUS_LARGE_PAYLOAD_MAX_MB", "128")), 900)
     sizes_mb = []
     size = 1
     while size <= max_mb:
