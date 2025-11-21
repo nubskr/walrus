@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 name: "logs".into(),
                 partition: 0,
                 new_leader: next_leader,
+                sealed_segment_size_bytes: 0,
             };
 
             loop {
@@ -201,7 +202,8 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             info!("Append routed through controller");
 
-            let (reads, high_watermark) = controller.route_and_read("logs", 0, 1024).await?;
+            let (reads, high_watermark) =
+                controller.route_and_read("logs", 0, 0, 1024).await?;
             info!("Read {} entries (hw={})", reads.len(), high_watermark);
             for (i, data) in reads.iter().enumerate() {
                 info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));

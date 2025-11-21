@@ -283,29 +283,30 @@ async fn encode_fetch_response(
             let partition = i32::decode(buf)?;
             let fetch_offset = i64::decode(buf)?;
             let max_bytes = i32::decode(buf)?;
+            let err_tuple = (partition, 1i16, 0i64, Vec::new());
+            if fetch_offset < 0 {
+                parts.push(err_tuple);
+                continue;
+            }
             let read_res = controller
-                .route_and_read(&topic, partition as u32, max_bytes as usize)
+                .route_and_read(&topic, partition as u32, fetch_offset as u64, max_bytes as usize)
                 .await;
             match read_res {
                 Ok((data, observed_high_watermark)) => {
-                    let start = fetch_offset.max(0) as usize;
                     let high_watermark = observed_high_watermark as i64;
-                    let total_available = observed_high_watermark as usize;
-                    if total_available > 0 && start >= total_available {
-                        parts.push((partition, 1i16, high_watermark, Vec::new()));
-                    } else if start < data.len() {
-                        let payload = data[start].clone();
-                        parts.push((partition, 0i16, high_watermark, payload));
-                    } else if data.is_empty() {
-                        parts.push((partition, 0i16, high_watermark, Vec::new()));
+                    let payload = data.into_iter().next().unwrap_or_default();
+                    let error_code = if payload.is_empty()
+                        && fetch_offset as u64 >= observed_high_watermark
+                    {
+                        1i16
                     } else {
-                        // Offset beyond available entries: surface error; keep high watermark visible.
-                        parts.push((partition, 1i16, high_watermark, Vec::new()));
-                    }
+                        0i16
+                    };
+                    parts.push((partition, error_code, high_watermark, payload));
                 }
                 Err(e) => {
                     error!("Fetch failure for {}-{}: {}", topic, partition, e);
-                    parts.push((partition, 1i16, 0i64, Vec::new()));
+                    parts.push(err_tuple);
                 }
             }
         }

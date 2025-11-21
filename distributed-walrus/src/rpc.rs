@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum InternalOp {
     ForwardAppend { wal_key: String, data: Vec<u8> },
-    ForwardRead { wal_key: String, max_bytes: usize },
+    ForwardRead {
+        wal_key: String,
+        start_offset: u64,
+        max_bytes: usize,
+    },
     JoinCluster { node_id: u64, addr: String },
     TestControl(TestControl),
 }

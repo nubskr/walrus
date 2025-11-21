@@ -13,7 +13,7 @@ use crate::metadata::MetadataCmd;
 
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1_000_000_000;
-const DEFAULT_RETENTION_GENERATIONS: u64 = 10;
+const DEFAULT_RETENTION_BYTES: u64 = 1_000_000_000;
 
 pub struct Monitor {
     controller: Arc<NodeController>,
@@ -48,43 +48,46 @@ impl Monitor {
     }
 
     async fn check_rollovers(&self) -> Result<()> {
-        let root = self.wal_root();
-        let size = if self
+        if self
             .controller
             .test_fail_dir_size
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            error!("dir_size forced failure for {:?}", root);
-            return Ok(());
-        } else {
-            match dir_size(&root).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("dir_size failed for {:?}: {}", root, e);
-                    return Ok(());
-                }
-            }
-        };
-        if size <= max_segment_size() {
+            error!("dir_size forced failure");
             return Ok(());
         }
 
+        let root = self.wal_root();
         let assignments = self
             .controller
             .metadata
             .assignments_for_node(self.controller.node_id);
-        for (topic, partition, _) in assignments {
+
+        for (topic, partition, generation) in assignments {
+            let wal = wal_key(&topic, partition, generation);
+            let path = walrus_path_for_key(&root, &wal);
+            let size = match dir_size(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("dir_size failed for {:?}: {}", path, e);
+                    continue;
+                }
+            };
+            if size <= max_segment_size() {
+                continue;
+            }
+
             info!(
-                "Namespace size {} exceeds limit {}, proposing rollover for {}-{}",
+                "Segment {} size {} exceeds limit {}, proposing rollover",
+                wal,
                 size,
                 max_segment_size(),
-                topic,
-                partition
             );
             let cmd = MetadataCmd::RolloverPartition {
                 name: topic.clone(),
                 partition,
                 new_leader: self.controller.node_id,
+                sealed_segment_size_bytes: size,
             };
             let payload = bincode::serialize(&cmd)?;
             self.controller.raft.propose(payload).await?;
@@ -106,17 +109,39 @@ impl Monitor {
 
         for (topic, info) in state.topics {
             for (partition, part_state) in info.partition_states {
-                if part_state.current_generation <= retention_generations() {
+                let high_watermark = self
+                    .controller
+                    .partition_high_watermark(&topic, partition)
+                    .await;
+                if high_watermark == 0 {
                     continue;
                 }
-                let cutoff = part_state.current_generation - retention_generations();
-                for generation in 1..cutoff {
-                    let key = wal_key(&topic, partition, generation);
+                let cutoff = high_watermark.saturating_sub(retention_bytes());
+                let mut max_trim: Option<u64> = None;
+                for segment in part_state.history.iter().filter(|seg| {
+                    seg.stored_on_node == self.controller.node_id && seg.end_offset < cutoff
+                }) {
+                    let key = wal_key(&topic, partition, segment.generation);
                     let path = walrus_path_for_key(&root, &key);
                     if fs::metadata(&path).await.is_ok() {
-                        info!("Removing expired Walrus segment {}", key);
+                        info!(
+                            "Removing expired Walrus segment {} (end_offset {}, cutoff {})",
+                            key, segment.end_offset, cutoff
+                        );
                         remove_segment_dir(&path).await?;
+                        let candidate = segment.generation;
+                        max_trim = Some(max_trim.map(|g| g.max(candidate)).unwrap_or(candidate));
                     }
+                }
+
+                if let Some(up_to) = max_trim {
+                    let cmd = MetadataCmd::TrimHistory {
+                        name: topic.clone(),
+                        partition,
+                        up_to_generation: up_to,
+                    };
+                    let payload = bincode::serialize(&cmd)?;
+                    let _ = self.controller.raft.propose(payload).await;
                 }
             }
         }
@@ -146,13 +171,18 @@ fn max_segment_size() -> u64 {
     DEFAULT_MAX_SEGMENT_SIZE
 }
 
-fn retention_generations() -> u64 {
-    if let Ok(val) = std::env::var("WALRUS_RETENTION_GENERATIONS") {
+fn retention_bytes() -> u64 {
+    if let Ok(val) = std::env::var("WALRUS_RETENTION_BYTES") {
         if let Ok(parsed) = val.parse::<u64>() {
             return parsed;
         }
     }
-    DEFAULT_RETENTION_GENERATIONS
+    if let Ok(val) = std::env::var("WALRUS_RETENTION_GENERATIONS") {
+        if let Ok(parsed) = val.parse::<u64>() {
+            return parsed.saturating_mul(max_segment_size());
+        }
+    }
+    DEFAULT_RETENTION_BYTES
 }
 
 #[cfg(test)]
@@ -170,15 +200,15 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("WALRUS_MONITOR_CHECK_MS", "5");
         std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "42");
-        std::env::set_var("WALRUS_RETENTION_GENERATIONS", "3");
+        std::env::set_var("WALRUS_RETENTION_BYTES", "3");
 
         assert_eq!(check_interval(), Duration::from_millis(10)); // clamped to minimum
         assert_eq!(max_segment_size(), 42);
-        assert_eq!(retention_generations(), 3);
+        assert_eq!(retention_bytes(), 3);
 
         std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
         std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
-        std::env::remove_var("WALRUS_RETENTION_GENERATIONS");
+        std::env::remove_var("WALRUS_RETENTION_BYTES");
     }
 
     #[test]
@@ -186,14 +216,14 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("WALRUS_MONITOR_CHECK_MS", "bogus");
         std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "notanumber");
-        std::env::set_var("WALRUS_RETENTION_GENERATIONS", "-1");
+        std::env::set_var("WALRUS_RETENTION_BYTES", "-1");
 
         assert_eq!(check_interval(), DEFAULT_CHECK_INTERVAL);
         assert_eq!(max_segment_size(), DEFAULT_MAX_SEGMENT_SIZE);
-        assert_eq!(retention_generations(), DEFAULT_RETENTION_GENERATIONS);
+        assert_eq!(retention_bytes(), DEFAULT_RETENTION_BYTES);
 
         std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
         std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
-        std::env::remove_var("WALRUS_RETENTION_GENERATIONS");
+        std::env::remove_var("WALRUS_RETENTION_BYTES");
     }
 }

@@ -22,6 +22,16 @@ pub struct TopicInfo {
 pub struct PartitionState {
     pub current_generation: u64,
     pub leader_node: NodeId,
+    #[serde(default)]
+    pub history: Vec<SegmentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentRecord {
+    pub generation: u64,
+    pub stored_on_node: NodeId,
+    pub start_offset: u64,
+    pub end_offset: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +45,12 @@ pub enum MetadataCmd {
         name: String,
         partition: u32,
         new_leader: NodeId,
+        sealed_segment_size_bytes: u64,
+    },
+    TrimHistory {
+        name: String,
+        partition: u32,
+        up_to_generation: u64,
     },
 }
 
@@ -62,6 +78,12 @@ impl MetadataStateMachine {
         let topic_info = guard.topics.get(topic)?;
         let part = topic_info.partition_states.get(&partition)?;
         Some((part.leader_node, part.current_generation))
+    }
+
+    pub fn get_partition_state(&self, topic: &str, partition: u32) -> Option<PartitionState> {
+        let guard = self.state.read().ok()?;
+        let topic_info = guard.topics.get(topic)?;
+        topic_info.partition_states.get(&partition).cloned()
     }
 
     pub fn assignments_for_node(&self, node_id: NodeId) -> Vec<(String, u32, u64)> {
@@ -120,6 +142,7 @@ impl StateMachineTrait for MetadataStateMachine {
                         PartitionState {
                             current_generation: 1,
                             leader_node: initial_leader,
+                            history: Vec::new(),
                         },
                     );
                 }
@@ -137,12 +160,40 @@ impl StateMachineTrait for MetadataStateMachine {
                 name,
                 partition,
                 new_leader,
+                sealed_segment_size_bytes,
             } => {
                 if let Some(topic) = state.topics.get_mut(&name) {
                     if let Some(part) = topic.partition_states.get_mut(&partition) {
+                        let prev_head_start = part
+                            .history
+                            .last()
+                            .map(|s| s.end_offset)
+                            .unwrap_or(0);
+                        let sealed_end = prev_head_start + sealed_segment_size_bytes;
+                        let record = SegmentRecord {
+                            generation: part.current_generation,
+                            stored_on_node: part.leader_node,
+                            start_offset: prev_head_start,
+                            end_offset: sealed_end,
+                        };
+                        part.history.push(record);
                         part.current_generation += 1;
                         part.leader_node = new_leader;
                         return Ok(Bytes::from_static(b"ROLLED"));
+                    }
+                }
+                Err("Topic or partition not found".into())
+            }
+            MetadataCmd::TrimHistory {
+                name,
+                partition,
+                up_to_generation,
+            } => {
+                if let Some(topic) = state.topics.get_mut(&name) {
+                    if let Some(part) = topic.partition_states.get_mut(&partition) {
+                        part.history
+                            .retain(|seg| seg.generation > up_to_generation);
+                        return Ok(Bytes::from_static(b"TRIMMED"));
                     }
                 }
                 Err("Topic or partition not found".into())
