@@ -72,3 +72,33 @@ fn checksum64(data: &[u8]) -> u64 {
     }
     hash
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_and_checksums_paths() {
+        let root = PathBuf::from("/tmp/walrus-test");
+        let key = "abc-DEF_123";
+        let path = walrus_path_for_key(&root, key);
+        assert!(path.ends_with("abc-DEF_123"));
+
+        // An all-invalid topic should fall back to a checksum name.
+        let bad_key = "!!!@@@";
+        let bad_path = walrus_path_for_key(&root, bad_key);
+        assert!(bad_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ns_"));
+    }
+
+    #[test]
+    fn checksum_is_stable() {
+        let a = checksum64(b"hello");
+        let b = checksum64(b"hello");
+        assert_eq!(a, b);
+        assert_ne!(a, checksum64(b"world"));
+    }
+}

@@ -156,3 +156,48 @@ impl BucketService {
         leases.remove(&key);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("walrus-bucket-{name}-{unique}"))
+    }
+
+    #[tokio::test]
+    async fn partition_ids_gate_leases_and_io() {
+        let path = temp_path("leases");
+        let bucket = BucketService::new(path.clone()).await.expect("bucket init");
+        let pid = PartitionId {
+            topic_id: 9,
+            partition_id: 7,
+            generation_id: 3,
+        };
+        assert_eq!(pid.to_wal_key(), "t_9_p_7_g_3");
+
+        // Writes without a lease should be rejected.
+        let err = bucket.append(pid, b"nope".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("NotLeaderForPartition"));
+
+        bucket.grant_lease(pid).await;
+        bucket
+            .append(pid, b"hello-world".to_vec())
+            .await
+            .expect("append with lease");
+        let entries = bucket.read(pid, 1024).await.expect("read with lease");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, b"hello-world");
+
+        bucket.revoke_lease(pid).await;
+        let err = bucket.append(pid, b"after-revoke".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("NotLeaderForPartition"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+}

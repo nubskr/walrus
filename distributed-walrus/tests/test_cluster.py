@@ -431,17 +431,17 @@ def snapshot_data_plane_mtimes() -> dict[int, dict[str, int]]:
     return snapshot
 
 
-def list_generations(node_id: int) -> list[int]:
-    """Return generation numbers for logs partition as reported by internal state."""
-    resp = send_frame_with_retry(*NODES.get(node_id, NODES[1]), make_internal_state_request(["logs"]))
+def list_generations(node_id: int, topic: str = "logs") -> list[int]:
+    """Return generation numbers for a topic/partition as reported by internal state."""
+    resp = send_frame_with_retry(*NODES.get(node_id, NODES[1]), make_internal_state_request([topic]))
     state = decode_internal_state(resp or b"")
     if not state:
         return []
     gens: list[int] = []
-    for topic in state["topics"]:
-        if topic["name"] != "logs":
+    for topic_info in state["topics"]:
+        if topic_info["name"] != topic:
             continue
-        for part in topic["partitions"]:
+        for part in topic_info["partitions"]:
             gens.append(int(part["generation"]))
     return gens
 
@@ -451,6 +451,26 @@ def wal_file_count(node_id: int) -> int:
     if not root.exists():
         return 0
     return len([p for p in root.iterdir() if p.is_file()])
+
+
+def data_plane_size_bytes(node_id: int) -> int:
+    root = data_plane_root(node_id)
+    total = 0
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            try:
+                total += os.path.getsize(Path(dirpath) / name)
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def wal_dirs_for_topic(node_id: int, topic: str) -> list[Path]:
+    root = data_plane_root(node_id)
+    if not root.exists():
+        return []
+    prefix = f"t_{topic}_p_"
+    return [p for p in root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
 
 
 def wal_file_mtime_ns(node_id: int) -> int:
@@ -2131,3 +2151,64 @@ def test_monitor_gc_error_path():
     produce_and_assert_ok(NODES[1], "logs", b"GC_TEST", partition=1)
     fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096, partition=1)) or b"")
     assert fetch and fetch[0]["error_code"] == 0
+
+
+def test_periodic_lease_sync_loop_restores_revoked_leases():
+    """
+    Revoke leases without issuing a manual sync and ensure the background lease sync loop restores them.
+    """
+    ensure_cluster_ready()
+    topic = "logs"
+    partition = 0
+    resp = send_test_control(1, topic=topic, partition=partition)
+    assert resp, "test control revoke leases failed"
+    assert decode_test_control_code(resp) == 0
+
+    first = send_frame_with_retry(*NODES[1], make_produce_request(topic, b"LEASE_REVOKED_ONCE", partition=partition))
+    assert first, "produce after lease revoke returned no response"
+
+    def lease_restored() -> bool:
+        resp = send_frame_with_retry(*NODES[1], make_produce_request(topic, b"LEASE_SYNC_RESTORE", partition=partition))
+        if not resp:
+            return False
+        codes = parse_produce_error_codes(resp)
+        return all(code == 0 for code in codes)
+
+    wait_until(lease_restored, timeout=15.0, interval=0.5, msg="lease sync loop did not restore leases")
+
+
+def test_env_overrides_apply_to_monitor_rollover_and_retention():
+    """
+    Verify docker env overrides are present and drive monitor rollover + retention behaviour.
+    """
+    ensure_cluster_ready(timeout=180)
+    topic = "env_rollover"
+    partitions = 1
+    created = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, partitions)])) or b""
+    )
+    assert created and all(err in (0, 36) for _, err in created), f"CreateTopics failed: {created}"
+    wait_for_topics_on_all_nodes([topic], timeout=90)
+
+    # Confirm env vars are wired into the containers as configured in docker-compose.yml.
+    env_output = subprocess.check_output(["docker", "exec", "walrus-1", "env"], text=True, cwd=PROJECT_ROOT)
+    for expected in (
+        "WALRUS_MONITOR_CHECK_MS=1000",
+        "WALRUS_MAX_SEGMENT_BYTES=32768",
+        "WALRUS_RETENTION_GENERATIONS=0",
+        "WALRUS_DISABLE_IO_URING=1",
+    ):
+        assert expected in env_output, f"missing env override {expected} in walrus-1"
+
+    payload = b"A" * 20000
+    start = time.time()
+    for _ in range(4):
+        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+
+    def rolled_over() -> bool:
+        gens = list_generations(1, topic)
+        return bool(gens) and max(gens) >= 2
+
+    wait_until(rolled_over, timeout=8.0, interval=0.5, msg="monitor did not trigger rollover from env thresholds")
+    assert time.time() - start < 10, "rollover took too long; monitor interval override may not be applied"
+    wait_until(lambda: wal_file_count(1) > 0, timeout=30.0, interval=1.0, msg="walrus data files were not created")

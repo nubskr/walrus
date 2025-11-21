@@ -7,6 +7,8 @@ VENV ?= .venv
 PYFLAGS ?= -vv
 PYTEST_MARK_EXPR ?= not soak
 SKIP_BUILD ?= 1
+SOAK_LONG_DURATION_SEC ?= 1200
+SOAK_LONG_CLIENTS ?= 6
 
 # Run each cluster test individually to keep runs isolated.
 TESTS := \
@@ -59,9 +61,11 @@ TESTS := \
 	test_malformed_produce_frame_returns_error \
 	test_negative_record_set_size_rejected \
 	test_follower_fetch_survives_monitor_rollover_and_gc \
-	test_join_cluster_duplicate_node_id_is_tolerated_and_cluster_continues_io
+	test_join_cluster_duplicate_node_id_is_tolerated_and_cluster_continues_io \
+	test_periodic_lease_sync_loop_restores_revoked_leases \
+	test_env_overrides_apply_to_monitor_rollover_and_retention
 
-.PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long cluster-up cluster-down cluster-restart cluster-logs $(TESTS)
+.PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long soak-test-20m cluster-up cluster-down cluster-restart cluster-logs cluster-bootstrap $(TESTS)
 
 deps: $(VENV)/.deps-installed
 
@@ -102,7 +106,39 @@ soak-tests: deps
 	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak $(PYFLAGS)
 
 soak-test-long: deps
-	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak_long $(PYFLAGS)
+	@SOAK_LONG_DURATION_SEC=$(SOAK_LONG_DURATION_SEC) SOAK_LONG_CLIENTS=$(SOAK_LONG_CLIENTS) \
+	SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak_long $(PYFLAGS)
+
+soak-test-20m: soak-test-long
+
+cluster-bootstrap: cluster-up
+	@echo "Waiting for cluster ports 9091-9093 to come up..."
+	@python - <<-'PY'
+		import socket
+		import time
+
+		nodes = [("localhost", 9091), ("localhost", 9092), ("localhost", 9093)]
+		deadline = time.time() + 90
+
+		def ready(addr):
+		    s = socket.socket()
+		    s.settimeout(1.5)
+		    try:
+		        s.connect(addr)
+		        return True
+		    except Exception:
+		        return False
+		    finally:
+		        s.close()
+
+		while time.time() < deadline:
+		    if all(ready(n) for n in nodes):
+		        print("Cluster ports ready")
+		        raise SystemExit(0)
+		    time.sleep(1)
+
+		raise SystemExit("Cluster did not become ready within timeout")
+	PY
 
 cluster-up:
 	docker compose -f docker-compose.yml up --build -d
