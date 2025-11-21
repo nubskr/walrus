@@ -5,6 +5,7 @@ UV ?= uv
 UV_VENV_FLAGS ?= --if-exists reuse
 VENV ?= .venv
 PYFLAGS ?= -vv
+PYTEST_MARK_EXPR ?= not soak
 SKIP_BUILD ?= 1
 
 # Run each cluster test individually to keep runs isolated.
@@ -21,8 +22,12 @@ TESTS := \
 	test_fetch_payload_and_offsets_from_leader \
 	test_create_topic_and_roundtrip_partition_zero \
 	test_fetch_offset_strictness_with_high_watermark \
+	test_fetch_with_too_small_max_bytes_returns_empty_payload \
 	test_fetch_unknown_topic_returns_error \
 	test_fetch_invalid_partition_returns_error \
+	test_create_topic_invalid_replication_factor_returns_error \
+	test_create_topic_invalid_partitions_returns_error \
+	test_create_topic_duplicate_rejected \
 	test_partition_one_produce_and_fetch \
 	test_restart_preserves_data_and_leadership \
 	test_monitor_rollover_and_gc_removes_old_generation \
@@ -30,14 +35,24 @@ TESTS := \
 	test_hot_join_node4_reports_metadata \
 	test_fetch_respects_offsets_and_payloads_from_leader \
 	test_leader_failover_timeout_then_recovery \
+	test_follower_fetch_during_leader_pause_returns_high_watermark \
 	test_leader_pause_causes_timeout_and_resumes \
 	test_full_cluster_restart_preserves_data \
 	test_follower_restart_catches_up_and_reads \
 	test_retention_gc_prunes_old_generations \
+	test_produce_after_rollover_generation_advances \
 	test_hot_join_rejoin_promotes_node4 \
-	test_remove_node_from_membership_and_continue_io
+	test_remove_node_from_membership_and_continue_io \
+	test_remove_node_with_invalid_op_returns_error \
+	test_remove_nonexistent_node_is_tolerated \
+	test_forward_read_error_path_and_retry_append_on_missing_lease \
+	test_join_cluster_bad_addr_returns_error \
+	test_test_control_unknown_op_returns_error \
+	test_monitor_force_error_flag_and_recovery \
+	test_monitor_dir_size_error_path \
+	test_monitor_gc_error_path
 
-.PHONY: deps all-tests all-tests-one-by-one $(TESTS)
+.PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests $(TESTS)
 
 deps: $(VENV)/.deps-installed
 
@@ -54,7 +69,7 @@ $(VENV)/.deps-installed:
 	@touch $(VENV)/.deps-installed
 
 all-tests: deps
-	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py $(PYFLAGS)
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m "$(PYTEST_MARK_EXPR)" $(PYFLAGS)
 
 # Original behaviour: run each test separately (slower; many container restarts).
 all-tests-one-by-one: deps
@@ -65,3 +80,14 @@ all-tests-one-by-one: deps
 
 $(TESTS): deps
 	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py::$@ $(PYFLAGS)
+
+soak-test-batch: deps
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py::test_soak_multi_client_produce_and_fetch_read_your_writes -m soak $(PYFLAGS)
+
+soak-test-regular: deps
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py::test_soak_parallel_produce_multi_topics_and_cross_read -m soak $(PYFLAGS)
+
+soak-test: soak-tests
+
+soak-tests: deps
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak $(PYFLAGS)

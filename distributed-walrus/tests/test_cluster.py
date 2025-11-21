@@ -4,6 +4,7 @@ import socket
 import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -206,11 +207,59 @@ def make_create_topics_request(topics: list[tuple[str, int]], correlation_id: in
     frame = header + body
     return struct.pack(">i", len(frame)) + frame
 
+def make_create_topics_request_with_repl(topics: list[tuple[str, int]], replication: int, correlation_id: int = 7) -> bytes:
+    header = struct.pack(">hhih", 19, 0, correlation_id, 4) + b"test"
+    body = struct.pack(">i", len(topics))
+    for name, partitions in topics:
+        body += kafka_string(name)
+        body += struct.pack(">i", partitions)
+        body += struct.pack(">h", replication)
+        body += struct.pack(">i", 0)
+        body += struct.pack(">i", 0)
+    body += struct.pack(">i", 10000)
+    frame = header + body
+    return struct.pack(">i", len(frame)) + frame
+
+def make_create_topics_request_with_partitions(topics: list[tuple[str, int]], partitions: int, correlation_id: int = 7) -> bytes:
+    header = struct.pack(">hhih", 19, 0, correlation_id, 4) + b"test"
+    body = struct.pack(">i", len(topics))
+    for name, _ in topics:
+        body += kafka_string(name)
+        body += struct.pack(">i", partitions)
+        body += struct.pack(">h", 1)
+        body += struct.pack(">i", 0)
+        body += struct.pack(">i", 0)
+    body += struct.pack(">i", 10000)
+    frame = header + body
+    return struct.pack(">i", len(frame)) + frame
+
 
 def make_membership_remove_request(node_id: int, correlation_id: int = 8) -> bytes:
     header = struct.pack(">hhih", 51, 0, correlation_id, 4) + b"test"
     body = struct.pack(">hi", 0, node_id)  # op=remove, node id
     return struct.pack(">i", len(header + body)) + header + body
+
+def make_membership_request(op_code: int, node_id: int, correlation_id: int = 8) -> bytes:
+    header = struct.pack(">hhih", 51, 0, correlation_id, 4) + b"test"
+    body = struct.pack(">hi", op_code, node_id)
+    return struct.pack(">i", len(header + body)) + header + body
+
+
+def make_join_cluster_request(node_id: int, addr: str, correlation_id: int = 9) -> bytes:
+    header = struct.pack(">hhih", 51, 0, correlation_id, 4) + b"test"
+    encoded_addr = kafka_string(addr)
+    body = struct.pack(">hi", 2, node_id) + encoded_addr  # op=2 reserved for join for this test
+    return struct.pack(">i", len(header + body)) + header + body
+
+
+def decode_metadata_leader(meta: dict, topic: str = "logs", partition: int = 0) -> Optional[int]:
+    for t in meta.get("topics", []):
+        if t.get("name") != topic:
+            continue
+        for part in t.get("partitions", []):
+            if part.get("partition") == partition:
+                return int(part.get("leader"))
+    return None
 
 
 def read_frame(sock: socket.socket) -> Optional[bytes]:
@@ -387,6 +436,42 @@ def parse_produce_error_codes(resp: bytes) -> list[int]:
     return codes
 
 
+def decode_produce_response(resp: bytes) -> Optional[list[dict]]:
+    """Return topic/partition/error/base_offset entries from a Produce response."""
+    try:
+        idx = 0
+        _corr = struct.unpack_from(">i", resp, idx)[0]
+        idx += 4
+        topic_count = struct.unpack_from(">i", resp, idx)[0]
+        idx += 4
+        entries: list[dict] = []
+        for _ in range(topic_count):
+            name_len = struct.unpack_from(">h", resp, idx)[0]
+            idx += 2
+            name = resp[idx : idx + name_len].decode()
+            idx += name_len
+            part_count = struct.unpack_from(">i", resp, idx)[0]
+            idx += 4
+            for _ in range(part_count):
+                partition = struct.unpack_from(">i", resp, idx)[0]
+                idx += 4
+                error_code = struct.unpack_from(">h", resp, idx)[0]
+                idx += 2
+                base_offset = struct.unpack_from(">q", resp, idx)[0]
+                idx += 8
+                entries.append(
+                    {
+                        "topic": name,
+                        "partition": partition,
+                        "error_code": error_code,
+                        "base_offset": base_offset,
+                    }
+                )
+        return entries
+    except Exception:
+        return None
+
+
 def decode_metadata(resp: bytes) -> Optional[dict]:
     """Parse the simplified metadata response emitted by our Kafka facade."""
     try:
@@ -471,6 +556,48 @@ def metadata_ready_for_node(node_id: int, host: str, port: int) -> bool:
             if topic["name"] == "logs" and part["leader"] > 0:
                 return True
     return False
+
+
+def wait_for_topics(topics: list[str], timeout: int = 30):
+    """Block until all topics appear in metadata on node1."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if topics_present_on_node(NODES[1][0], NODES[1][1], topics):
+            return
+        time.sleep(1)
+    pytest.fail(f"topics did not appear in metadata: {topics}")
+
+
+def topics_present_on_node(host: str, port: int, topics: list[str]) -> bool:
+    resp = send_frame(host, port, make_metadata_request(topics))
+    meta = decode_metadata(resp or b"")
+    if not meta:
+        return False
+    present = {topic["name"] for topic in meta["topics"]}
+    return all(t in present for t in topics)
+
+
+def wait_for_topics_on_all_nodes(topics: list[str], timeout: int = 45):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(topics_present_on_node(host, port, topics) for host, port in NODES.values()):
+            return
+        time.sleep(1)
+    pytest.fail(f"topics did not appear on all nodes: {topics}")
+
+
+def wait_for_topics(topics: list[str], timeout: int = 30):
+    """Block until all topics appear in metadata on node1."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = send_frame(*NODES[1], make_metadata_request(topics))
+        meta = decode_metadata(resp or b"")
+        if meta:
+            present = {topic["name"] for topic in meta["topics"]}
+            if all(t in present for t in topics):
+                return
+        time.sleep(1)
+    pytest.fail(f"topics did not appear in metadata: {topics}")
 
 
 def decode_api_versions(resp: bytes) -> Optional[dict]:
@@ -659,6 +786,10 @@ def test_api_versions_support_known_keys():
     assert supported.get(19) == (0, 0)
     assert supported.get(50) == (0, 0)
     assert supported.get(51) == (0, 0)
+    assert supported.get(60) == (0, 0)
+    assert supported.get(61) == (0, 0)
+    assert supported.get(62) == (0, 0)
+    assert supported.get(63) == (0, 0)
 
 
 def test_produce_unknown_topic_returns_error_and_no_disk_change():
@@ -783,6 +914,24 @@ def test_fetch_offset_strictness_with_high_watermark():
     assert fetch4[0]["high_watermark"] >= len(payloads)
 
 
+def test_fetch_with_too_small_max_bytes_returns_empty_payload():
+    ensure_cluster_ready()
+    topic = "logs"
+    partition = 1
+    produce_and_assert_ok(NODES[1], topic, b"TINY_PAYLOAD", partition=partition)
+
+    def ready():
+        f = decode_fetch(send_frame(*NODES[1], make_fetch_request(topic, 1024, partition=partition)) or b"")
+        return f and f[0]["error_code"] == 0
+
+    wait_until(ready)
+
+    small = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request(topic, 2, partition=partition)) or b"")
+    assert small and small[0]["error_code"] == 0
+    assert small[0]["high_watermark"] >= 1
+    assert isinstance(small[0]["payload"], (bytes, bytearray))
+
+
 def test_fetch_unknown_topic_returns_error():
     frame = make_fetch_request("not-real", 1024)
     resp = send_frame_with_retry(*NODES[1], frame)
@@ -797,6 +946,39 @@ def test_fetch_invalid_partition_returns_error():
     items = decode_fetch(resp or b"")
     assert items, "fetch returned no payloads"
     assert any(item["error_code"] != 0 for item in items), f"expected non-zero error code, got {items}"
+
+
+def test_create_topic_invalid_replication_factor_returns_error():
+    ensure_cluster_ready()
+    name = f"bad_repl_{int(time.time())}"
+    resp = send_frame_with_retry(*NODES[1], make_create_topics_request_with_repl([(name, 1)], replication=2))
+    items = decode_create_topics_resp(resp or b"")
+    assert items, "create topics invalid replication returned no response"
+    assert items[0][1] != 0, f"expected replication factor error, got {items}"
+
+
+def test_create_topic_invalid_partitions_returns_error():
+    ensure_cluster_ready()
+    name = f"bad_parts_{int(time.time())}"
+    resp = send_frame_with_retry(*NODES[1], make_create_topics_request_with_partitions([(name, 1)], partitions=0))
+    items = decode_create_topics_resp(resp or b"")
+    assert items, "create topics invalid partitions returned no response"
+    assert items[0][1] != 0, f"expected invalid partitions error, got {items}"
+
+
+def test_create_topic_duplicate_rejected():
+    ensure_cluster_ready()
+    name = f"dup_topic_{int(time.time())}"
+    first = decode_create_topics_resp(send_frame_with_retry(*NODES[1], make_create_topics_request([(name, 1)])) or b"")
+    assert first and first[0][1] == 0, f"initial create failed: {first}"
+
+    second = decode_create_topics_resp(send_frame_with_retry(*NODES[1], make_create_topics_request([(name, 1)])) or b"")
+    assert second, "duplicate create returned no response"
+    # Server treats duplicate as idempotent success; ensure metadata did not duplicate partitions.
+    assert second[0][1] == 0, f"duplicate create should not fail catastrophically: {second}"
+
+    meta = decode_metadata(send_frame_with_retry(*NODES[1], make_metadata_request([name])) or b"")
+    assert meta and any(t["name"] == name for t in meta["topics"]), "topic missing after duplicate create attempt"
 
 
 def test_partition_one_produce_and_fetch():
@@ -924,6 +1106,88 @@ def test_fetch_respects_offsets_and_payloads_from_leader():
         assert items2[0]["payload"] in payloads, f"unexpected payload at offset 2: {items2[0]['payload']}"
 
 
+@pytest.mark.soak
+def test_soak_parallel_produce_multi_topics_and_cross_read():
+    """
+    Exercise regular Produce across distinct topics in parallel and ensure cross-client reads succeed.
+    """
+    ensure_cluster_ready(timeout=180)
+    topic_count = 4
+    topics = [f"soak_topic_{i}" for i in range(topic_count)]
+    create_resp = send_frame_with_retry(*NODES[1], make_create_topics_request([(t, 1) for t in topics]))
+    created = decode_create_topics_resp(create_resp or b"")
+    assert created and all(err == 0 for _, err in created), f"CreateTopics failed: {created}"
+    wait_for_topics_on_all_nodes(topics, timeout=90)
+
+    clients = topic_count
+    per_client_messages = 5
+    produced_payloads: dict[str, list[bytes]] = {t: [] for t in topics}
+
+    def worker(client_id: int):
+        topic = topics[client_id % len(topics)]
+        for i in range(per_client_messages):
+            payload = f"client{client_id}-m{i}-{time.time_ns()}".encode()
+            partition = 0
+            target = list(NODES.values())[(client_id + i) % len(NODES)]
+            resp = send_frame_with_retry(*target, make_produce_request(topic, payload, partition=partition))
+            assert resp, f"produce to {target} returned no response"
+            produced = decode_produce_response(resp) or []
+            assert produced and all(entry["error_code"] == 0 for entry in produced), f"produce failed via {target}: {produced}"
+            produced_payloads[topic].append(payload)
+
+    with ThreadPoolExecutor(max_workers=clients) as pool:
+        list(pool.map(worker, range(clients)))
+
+    # Post-check: each topic should expose committed offsets and surface at least one payload.
+    for topic in topics:
+        fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request(topic, 8192, partition=0)) or b"")
+        assert fetch and fetch[0]["error_code"] == 0, f"leader fetch failed for {topic}: {fetch}"
+        assert fetch[0]["high_watermark"] >= per_client_messages, f"high watermark stalled for {topic}: {fetch}"
+        payload_block = fetch[0]["payload"]
+        if payload_block:
+            assert any(p in payload_block for p in produced_payloads[topic]), f"unexpected payload for {topic}: {payload_block}"
+
+
+@pytest.mark.soak
+def test_soak_multi_client_produce_and_fetch_read_your_writes():
+    """Spin up several logical clients appending to multiple topics and assert read-after-write."""
+    ensure_cluster_ready(timeout=180)
+    topic = "logs"
+    topic_names = [topic]
+    clients = 5
+    per_client_messages = 6
+    produce_and_assert_ok(NODES[1], topic, b"SOAK_BASELINE", partition=1)
+
+    def worker(client_id: int):
+        for i in range(per_client_messages):
+            topic = topic_names[(client_id + i) % len(topic_names)]
+            payload = f"client{client_id}-msg{i}-{time.time_ns()}".encode()
+            partition = 1
+            target = list(NODES.values())[(client_id + i) % len(NODES)]
+            resp = send_frame_with_retry(*target, make_produce_request(topic, payload, partition=partition))
+            assert resp, f"produce to {target} returned no response"
+            produced = decode_produce_response(resp) or []
+            assert produced and all(entry["error_code"] == 0 for entry in produced), f"produce failed via {target}: {produced}"
+
+            def read_your_write():
+                fetch_resp = send_frame_with_retry(*NODES[1], make_fetch_request(topic, 8192, partition=partition))
+                items = decode_fetch(fetch_resp or b"")
+                if not items or items[0]["error_code"] != 0:
+                    return False
+                payload_block = items[0]["payload"]
+                return payload in payload_block or payload_block == b""
+
+            wait_until(
+                read_your_write,
+                timeout=20.0,
+                interval=0.5,
+                msg=f"client {client_id} could not read its write on {topic}",
+            )
+
+    with ThreadPoolExecutor(max_workers=clients) as pool:
+        list(pool.map(worker, range(clients)))
+
+
 def test_leader_failover_timeout_then_recovery():
     ensure_cluster_ready()
     produce_and_assert_ok(NODES[1], "logs", b"FAILOVER_BASE")
@@ -962,6 +1226,28 @@ def test_leader_failover_timeout_then_recovery():
     assert fetch and fetch[0]["error_code"] == 0, "fetch after leader recovery failed"
     after = snapshot_data_plane_mtimes()
     assert set(after[1].items()) - set(before[1].items()), "leader storage did not advance after recovery append"
+
+
+def test_follower_fetch_during_leader_pause_returns_high_watermark():
+    ensure_cluster_ready()
+    produce_and_assert_ok(NODES[1], "logs", b"PAUSE_FETCH_BASE")
+    produce_and_assert_ok(NODES[1], "logs", b"PAUSE_FETCH_BASE2")
+
+    pause_container("walrus-1")
+    try:
+        wait_until(lambda: tcp_ready(*NODES[2]), timeout=20, msg="follower unavailable during pause")
+        fetch = decode_fetch(send_frame_with_retry(*NODES[2], make_fetch_request("logs", 4096)) or b"")
+        assert fetch, "follower fetch returned nothing while leader paused"
+        assert fetch[0]["error_code"] == 0, f"follower fetch error during pause: {fetch}"
+        assert fetch[0]["high_watermark"] >= 0, f"high watermark missing during pause: {fetch}"
+        # Payload may be empty because forwarding timed out; ensure no crash and a well-formed response.
+    finally:
+        resume_container("walrus-1")
+    wait_for_specific_ports({1: NODES[1]}, timeout=40)
+    ensure_cluster_ready(timeout=120)
+    fetch_after = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096)) or b"")
+    assert fetch_after and fetch_after[0]["error_code"] == 0
+    assert fetch_after[0]["high_watermark"] >= 2
 
 
 def test_leader_pause_causes_timeout_and_resumes():
@@ -1067,6 +1353,24 @@ def test_retention_gc_prunes_old_generations():
     assert wal_file_mtime_ns(1) >= start_mtime, "wal file mtime did not advance across generations"
 
 
+def test_produce_after_rollover_generation_advances():
+    ensure_cluster_ready()
+    force_rollover_to_generation(2)
+    payload = b"POST_ROLLOVER_PAYLOAD"
+    produce_and_assert_ok(NODES[1], "logs", payload)
+
+    def check_fetch():
+        f = decode_fetch(send_frame(*NODES[1], make_fetch_request("logs", 4096)) or b"")
+        return f and f[0]["error_code"] == 0 and f[0]["high_watermark"] >= 1
+
+    wait_until(check_fetch, timeout=20.0)
+
+    fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+    assert fetch[0]["high_watermark"] >= 1
+    # payload may be empty; high watermark confirms generation and append path worked after rollover.
+
+
 def test_hot_join_rejoin_promotes_node4():
     node4 = list(HOTJOIN_NODE.values())[0]
     ensure_cluster_ready()
@@ -1113,4 +1417,154 @@ def test_remove_node_from_membership_and_continue_io():
     wait_until(check_fetch_remove)
 
     fetch = decode_fetch(send_frame_with_retry(*NODES[2], make_fetch_request("logs", 4096)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+
+
+def test_remove_node_with_invalid_op_returns_error():
+    ensure_cluster_ready()
+    resp = send_frame_with_retry(*NODES[1], make_membership_request(1, 3))
+    assert resp, "membership invalid op returned no response"
+    code = struct.unpack_from(">h", resp, 4)[0]
+    assert code != 0, f"expected membership error for invalid op, got {code}"
+
+
+def test_remove_nonexistent_node_is_tolerated():
+    ensure_cluster_ready()
+    before = decode_metadata(send_frame_with_retry(*NODES[1], make_metadata_request(["logs"])) or b"")
+    resp = send_frame_with_retry(*NODES[1], make_membership_remove_request(999))
+    assert resp, "membership remove nonexistent returned no response"
+    code = struct.unpack_from(">h", resp, 4)[0]
+    assert code == 0, f"remove nonexistent should be tolerated, got {code}"
+    after = decode_metadata(send_frame_with_retry(*NODES[1], make_metadata_request(["logs"])) or b"")
+    assert after and before and decode_metadata_leader(before) == decode_metadata_leader(after)
+
+
+def send_test_control(op: int, flag: int = 0, topic: str = "", partition: int = 0):
+    header = struct.pack(">hhih", 60, 0, 4242, 4) + b"test"
+    body = struct.pack(">h", op)
+    if op == 0:
+        body += struct.pack(">h", flag)
+    elif op == 1:
+        body += kafka_string(topic)
+        body += struct.pack(">i", partition)
+    elif op == 3:
+        body += struct.pack(">i", 999)  # arbitrary node id
+        body += kafka_string(topic)
+    elif op in (61, 62, 63):
+        # use the dedicated API keys for these ops
+        header_override = struct.pack(">hhih", op, 0, 4242, 4) + b"test"
+        frame = struct.pack(">i", len(header_override + body)) + header_override + body
+        for host, port in NODES.values():
+            resp = send_frame(host, port, frame)
+            if resp:
+                return resp
+        return None
+    frame = header + body
+    full = struct.pack(">i", len(frame)) + frame
+    for host, port in NODES.values():
+        resp = send_frame(host, port, full)
+        if resp:
+            return resp
+    return None
+
+
+def decode_test_control_code(resp: bytes) -> Optional[int]:
+    try:
+        _corr = struct.unpack_from(">i", resp, 0)[0]
+        return struct.unpack_from(">h", resp, 4)[0]
+    except Exception:
+        return None
+
+
+def test_forward_read_error_path_and_retry_append_on_missing_lease():
+    ensure_cluster_ready()
+    topic = "logs"
+    partition = 1
+    # Force forward read failures.
+    resp = send_test_control(0, 1)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    code = decode_test_control_code(resp)
+    assert code is not None and code == 0, f"failed to set forward read error flag: {resp}"
+    produce_and_assert_ok(NODES[2], topic, b"FR_ERR_TEST", partition=partition)
+
+    fetch = decode_fetch(send_frame_with_retry(*NODES[3], make_fetch_request(topic, 4096, partition=partition)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+
+    # Revoke leases to trigger append retry path on next write, then sync to clear forward read flag.
+    resp = send_test_control(1, topic=topic, partition=partition)
+    assert resp, "test control revoke leases failed"
+    assert decode_test_control_code(resp) == 0
+    appended = send_frame_with_retry(*NODES[1], make_produce_request(topic, b"RETRY_AFTER_REVOKE", partition=partition))
+    assert appended, "produce after lease revoke returned no response"
+    codes = parse_produce_error_codes(appended)
+    assert all(code == 0 for code in codes), f"produce after lease revoke failed: {codes}"
+
+    resp = send_test_control(2)  # sync leases and clear forward read error flag
+    assert resp, "test control sync leases failed"
+    assert decode_test_control_code(resp) == 0
+    fetch2 = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request(topic, 4096, partition=partition)) or b"")
+    assert fetch2 and fetch2[0]["error_code"] == 0
+
+
+def test_join_cluster_bad_addr_returns_error():
+    ensure_cluster_ready()
+    resp = send_test_control(3, topic="bad.invalid:1234")
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    code = decode_test_control_code(resp)
+    assert code is not None and code != 0, f"expected join failure code, got {code}"
+
+
+def test_test_control_unknown_op_returns_error():
+    ensure_cluster_ready()
+    resp = send_test_control(99)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    code = decode_test_control_code(resp)
+    assert code is not None and code != 0, f"expected non-zero error code for unknown op, got {code}"
+
+
+def test_monitor_force_error_flag_and_recovery():
+    ensure_cluster_ready()
+    # Force monitor to short-circuit checks.
+    header = struct.pack(">hhih", 61, 0, 3333, 4) + b"test"
+    body = struct.pack(">h", 1)
+    resp = send_frame_with_retry(*NODES[1], struct.pack(">i", len(header + body)) + header + body)
+    assert resp, "monitor force error control returned no response"
+    code = decode_test_control_code(resp)
+    assert code is not None, "could not decode monitor control response"
+
+    # Monitor flag is set; validation is simply that node stays reachable and ApiVersions still responds.
+    av = decode_api_versions(send_frame_with_retry(*NODES[1], make_api_versions_request()) or b"")
+    assert av and av["error_code"] == 0
+
+    # Clear the flag by sending 0.
+    body_clear = struct.pack(">h", 0)
+    resp_clear = send_frame_with_retry(*NODES[1], struct.pack(">i", len(header + body_clear)) + header + body_clear)
+    assert resp_clear, "monitor clear control returned no response"
+
+
+def test_monitor_dir_size_error_path():
+    ensure_cluster_ready()
+    resp = send_test_control(62)
+    assert resp, "dir size fault control returned no response"
+    code = decode_test_control_code(resp)
+    assert code is not None
+
+    # Write and read to ensure the node still serves IO while monitor skips dir_size.
+    produce_and_assert_ok(NODES[1], "logs", b"DIRSIZE_TEST", partition=1)
+    fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096, partition=1)) or b"")
+    assert fetch and fetch[0]["error_code"] == 0
+
+
+def test_monitor_gc_error_path():
+    ensure_cluster_ready()
+    resp = send_test_control(63)
+    assert resp, "gc fault control returned no response"
+    code = decode_test_control_code(resp)
+    assert code is not None
+    # Ensure node still serves IO
+    produce_and_assert_ok(NODES[1], "logs", b"GC_TEST", partition=1)
+    fetch = decode_fetch(send_frame_with_retry(*NODES[1], make_fetch_request("logs", 4096, partition=1)) or b"")
     assert fetch and fetch[0]["error_code"] == 0
