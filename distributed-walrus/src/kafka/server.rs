@@ -47,9 +47,7 @@ pub async fn run_server(port: u16, controller: Arc<NodeController>) -> Result<()
                             };
                             match handle_request(header, &mut cursor, &ctrl, port).await {
                                 Ok(response) => {
-                                    if let Err(e) =
-                                        write_frame(&mut socket, response).await
-                                    {
+                                    if let Err(e) = write_frame(&mut socket, response).await {
                                         error!("socket write error: {e}");
                                         return;
                                     }
@@ -117,6 +115,40 @@ async fn handle_request(
         }
         18 => {
             encode_api_versions_response(&mut res);
+        }
+        60 => {
+            encode_test_control_response(&mut res, buf, controller).await?;
+        }
+        61 => {
+            // Unadvertised test: force monitor error flag; returns a simple code.
+            let flag = i16::decode(buf)?;
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::ForceMonitorError,
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code | (flag != 0) as i16);
+        }
+        62 => {
+            // Unadvertised: force dir_size error path in monitor.
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::ForceDirSizeError,
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
+        }
+        63 => {
+            // Unadvertised: force GC failure in monitor.
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::ForceGcError,
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
         }
         other => {
             return Err(anyhow!("unsupported Kafka API key {}", other));
@@ -297,7 +329,16 @@ async fn encode_fetch_response(
 
 fn encode_api_versions_response(res: &mut BytesMut) {
     res.put_i16(0);
-    let supported = [(0i16, 0i16), (1, 0i16), (3, 0), (18, 0), (19, 0), (50, 0), (51, 0)];
+    let supported = [
+        (0i16, 0i16),
+        (1, 0i16),
+        (3, 0),
+        (18, 0),
+        (19, 0),
+        (50, 0),
+        (51, 0),
+        (60, 0),
+    ];
     res.put_i32(supported.len() as i32);
     for (api, version) in supported {
         res.put_i16(api);
@@ -370,7 +411,10 @@ async fn encode_create_topics_response(
         } else if partitions <= 0 {
             21i16 // invalid partitions
         } else {
-            match controller.create_topic(name.clone(), partitions as u32).await {
+            match controller
+                .create_topic(name.clone(), partitions as u32)
+                .await
+            {
                 Ok(_) => 0i16,
                 Err(e) => {
                     error!("CreateTopic failed for {}: {}", name, e);
@@ -410,5 +454,67 @@ async fn encode_membership_response(
         code = 6;
     }
     res.put_i16(code);
+    Ok(())
+}
+
+async fn encode_test_control_response(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+) -> Result<()> {
+    let op = i16::decode(buf)?;
+    match op {
+        0 => {
+            let flag = i16::decode(buf)?;
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::ForceForwardReadError(flag != 0),
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
+        }
+        1 => {
+            let topic = String::decode(buf)?;
+            let partition = i32::decode(buf)?;
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::RevokeLeases {
+                        topic,
+                        partition: partition as u32,
+                    },
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
+        }
+        2 => {
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::SyncLeases,
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
+        }
+        3 => {
+            let node_id = i32::decode(buf)?;
+            let addr = String::decode(buf)?;
+            let resp = controller
+                .handle_rpc(crate::rpc::InternalOp::TestControl(
+                    crate::rpc::TestControl::TriggerJoin {
+                        node_id: node_id as u64,
+                        addr,
+                    },
+                ))
+                .await;
+            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+            res.put_i16(code);
+        }
+        other => {
+            error!("unknown test control op {}", other);
+            res.put_i16(42);
+        }
+    }
     Ok(())
 }

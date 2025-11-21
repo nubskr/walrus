@@ -1,10 +1,10 @@
 use anyhow::{bail, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
-use walrus_rust::{disable_fd_backend, Entry, Walrus};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
+use walrus_rust::{Entry, Walrus};
 
 pub const DATA_NAMESPACE: &str = "data_plane";
 
@@ -30,6 +30,7 @@ impl PartitionId {
 pub struct BucketService {
     engine: Arc<Walrus>,
     active_leases: RwLock<HashSet<String>>,
+    write_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl BucketService {
@@ -42,7 +43,7 @@ impl BucketService {
 
         // io_uring is unavailable in many containerized environments; allow opting into mmap.
         if std::env::var("WALRUS_DISABLE_IO_URING").is_ok() {
-            disable_fd_backend();
+            // disable_fd_backend();
         }
         std::env::set_var("WALRUS_DATA_DIR", &storage_path);
 
@@ -51,6 +52,7 @@ impl BucketService {
         Ok(Self {
             engine,
             active_leases: RwLock::new(HashSet::new()),
+            write_locks: RwLock::new(HashMap::new()),
         })
     }
 
@@ -70,7 +72,7 @@ impl BucketService {
         {
             let leases = self.active_leases.read().await;
             if !leases.contains(&key) {
-                tracing::warn!("Write rejected for {} (missing lease)", key);
+                warn!("Write rejected for {} (missing lease)", key);
                 bail!("NotLeaderForPartition: {}", key);
             }
         }
@@ -97,9 +99,15 @@ impl BucketService {
         {
             let leases = self.active_leases.read().await;
             if !leases.contains(wal_key) {
+                warn!(
+                    "append_by_key missing lease for {} (leases: {:?})",
+                    wal_key, leases
+                );
                 bail!("NotLeaderForPartition: {}", wal_key);
             }
         }
+        let lock = self.lock_for_key(wal_key).await;
+        let _guard = lock.lock().await;
         let engine = self.engine.clone();
         let key = wal_key.to_string();
         tokio::task::spawn_blocking(move || engine.batch_append_for_topic(&key, &[&data]))
@@ -123,6 +131,17 @@ impl BucketService {
         for key in expected.iter() {
             leases.insert(key.clone());
         }
+    }
+
+    async fn lock_for_key(&self, key: &str) -> Arc<Mutex<()>> {
+        if let Some(existing) = self.write_locks.read().await.get(key).cloned() {
+            return existing;
+        }
+        let mut guard = self.write_locks.write().await;
+        guard
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn grant_key(&self, key: String) {

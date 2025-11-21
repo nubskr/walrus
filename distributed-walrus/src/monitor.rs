@@ -30,6 +30,14 @@ impl Monitor {
         let mut interval = tokio::time::interval(check_interval());
         loop {
             interval.tick().await;
+            if self
+                .controller
+                .test_fail_monitor
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                error!("monitor in forced error mode");
+                continue;
+            }
             if let Err(e) = self.check_rollovers().await {
                 error!("rollover check failed: {e}");
             }
@@ -41,11 +49,20 @@ impl Monitor {
 
     async fn check_rollovers(&self) -> Result<()> {
         let root = self.wal_root();
-        let size = match dir_size(&root).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("dir_size failed for {:?}: {}", root, e);
-                return Ok(());
+        let size = if self
+            .controller
+            .test_fail_dir_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            error!("dir_size forced failure for {:?}", root);
+            return Ok(());
+        } else {
+            match dir_size(&root).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("dir_size failed for {:?}: {}", root, e);
+                    return Ok(());
+                }
             }
         };
         if size <= max_segment_size() {
@@ -77,6 +94,13 @@ impl Monitor {
     }
 
     async fn run_gc(&self) -> Result<()> {
+        if self
+            .controller
+            .test_fail_gc
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(anyhow::anyhow!("forced gc failure"));
+        }
         let state = self.controller.metadata.snapshot_state();
         let root = self.wal_root();
 

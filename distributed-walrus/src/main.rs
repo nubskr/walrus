@@ -25,14 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let node_config = NodeConfig::parse();
     // LogTracer::init().expect("Failed to set log tracer");
 
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env());
+    let subscriber = fmt::Subscriber::builder().with_env_filter(EnvFilter::from_default_env());
 
     if let Some(log_file_path) = &node_config.log_file {
         let file = std::fs::File::create(log_file_path)?;
-        subscriber
-            .with_writer(Arc::new(file))
-            .init();
+        subscriber.with_writer(Arc::new(file)).init();
     } else {
         subscriber.init();
     }
@@ -101,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
         metadata: metadata.clone(),
         raft: raft.clone(),
         offsets: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        test_fail_forward_read: std::sync::atomic::AtomicBool::new(false),
+        test_fail_monitor: std::sync::atomic::AtomicBool::new(false),
+        test_fail_dir_size: std::sync::atomic::AtomicBool::new(false),
+        test_fail_gc: std::sync::atomic::AtomicBool::new(false),
     });
 
     let controller_rpc = controller.clone();
@@ -153,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 partitions: 2,
                 initial_leader: 1,
             };
-            
+
             let mut attempts = 0;
             loop {
                 attempts += 1;
@@ -163,21 +164,24 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     Err(e) => {
-                        error!("CreateTopic failed (attempt {}): {}. Retrying in 2s...", attempts, e);
+                        error!(
+                            "CreateTopic failed (attempt {}): {}. Retrying in 2s...",
+                            attempts, e
+                        );
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                 }
             }
 
             // Always rollover to self (1) initially since we don't know if peers joined yet
-            let next_leader = 1; 
+            let next_leader = 1;
             info!("--- Rollover partition to Node {} ---", next_leader);
             let roll = MetadataCmd::RolloverPartition {
                 name: "logs".into(),
                 partition: 0,
                 new_leader: next_leader,
             };
-            
+
             loop {
                 match raft.propose(bincode::serialize(&roll)?).await {
                     Ok(_) => break,
@@ -216,9 +220,8 @@ async fn main() -> anyhow::Result<()> {
             addr: my_addr,
         };
         let payload = bytes::Bytes::from(bincode::serialize(&op)?);
-        let target_sock: std::net::SocketAddr = join_target_resolved.ok_or_else(|| {
-            anyhow::anyhow!("could not resolve join target {}", join_target)
-        })?;
+        let target_sock: std::net::SocketAddr = join_target_resolved
+            .ok_or_else(|| anyhow::anyhow!("could not resolve join target {}", join_target))?;
 
         let rpc = raft.rpc_handler();
         let mut joined = false;
