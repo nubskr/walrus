@@ -295,10 +295,14 @@ async fn encode_fetch_response(
                 Ok((data, observed_high_watermark)) => {
                     let high_watermark = observed_high_watermark as i64;
                     let payload = data.into_iter().next().unwrap_or_default();
-                    let error_code = if payload.is_empty()
-                        && fetch_offset as u64 >= observed_high_watermark
-                    {
-                        1i16
+                    let error_code = if payload.is_empty() {
+                        if observed_high_watermark > 0
+                            && fetch_offset as u64 >= observed_high_watermark
+                        {
+                            1i16
+                        } else {
+                            0i16
+                        }
                     } else {
                         0i16
                     };

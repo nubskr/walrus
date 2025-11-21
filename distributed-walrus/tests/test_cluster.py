@@ -1505,12 +1505,13 @@ def test_fetch_respects_offsets_and_payloads_from_leader():
     if items0[0]["payload"]:
         assert items0[0]["payload"] in payloads, f"unexpected payload at offset 0: {items0[0]['payload']}"
 
-    # Offset 2 should surface the third entry.
-    fetch2 = send_frame_with_retry(*NODES[1], make_fetch_with_offset("logs", 1, 2))
+    # Offset at the start of the third entry (byte offsets).
+    offset_third = sum(len(p) for p in payloads[:2])
+    fetch2 = send_frame_with_retry(*NODES[1], make_fetch_with_offset("logs", 1, offset_third))
     items2 = decode_fetch(fetch2 or b"")
     assert items2 and items2[0]["error_code"] == 0
     if items2[0]["payload"]:
-        assert items2[0]["payload"] in payloads, f"unexpected payload at offset 2: {items2[0]['payload']}"
+        assert items2[0]["payload"] in payloads, f"unexpected payload at offset {offset_third}: {items2[0]['payload']}"
 
 
 @pytest.mark.soak
