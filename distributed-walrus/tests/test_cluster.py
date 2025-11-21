@@ -1228,10 +1228,16 @@ def test_fetch_payload_and_offsets_from_leader():
     assert items0 and items0[0]["error_code"] == 0
     assert items0[0]["payload"].startswith(b"FIRST") or items0[0]["payload"] == b""
 
-    # Offset 1 should return the second payload
+    # Offsets are byte-based; use the length of the first payload to reach the second one.
+    second_offset = len(b"FIRST")
     header = struct.pack(">hhih", 1, 0, 100, 4) + b"test"
     body = struct.pack(">iii", -1, 0, 0) + struct.pack(">i", 1) + kafka_string(topic)
-    body += struct.pack(">i", 1) + struct.pack(">i", 0) + struct.pack(">q", 1) + struct.pack(">i", 4096)
+    body += (
+        struct.pack(">i", 1)
+        + struct.pack(">i", 0)
+        + struct.pack(">q", second_offset)
+        + struct.pack(">i", 4096)
+    )
     fetch1 = send_frame_with_retry(*NODES[1], struct.pack(">i", len(header + body)) + header + body)
     items1 = decode_fetch(fetch1 or b"")
     assert items1 and items1[0]["error_code"] == 0
@@ -2249,7 +2255,7 @@ def test_historical_fetch_reads_from_sealed_generation():
 
 def test_read_entire_multi_rollover_history():
     """
-    Write ~3GB to a topic (enough to trigger many rollovers with tiny segment threshold),
+    Write ~3GB to a topic (enough to trigger many rollovers with tiny segment threshold; override with WALRUS_HISTORY_STRESS_TARGET_MB),
     then sequentially fetch from offset 0 to the high watermark to ensure all bytes are readable.
     """
     ensure_cluster_ready(timeout=180)
@@ -2267,8 +2273,9 @@ def test_read_entire_multi_rollover_history():
     wait_for_topics([topic], timeout=60)
     send_test_control(2)  # sync leases for the new topic
 
-    chunk_size = 8 * 1024 * 1024  # 8MiB per record (will shrink on repeated failures)
-    target_bytes = 3 * 1024 * 1024 * 1024  # 3GiB
+    target_mb = int(os.getenv("WALRUS_HISTORY_STRESS_TARGET_MB", "3072"))
+    target_bytes = target_mb * 1024 * 1024
+    chunk_size = min(8 * 1024 * 1024, target_bytes)  # shrink automatically for smaller targets
 
     sent = 0
     while sent < target_bytes:
@@ -2320,7 +2327,7 @@ def test_read_entire_multi_rollover_history():
 
 def test_produce_large_payloads_up_to_cap():
     """
-    Produce increasingly large payloads (1MB doubling up to WALRUS_LARGE_PAYLOAD_MAX_MB, default 64MB)
+    Produce increasingly large payloads (1MB doubling up to WALRUS_LARGE_PAYLOAD_MAX_MB, capped at 900MB)
     and ensure the cluster accepts and serves them.
     """
     ensure_cluster_ready(timeout=180)
@@ -2332,7 +2339,7 @@ def test_produce_large_payloads_up_to_cap():
     wait_for_topics([topic], timeout=60)
     send_test_control(2)  # sync leases for the new topic
 
-    max_mb = int(os.getenv("WALRUS_LARGE_PAYLOAD_MAX_MB", "64"))
+    max_mb = min(int(os.getenv("WALRUS_LARGE_PAYLOAD_MAX_MB", "900")), 900)
     sizes_mb = []
     size = 1
     while size <= max_mb:
