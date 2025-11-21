@@ -14,6 +14,7 @@ TESTS := \
 	test_metadata_connectivity \
 	test_followers_forward_produce_to_leader \
 	test_metadata_filtered_request_returns_only_logs \
+	test_metadata_filtered_unknown_topic_returns_empty \
 	test_api_versions_support_known_keys \
 	test_produce_unknown_topic_returns_error_and_no_disk_change \
 	test_produce_invalid_partition_returns_error_and_no_disk_change \
@@ -27,11 +28,13 @@ TESTS := \
 	test_fetch_invalid_partition_returns_error \
 	test_create_topic_invalid_replication_factor_returns_error \
 	test_create_topic_invalid_partitions_returns_error \
+	test_create_topic_from_follower_rejected_when_not_leader \
 	test_create_topic_duplicate_rejected \
 	test_partition_one_produce_and_fetch \
 	test_restart_preserves_data_and_leadership \
 	test_monitor_rollover_and_gc_removes_old_generation \
 	test_internal_state_reports_leader_and_generation \
+	test_internal_state_filtered_unknown_topic_returns_empty \
 	test_hot_join_node4_reports_metadata \
 	test_fetch_respects_offsets_and_payloads_from_leader \
 	test_leader_failover_timeout_then_recovery \
@@ -43,6 +46,7 @@ TESTS := \
 	test_produce_after_rollover_generation_advances \
 	test_hot_join_rejoin_promotes_node4 \
 	test_remove_node_from_membership_and_continue_io \
+	test_membership_request_on_follower_returns_not_leader_error \
 	test_remove_node_with_invalid_op_returns_error \
 	test_remove_nonexistent_node_is_tolerated \
 	test_forward_read_error_path_and_retry_append_on_missing_lease \
@@ -50,9 +54,14 @@ TESTS := \
 	test_test_control_unknown_op_returns_error \
 	test_monitor_force_error_flag_and_recovery \
 	test_monitor_dir_size_error_path \
-	test_monitor_gc_error_path
+	test_monitor_gc_error_path \
+	test_lease_revocation_blocks_then_sync_allows_and_serializes_writes \
+	test_malformed_produce_frame_returns_error \
+	test_negative_record_set_size_rejected \
+	test_follower_fetch_survives_monitor_rollover_and_gc \
+	test_join_cluster_duplicate_node_id_is_tolerated_and_cluster_continues_io
 
-.PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests $(TESTS)
+.PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long cluster-up cluster-down cluster-restart cluster-logs $(TESTS)
 
 deps: $(VENV)/.deps-installed
 
@@ -91,3 +100,19 @@ soak-test: soak-tests
 
 soak-tests: deps
 	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak $(PYFLAGS)
+
+soak-test-long: deps
+	@SKIP_BUILD=$(SKIP_BUILD) $(PYTEST) tests/test_cluster.py -m soak_long $(PYFLAGS)
+
+cluster-up:
+	docker compose -f docker-compose.yml up --build -d
+
+cluster-down:
+	docker compose -f docker-compose.yml down -v
+
+cluster-restart:
+	$(MAKE) cluster-down
+	$(MAKE) cluster-up
+
+cluster-logs:
+	docker compose -f docker-compose.yml logs -f

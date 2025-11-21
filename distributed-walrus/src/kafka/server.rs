@@ -338,6 +338,9 @@ fn encode_api_versions_response(res: &mut BytesMut) {
         (50, 0),
         (51, 0),
         (60, 0),
+        (61, 0),
+        (62, 0),
+        (63, 0),
     ];
     res.put_i32(supported.len() as i32);
     for (api, version) in supported {
