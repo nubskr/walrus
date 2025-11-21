@@ -1,5 +1,5 @@
 use crate::bucket::BucketService;
-use crate::metadata::{MetadataStateMachine, NodeId};
+use crate::metadata::{MetadataStateMachine, NodeId, PartitionState, SegmentRecord};
 use crate::rpc::TestControl;
 use crate::rpc::{InternalOp, InternalResp};
 use anyhow::{anyhow, bail, Result};
@@ -40,10 +40,11 @@ impl NodeController {
         match op {
             InternalOp::ForwardAppend { wal_key, data } => {
                 self.sync_leases_now().await;
+                let data_len = data.len() as u64;
                 match self.append_with_retry(&wal_key, data).await {
                     Ok(_) => {
                         tracing::info!("handle_rpc: append success for {}", wal_key);
-                        self.record_append(&wal_key).await;
+                        self.record_append(&wal_key, data_len).await;
                         InternalResp::Ok
                     }
                     Err(e) => {
@@ -52,13 +53,25 @@ impl NodeController {
                     }
                 }
             }
-            InternalOp::ForwardRead { wal_key, max_bytes } => {
+            InternalOp::ForwardRead {
+                wal_key,
+                start_offset,
+                max_bytes,
+            } => {
                 if self.test_fail_forward_read.load(Ordering::Relaxed) {
                     return InternalResp::Error("forced forward read failure".into());
                 }
-                match self.bucket.read_by_key(&wal_key, max_bytes).await {
+                let Some((topic, partition, _)) = parse_wal_key(&wal_key) else {
+                    return InternalResp::Error("invalid wal_key".into());
+                };
+                match self
+                    .bucket
+                    .read_by_key_from_offset(&wal_key, start_offset, max_bytes)
+                    .await
+                {
                     Ok(entries) => {
-                        let high_watermark = self.current_high_watermark(&wal_key).await;
+                        let high_watermark =
+                            self.partition_high_watermark(&topic, partition).await;
                         let data = entries.into_iter().map(|e| e.data).collect();
                         InternalResp::ReadResult {
                             data,
@@ -150,8 +163,9 @@ impl NodeController {
             tracing::info!("writing locally on node {}", self.node_id);
             // Ensure local bucket has the latest leases from metadata before appending.
             self.sync_leases_now().await;
+            let bytes = data.len() as u64;
             self.append_with_retry(&key, data).await?;
-            self.record_append(&key).await;
+            self.record_append(&key, bytes).await;
         } else {
             let addr = self
                 .raft
@@ -196,106 +210,34 @@ impl NodeController {
         &self,
         topic: &str,
         partition: u32,
+        req_offset: u64,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let (leader, generation) = self
+        let state = self
             .metadata
-            .get_partition_leader(topic, partition)
+            .get_partition_state(topic, partition)
             .ok_or_else(|| anyhow!("unknown topic/partition"))?;
-        let key = wal_key(topic, partition, generation);
-        tracing::info!(
-            "route_and_read topic={} partition={} leader={} gen={} key={}",
-            topic,
-            partition,
-            leader,
-            generation,
-            key
-        );
+        let head_start = state.history.last().map(|s| s.end_offset).unwrap_or(0);
 
-        if leader == self.node_id {
-            tracing::info!("reading locally on node {}", self.node_id);
-            let entries = self.bucket.read_by_key(&key, max_bytes).await?;
-            let watermark = self
-                .current_high_watermark(&key)
-                .await
-                .max(entries.len() as u64);
-            Ok((entries.into_iter().map(|e| e.data).collect(), watermark))
-        } else {
-            let addr = self
-                .raft
-                .peer_addr_for(leader)
-                .await
-                .ok_or_else(|| anyhow!("missing peer address for {}", leader))?;
-            tracing::info!("forwarding read to leader {} at {}", leader, addr);
-            let fwd_key = key.clone();
-            let op = InternalOp::ForwardRead {
-                wal_key: fwd_key,
-                max_bytes,
-            };
-            let payload = Bytes::from(bincode::serialize(&op)?);
-            let forwarded = timeout(
-                Self::forward_timeout(),
-                self.raft.rpc_handler().request(
-                    addr,
-                    RequestPayload::Custom {
-                        operation: "Forward".into(),
-                        data: payload,
-                    },
-                    Self::forward_timeout(),
-                ),
-            )
-            .await;
-            let resp = match forwarded {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    warn!(
-                        "forward read to leader {} at {} failed: {}",
-                        leader, addr, e
-                    );
-                    let watermark = self.current_high_watermark(&key).await;
-                    return Ok((Vec::new(), watermark));
-                }
-                Err(_) => {
-                    warn!(
-                        "forward read to leader {} at {} timed out after {:?}",
-                        leader,
-                        addr,
-                        Self::forward_timeout()
-                    );
-                    let watermark = self.current_high_watermark(&key).await;
-                    return Ok((Vec::new(), watermark));
-                }
-            };
-            match resp.payload {
-                ResponsePayload::CustomResponse { data, .. } => {
-                    match bincode::deserialize::<InternalResp>(&data) {
-                        Ok(InternalResp::ReadResult {
-                            data,
-                            high_watermark,
-                        }) => Ok((data, high_watermark)),
-                        Ok(InternalResp::Error(e)) => {
-                            warn!(
-                                "forward read to leader {} at {} returned error: {}",
-                                leader, addr, e
-                            );
-                            Ok((Vec::new(), self.current_high_watermark(&key).await))
-                        }
-                        Ok(other) => {
-                            warn!("unexpected response {:?}", other);
-                            Ok((Vec::new(), self.current_high_watermark(&key).await))
-                        }
-                        Err(e) => {
-                            warn!("failed to decode forward read response: {}", e);
-                            Ok((Vec::new(), self.current_high_watermark(&key).await))
-                        }
-                    }
-                }
-                other => {
-                    warn!("unexpected response: {:?}", other);
-                    Ok((Vec::new(), self.current_high_watermark(&key).await))
-                }
-            }
+        if req_offset >= head_start {
+            let local_offset = req_offset - head_start;
+            return self
+                .read_active_head(topic, partition, &state, local_offset, max_bytes)
+                .await;
         }
+
+        if let Some(seg) = state
+            .history
+            .iter()
+            .find(|s| req_offset >= s.start_offset && req_offset < s.end_offset)
+        {
+            let local_offset = req_offset - seg.start_offset;
+            return self
+                .read_historical_segment(topic, partition, &state, seg, local_offset, max_bytes)
+                .await;
+        }
+
+        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
     }
 
     pub async fn sync_leases_now(&self) {
@@ -321,30 +263,239 @@ impl NodeController {
         }
     }
 
-    async fn record_append(&self, wal_key: &str) -> u64 {
-        let mut guard = self.offsets.write().await;
-        let entry = guard.entry(wal_key.to_string()).or_insert(0);
-        *entry += 1;
-        *entry
-    }
+    async fn read_active_head(
+        &self,
+        topic: &str,
+        partition: u32,
+        state: &PartitionState,
+        local_offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let leader = state.leader_node;
+        let wal_key = wal_key(topic, partition, state.current_generation);
+        tracing::info!(
+            "route_and_read head topic={} partition={} leader={} gen={} key={} offset={}",
+            topic,
+            partition,
+            leader,
+            state.current_generation,
+            wal_key,
+            local_offset
+        );
 
-    async fn current_high_watermark(&self, wal_key: &str) -> u64 {
-        let guard = self.offsets.read().await;
-        if let Some(hw) = guard.get(wal_key) {
-            return *hw;
+        if leader == self.node_id {
+            tracing::info!("reading head locally on node {}", self.node_id);
+            let entries = self
+                .bucket
+                .read_by_key_from_offset(&wal_key, local_offset, max_bytes)
+                .await?;
+            let watermark = self.partition_high_watermark(topic, partition).await;
+            return Ok((entries.into_iter().map(|e| e.data).collect(), watermark));
         }
-        if let Some((topic, partition, _)) = parse_wal_key(wal_key) {
-            let prefix = format!("t_{}_p_{}", topic, partition);
-            if let Some(max_seen) = guard
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix))
-                .map(|(_, v)| *v)
-                .max()
-            {
-                return max_seen;
+
+        let addr = self
+            .raft
+            .peer_addr_for(leader)
+            .await
+            .ok_or_else(|| anyhow!("missing peer address for {}", leader))?;
+        tracing::info!("forwarding read to leader {} at {}", leader, addr);
+        let op = InternalOp::ForwardRead {
+            wal_key: wal_key.clone(),
+            start_offset: local_offset,
+            max_bytes,
+        };
+        let payload = Bytes::from(bincode::serialize(&op)?);
+        let forwarded = timeout(
+            Self::forward_timeout(),
+            self.raft.rpc_handler().request(
+                addr,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: payload,
+                },
+                Self::forward_timeout(),
+            ),
+        )
+        .await;
+        let resp = match forwarded {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                warn!(
+                    "forward read to leader {} at {} failed: {}",
+                    leader, addr, e
+                );
+                let watermark = self.partition_high_watermark(topic, partition).await;
+                return Ok((Vec::new(), watermark));
+            }
+            Err(_) => {
+                warn!(
+                    "forward read to leader {} at {} timed out after {:?}",
+                    leader,
+                    addr,
+                    Self::forward_timeout()
+                );
+                let watermark = self.partition_high_watermark(topic, partition).await;
+                return Ok((Vec::new(), watermark));
+            }
+        };
+
+        match resp.payload {
+            ResponsePayload::CustomResponse { data, .. } => {
+                match bincode::deserialize::<InternalResp>(&data) {
+                    Ok(InternalResp::ReadResult {
+                        data,
+                        high_watermark,
+                    }) => Ok((data, high_watermark)),
+                    Ok(InternalResp::Error(e)) => {
+                        warn!(
+                            "forward read to leader {} at {} returned error: {}",
+                            leader, addr, e
+                        );
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                    Ok(other) => {
+                        warn!("unexpected response {:?}", other);
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                    Err(e) => {
+                        warn!("failed to decode forward read response: {}", e);
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                }
+            }
+            other => {
+                warn!("unexpected response: {:?}", other);
+                Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
             }
         }
-        0
+    }
+
+    async fn read_historical_segment(
+        &self,
+        topic: &str,
+        partition: u32,
+        _state: &PartitionState,
+        segment: &SegmentRecord,
+        local_offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let wal_key = wal_key(topic, partition, segment.generation);
+        tracing::info!(
+            "route_and_read history topic={} partition={} gen={} node={} key={} offset={}",
+            topic,
+            partition,
+            segment.generation,
+            segment.stored_on_node,
+            wal_key,
+            local_offset
+        );
+
+        if segment.stored_on_node == self.node_id {
+            let entries = self
+                .bucket
+                .read_by_key_from_offset(&wal_key, local_offset, max_bytes)
+                .await?;
+            let watermark = self.partition_high_watermark(topic, partition).await;
+            return Ok((entries.into_iter().map(|e| e.data).collect(), watermark));
+        }
+
+        let addr = self
+            .raft
+            .peer_addr_for(segment.stored_on_node)
+            .await
+            .ok_or_else(|| anyhow!("missing peer address for {}", segment.stored_on_node))?;
+
+        let op = InternalOp::ForwardRead {
+            wal_key: wal_key.clone(),
+            start_offset: local_offset,
+            max_bytes,
+        };
+        let payload = Bytes::from(bincode::serialize(&op)?);
+        let forwarded = timeout(
+            Self::forward_timeout(),
+            self.raft.rpc_handler().request(
+                addr,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: payload,
+                },
+                Self::forward_timeout(),
+            ),
+        )
+        .await;
+        let resp = match forwarded {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                warn!(
+                    "forward read to node {} at {} failed: {}",
+                    segment.stored_on_node, addr, e
+                );
+                let watermark = self.partition_high_watermark(topic, partition).await;
+                return Ok((Vec::new(), watermark));
+            }
+            Err(_) => {
+                warn!(
+                    "forward read to node {} at {} timed out after {:?}",
+                    segment.stored_on_node,
+                    addr,
+                    Self::forward_timeout()
+                );
+                let watermark = self.partition_high_watermark(topic, partition).await;
+                return Ok((Vec::new(), watermark));
+            }
+        };
+
+        match resp.payload {
+            ResponsePayload::CustomResponse { data, .. } => {
+                match bincode::deserialize::<InternalResp>(&data) {
+                    Ok(InternalResp::ReadResult {
+                        data,
+                        high_watermark,
+                    }) => Ok((data, high_watermark)),
+                    Ok(InternalResp::Error(e)) => {
+                        warn!(
+                            "forward read to node {} at {} returned error: {}",
+                            segment.stored_on_node, addr, e
+                        );
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                    Ok(other) => {
+                        warn!("unexpected response {:?}", other);
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                    Err(e) => {
+                        warn!("failed to decode forward read response: {}", e);
+                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                    }
+                }
+            }
+            other => {
+                warn!("unexpected response: {:?}", other);
+                Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+            }
+        }
+    }
+
+    pub async fn partition_high_watermark(&self, topic: &str, partition: u32) -> u64 {
+        let Some(state) = self.metadata.get_partition_state(topic, partition) else {
+            return 0;
+        };
+        let head_start = state.history.last().map(|s| s.end_offset).unwrap_or(0);
+        let key = wal_key(topic, partition, state.current_generation);
+        let active_bytes = self.active_bytes_for_key(&key).await;
+        head_start + active_bytes
+    }
+
+    async fn active_bytes_for_key(&self, wal_key: &str) -> u64 {
+        let guard = self.offsets.read().await;
+        guard.get(wal_key).copied().unwrap_or(0)
+    }
+
+    async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
+        let mut guard = self.offsets.write().await;
+        let entry = guard.entry(wal_key.to_string()).or_insert(0);
+        *entry += bytes;
+        *entry
     }
 
     async fn append_with_retry(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {

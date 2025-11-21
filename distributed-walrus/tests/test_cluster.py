@@ -269,7 +269,7 @@ def make_create_topics_request_with_partitions(topics: list[tuple[str, int]], pa
 
 
 def make_create_topics_request_with_assignment_and_configs(
-    topic: str, correlation_id: int = 15, config: tuple[str, str] | None = None
+    topic: str, correlation_id: int = 15, config: Optional[tuple[str, str]] = None
 ) -> bytes:
     """
     CreateTopics payload that includes replica assignments and configs to exercise decoding paths.
@@ -457,6 +457,19 @@ def data_plane_size_bytes(node_id: int) -> int:
     root = data_plane_root(node_id)
     total = 0
     for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            try:
+                total += os.path.getsize(Path(dirpath) / name)
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for dirpath, _, filenames in os.walk(path):
         for name in filenames:
             try:
                 total += os.path.getsize(Path(dirpath) / name)
@@ -2175,6 +2188,170 @@ def test_periodic_lease_sync_loop_restores_revoked_leases():
         return all(code == 0 for code in codes)
 
     wait_until(lease_restored, timeout=15.0, interval=0.5, msg="lease sync loop did not restore leases")
+
+
+def test_historical_fetch_reads_from_sealed_generation():
+    """
+    After a monitor-triggered rollover, fetch offset 0 should be served from the sealed segment,
+    and fetching at the sealed segment's end should reach the active head.
+    """
+    ensure_cluster_ready(timeout=180)
+    # Disable GC so sealed segments remain for the duration of this test.
+    resp = send_test_control(63)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    assert decode_test_control_code(resp) is not None
+
+    topic = f"history-{uuid4().hex[:6]}"
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+
+    old_payload = b"HIST_OLD" * 12000  # ~96KB to exceed rollover threshold
+    # Drive rollover by writing large batches until generation advances.
+    start = time.time()
+    while time.time() - start < 30:
+        produce_and_assert_ok(NODES[1], topic, old_payload, partition=0)
+        gens = list_generations(1, topic)
+        if gens and max(gens) >= 2:
+            break
+        time.sleep(1.0)
+    gens = list_generations(1, topic)
+    assert gens and max(gens) >= 2, "rollover to generation 2 did not occur"
+
+    sealed_dir = data_plane_root(1) / f"t_{topic}_p_0_g_1"
+    sealed_bytes = dir_size(sealed_dir)
+    assert sealed_bytes > 0, f"sealed segment size should be >0, got {sealed_bytes}"
+
+    head_payload = b"HEAD_AFTER_ROLLOVER"
+    produce_and_assert_ok(NODES[1], topic, head_payload, partition=0)
+
+    # Offset 0 should target the sealed segment.
+    history_fetch = decode_fetch(
+        send_frame_with_retry(*NODES[1], make_fetch_with_offset(topic, 0, 0, max_bytes=4096)) or b""
+    )
+    assert history_fetch and history_fetch[0]["error_code"] == 0
+    assert history_fetch[0]["payload"], "historical fetch returned empty payload"
+    assert history_fetch[0]["payload"].startswith(b"HIST_OLD")
+
+    # Fetch starting at the sealed segment's end should reach the active head.
+    head_fetch = decode_fetch(
+        send_frame_with_retry(
+            *NODES[1], make_fetch_with_offset(topic, 0, sealed_bytes, max_bytes=4096)
+        )
+        or b""
+    )
+    assert head_fetch and head_fetch[0]["error_code"] == 0
+    assert head_fetch[0]["payload"], "head fetch returned empty payload"
+    assert head_fetch[0]["payload"].startswith(head_payload)
+
+
+def test_read_entire_multi_rollover_history():
+    """
+    Write ~3GB to a topic (enough to trigger many rollovers with tiny segment threshold),
+    then sequentially fetch from offset 0 to the high watermark to ensure all bytes are readable.
+    """
+    ensure_cluster_ready(timeout=180)
+    # Disable GC to preserve sealed segments for the duration of this test.
+    resp = send_test_control(63)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    assert decode_test_control_code(resp) is not None
+
+    topic = f"history-full-{uuid4().hex[:6]}"
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+    wait_for_topics([topic], timeout=60)
+    send_test_control(2)  # sync leases for the new topic
+
+    chunk_size = 8 * 1024 * 1024  # 8MiB per record (will shrink on repeated failures)
+    target_bytes = 3 * 1024 * 1024 * 1024  # 3GiB
+
+    sent = 0
+    while sent < target_bytes:
+        retries = 0
+        payload = b"Z" * chunk_size
+        while True:
+            resp = send_frame_with_retry(*NODES[1], make_produce_request(topic, payload, partition=0))
+            assert resp, "produce returned no response"
+            codes = parse_produce_error_codes(resp)
+            if all(code == 0 for code in codes):
+                break
+            retries += 1
+            if retries >= 5:
+                # If we consistently fail, shrink the chunk size and retry.
+                chunk_size = max(chunk_size // 2, 128 * 1024)
+                payload = b"Z" * chunk_size
+                retries = 0
+                continue
+            time.sleep(1.0)
+            send_test_control(2)  # sync leases and retry
+        sent += chunk_size
+
+    # Allow monitor to observe rollovers and metadata to settle.
+    time.sleep(5)
+
+    # Sequentially read the entire history from offset 0.
+    offset = 0
+    read_total = 0
+    max_bytes = chunk_size
+    high_watermark_seen = 0
+
+    while read_total < target_bytes:
+        fetch = decode_fetch(
+            send_frame_with_retry(
+                *NODES[1], make_fetch_with_offset(topic, 0, offset, max_bytes=max_bytes)
+            )
+            or b""
+        )
+        assert fetch and fetch[0]["error_code"] == 0, f"fetch error at offset {offset}: {fetch}"
+        payload_bytes = fetch[0]["payload"]
+        assert payload_bytes, f"empty payload at offset {offset}"
+        high_watermark_seen = max(high_watermark_seen, fetch[0]["high_watermark"])
+        offset += len(payload_bytes)
+        read_total += len(payload_bytes)
+
+    assert read_total >= target_bytes, f"read {read_total} < target {target_bytes}"
+    assert high_watermark_seen >= target_bytes, f"high watermark {high_watermark_seen} below target {target_bytes}"
+
+
+def test_produce_large_payloads_up_to_cap():
+    """
+    Produce increasingly large payloads (1MB doubling up to WALRUS_LARGE_PAYLOAD_MAX_MB, default 64MB)
+    and ensure the cluster accepts and serves them.
+    """
+    ensure_cluster_ready(timeout=180)
+    topic = f"large-{uuid4().hex[:6]}"
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+    wait_for_topics([topic], timeout=60)
+    send_test_control(2)  # sync leases for the new topic
+
+    max_mb = int(os.getenv("WALRUS_LARGE_PAYLOAD_MAX_MB", "64"))
+    sizes_mb = []
+    size = 1
+    while size <= max_mb:
+        sizes_mb.append(size)
+        size *= 2
+    assert sizes_mb, "no payload sizes generated"
+
+    total_bytes = 0
+    for size_mb in sizes_mb:
+        payload = bytes([size_mb % 256]) * (size_mb * 1024 * 1024)
+        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+        total_bytes += len(payload)
+
+    # Fetch from offset 0 and ensure we read something and high watermark covers total bytes.
+    fetch = decode_fetch(
+        send_frame_with_retry(*NODES[1], make_fetch_with_offset(topic, 0, 0, max_bytes=1024 * 1024)) or b""
+    )
+    assert fetch and fetch[0]["error_code"] == 0
+    assert fetch[0]["high_watermark"] >= total_bytes, "high watermark did not advance after large writes"
 
 
 def test_env_overrides_apply_to_monitor_rollover_and_retention():

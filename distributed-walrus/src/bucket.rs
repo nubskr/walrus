@@ -125,6 +125,39 @@ impl BucketService {
         Ok(entries)
     }
 
+    pub async fn read_by_key_from_offset(
+        &self,
+        wal_key: &str,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<Entry>> {
+        // Walrus does not expose random access reads today; best-effort by requesting
+        // enough bytes and trimming in-memory.
+        let offset_as_usize = usize::try_from(start_offset).unwrap_or(usize::MAX);
+        let fetch_bytes = max_bytes.saturating_add(offset_as_usize);
+        let entries = self.read_by_key(wal_key, fetch_bytes).await?;
+        if start_offset == 0 {
+            return Ok(entries);
+        }
+
+        let mut skipped = 0u64;
+        let mut out = Vec::new();
+        for mut entry in entries.into_iter() {
+            let len = entry.data.len() as u64;
+            if skipped + len <= start_offset {
+                skipped += len;
+                continue;
+            }
+            let within_entry = (start_offset - skipped) as usize;
+            let remaining = &entry.data[within_entry..];
+            let capped_len = remaining.len().min(max_bytes);
+            entry.data = remaining[..capped_len].to_vec();
+            out.push(entry);
+            break;
+        }
+        Ok(out)
+    }
+
     pub async fn sync_leases(&self, expected: &HashSet<String>) {
         let mut leases = self.active_leases.write().await;
         leases.retain(|key| expected.contains(key));
