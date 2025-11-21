@@ -25,6 +25,9 @@ services:
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=32768
       - WALRUS_RETENTION_GENERATIONS=0
+      - WALRUS_MONITOR_CHECK_MS=1000
+      - WALRUS_MAX_SEGMENT_BYTES=32768
+      - WALRUS_RETENTION_GENERATIONS=0
     privileged: true
     security_opt:
       - seccomp:unconfined
@@ -59,6 +62,9 @@ services:
     environment:
       - RUST_LOG=info
       - WALRUS_DISABLE_IO_URING=1
+      - WALRUS_MONITOR_CHECK_MS=1000
+      - WALRUS_MAX_SEGMENT_BYTES=32768
+      - WALRUS_RETENTION_GENERATIONS=0
     privileged: true
     security_opt:
       - seccomp:unconfined
@@ -93,6 +99,9 @@ services:
     environment:
       - RUST_LOG=info
       - WALRUS_DISABLE_IO_URING=1
+      - WALRUS_MONITOR_CHECK_MS=1000
+      - WALRUS_MAX_SEGMENT_BYTES=32768
+      - WALRUS_RETENTION_GENERATIONS=0
     privileged: true
     security_opt:
       - seccomp:unconfined

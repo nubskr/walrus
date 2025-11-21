@@ -11,6 +11,7 @@ This guide covers how to bring up the reference 3‑node cluster, how to talk to
 ```
 cd distributed-walrus
 make cluster-up        # builds the image and starts node1–node3
+make cluster-bootstrap # same as cluster-up, but waits for Kafka ports to open
 make cluster-logs      # follow all node logs
 make cluster-down      # stop and remove containers + data volumes
 ```
@@ -64,6 +65,6 @@ Any Kafka client (Java, Go, Rust, Node, etc.) can be pointed at the same bootstr
 ## Testing and soak workloads
 - Run the full cluster test suite: `make all-tests`
 - Run short soak scenarios: `make soak-tests`
-- Run the long‑running mixed‑load soak (configurable via `SOAK_LONG_DURATION_SEC`): `make soak-test-long`
+- Run the long‑running mixed‑load soak (defaults to ~20 minutes; configurable via `SOAK_LONG_DURATION_SEC`): `make soak-test-long` or `make soak-test-20m`
 
 These tests exercise failure cases, leadership changes, GC, membership changes, follower reads, and both batch and non‑batch append paths in a 3‑node cluster.

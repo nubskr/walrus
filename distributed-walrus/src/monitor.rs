@@ -154,3 +154,46 @@ fn retention_generations() -> u64 {
     }
     DEFAULT_RETENTION_GENERATIONS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn check_interval_and_limits_respect_env_overrides() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("WALRUS_MONITOR_CHECK_MS", "5");
+        std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "42");
+        std::env::set_var("WALRUS_RETENTION_GENERATIONS", "3");
+
+        assert_eq!(check_interval(), Duration::from_millis(10)); // clamped to minimum
+        assert_eq!(max_segment_size(), 42);
+        assert_eq!(retention_generations(), 3);
+
+        std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
+        std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
+        std::env::remove_var("WALRUS_RETENTION_GENERATIONS");
+    }
+
+    #[test]
+    fn defaults_apply_for_invalid_env_values() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("WALRUS_MONITOR_CHECK_MS", "bogus");
+        std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "notanumber");
+        std::env::set_var("WALRUS_RETENTION_GENERATIONS", "-1");
+
+        assert_eq!(check_interval(), DEFAULT_CHECK_INTERVAL);
+        assert_eq!(max_segment_size(), DEFAULT_MAX_SEGMENT_SIZE);
+        assert_eq!(retention_generations(), DEFAULT_RETENTION_GENERATIONS);
+
+        std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
+        std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
+        std::env::remove_var("WALRUS_RETENTION_GENERATIONS");
+    }
+}
