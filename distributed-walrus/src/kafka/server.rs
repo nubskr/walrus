@@ -25,6 +25,9 @@ pub async fn run_server(port: u16, controller: Arc<NodeController>) -> Result<()
         tokio::spawn(async move {
             let mut buf = BytesMut::with_capacity(1024 * 1024);
             loop {
+                if buf.capacity() - buf.len() < 4096 {
+                    buf.reserve(1024 * 1024);
+                }
                 match socket.read_buf(&mut buf).await {
                     Ok(0) => break,
                     Ok(_) => {
@@ -32,6 +35,10 @@ pub async fn run_server(port: u16, controller: Arc<NodeController>) -> Result<()
                             let mut len_cursor = Cursor::new(&buf[..4]);
                             let frame_len = len_cursor.get_i32() as usize;
                             if buf.len() < 4 + frame_len {
+                                let needed = 4 + frame_len - buf.len();
+                                if buf.capacity() - buf.len() < needed {
+                                    buf.reserve(needed);
+                                }
                                 break;
                             }
                             buf.advance(4);

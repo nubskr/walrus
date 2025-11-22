@@ -43,7 +43,7 @@ impl BucketService {
 
         // io_uring is unavailable in many containerized environments; allow opting into mmap.
         if std::env::var("WALRUS_DISABLE_IO_URING").is_ok() {
-            // disable_fd_backend();
+            walrus_rust::disable_fd_backend();
         }
         std::env::set_var("WALRUS_DATA_DIR", &storage_path);
 
@@ -187,6 +187,10 @@ impl BucketService {
         info!("Revoking lease for {}", key);
         let mut leases = self.active_leases.write().await;
         leases.remove(&key);
+    }
+
+    pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64 {
+        self.engine.get_topic_size(wal_key)
     }
 }
 

@@ -114,6 +114,32 @@ impl Walrus {
         self.topic_clean_tracker.topic_is_clean(topic)
     }
 
+    pub fn get_topic_size(&self, topic: &str) -> u64 {
+        // 1. Get sealed size from reader
+        let sealed_size: u64 = if let Some(info_arc) = self.reader.data.read().ok().and_then(|m| m.get(topic).cloned()) {
+            if let Ok(info) = info_arc.read() {
+                info.chain.iter().map(|b| b.used).sum()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // 2. Get active size from writer
+        let active_size: u64 = if let Some(writer) = self.writers.read().ok().and_then(|m| m.get(topic).cloned()) {
+            if let Ok((_, offset)) = writer.snapshot_block() {
+                offset
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        sealed_size + active_size
+    }
+
     #[cfg(test)]
     pub(crate) fn force_flush_clean_markers_for_test(&self) -> std::io::Result<()> {
         self.topic_clean_tracker.force_flush_for_test()
@@ -401,6 +427,80 @@ mod tests {
             assert!(wal.topic_is_clean("beta"));
         }
 
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn test_batch_read_scanning() {
+        let key = unique_key();
+        // Ensure we use mmap backend for this test to match the "fix" environment
+        crate::wal::config::disable_fd_backend();
+        
+        let wal = Walrus::with_consistency_for_key(
+            &key,
+            ReadConsistency::StrictlyAtOnce,
+        ).unwrap();
+
+        // 1. Write a sequence of entries
+        let count = 100;
+        for i in 0..count {
+            let payload = format!("entry-{}", i);
+            wal.append_for_topic("scan_col", payload.as_bytes()).unwrap();
+        }
+
+        // 2. Read them back sequentially without checkpointing (cursor stays at 0)
+        // This simulates the `bucket.rs` behavior of reading from offset X by
+        // reading everything from 0 and skipping X bytes.
+        let mut offset = 0;
+        let mut total_read_entries = 0;
+        
+        loop {
+            // Read a batch from the *current cursor* (which is 0 because checkpoint=false)
+            // We ask for enough bytes to cover our offset + some data
+            let entries = wal.batch_read_for_topic("scan_col", offset + 1024, false).unwrap();
+            if entries.is_empty() {
+                break;
+            }
+
+            // Simulate "skipping" bytes to find the entry at `offset`
+            let mut current_pos = 0;
+            let mut found_new = false;
+            
+            for entry in entries {
+                let len = entry.data.len();
+                if current_pos >= offset {
+                    // This is a new entry we haven't "processed" yet
+                    // Verify content
+                    let payload = String::from_utf8(entry.data.clone()).unwrap();
+                    let expected = format!("entry-{}", total_read_entries);
+                    assert_eq!(payload, expected, "Data mismatch at entry index {}", total_read_entries);
+                    
+                    total_read_entries += 1;
+                    offset += len; // Advance our logical offset
+                    found_new = true;
+                    // In a real scenario we might stop here or consume more, 
+                    // but for this test let's read one-by-one to stress the loop
+                    break; 
+                }
+                current_pos += len;
+            }
+
+            if !found_new && total_read_entries < count {
+                // If we didn't find new data but expect more, it means batch size wasn't large enough
+                // or we are stuck. For this test, we increased batch size above so we should find it.
+                // If we reach here, it might be an infinite loop.
+                if total_read_entries == count {
+                    break; 
+                }
+                panic!("Stuck at offset {} with {} entries read", offset, total_read_entries);
+            }
+            
+            if total_read_entries == count {
+                break;
+            }
+        }
+
+        assert_eq!(total_read_entries, count);
         cleanup_key(&key);
     }
 }

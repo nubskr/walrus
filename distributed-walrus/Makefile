@@ -63,7 +63,10 @@ TESTS := \
 	test_follower_fetch_survives_monitor_rollover_and_gc \
 	test_join_cluster_duplicate_node_id_is_tolerated_and_cluster_continues_io \
 	test_periodic_lease_sync_loop_restores_revoked_leases \
-	test_env_overrides_apply_to_monitor_rollover_and_retention
+	test_env_overrides_apply_to_monitor_rollover_and_retention \
+	test_historical_fetch_reads_from_sealed_generation \
+	test_read_entire_multi_rollover_history \
+	test_produce_large_payloads_up_to_cap
 
 .PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long soak-test-20m cluster-up cluster-down cluster-restart cluster-logs cluster-bootstrap $(TESTS)
 
