@@ -36,7 +36,8 @@ pub enum FsyncSchedule {
 pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 10 * 1024 * 1024; // 10mb
 pub(crate) const BLOCKS_PER_FILE: u64 = 100;
 pub(crate) const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
-pub(crate) const PREFIX_META_SIZE: usize = 256;
+// Expose so integration tests can match the on-disk layout when poking raw files.
+pub const PREFIX_META_SIZE: usize = 256;
 pub(crate) const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
 pub(crate) const MAX_BATCH_ENTRIES: usize = 2000;
 pub(crate) const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total payload limit
