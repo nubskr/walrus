@@ -381,13 +381,14 @@ impl NodeController {
     ) -> Result<(Vec<Vec<u8>>, u64)> {
         let wal_key = wal_key(topic, partition, segment.generation);
         tracing::info!(
-            "route_and_read history topic={} partition={} gen={} node={} key={} offset={}",
+            "route_and_read history topic={} partition={} gen={} node={} key={} offset={} end_offset={}",
             topic,
             partition,
             segment.generation,
             segment.stored_on_node,
             wal_key,
-            local_offset
+            local_offset,
+            segment.end_offset
         );
 
         if segment.stored_on_node == self.node_id {
@@ -395,6 +396,7 @@ impl NodeController {
                 .bucket
                 .read_by_key_from_offset(&wal_key, local_offset, max_bytes)
                 .await?;
+            tracing::info!("read_historical_segment local: key={} entries={}", wal_key, entries.len());
             let watermark = self.partition_high_watermark(topic, partition).await;
             return Ok((entries.into_iter().map(|e| e.data).collect(), watermark));
         }

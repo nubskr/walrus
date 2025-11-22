@@ -131,12 +131,15 @@ impl Walrus {
             if let Ok((_, offset)) = writer.snapshot_block() {
                 offset
             } else {
+                debug_print!("[size_debug] writer snapshot failed for {}", topic);
                 0
             }
         } else {
+            debug_print!("[size_debug] writer not found for {}", topic);
             0
         };
-
+        
+        // debug_print!("[size_debug] {} sealed={} active={}", topic, sealed_size, active_size);
         sealed_size + active_size
     }
 
@@ -154,6 +157,8 @@ impl Walrus {
         } {
             return Ok(writer);
         }
+        
+        debug_print!("[writer_debug] creating new writer for {}", col_name);
 
         let mut map = self.writers.write().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
@@ -241,7 +246,9 @@ impl Walrus {
                 mmap.read(block_offset as usize, &mut meta_buf);
                 let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                    break;
+                    block_offset += DEFAULT_BLOCK_SIZE;
+                    next_block_id += 1;
+                    continue;
                 }
                 let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
                 aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
@@ -346,6 +353,11 @@ impl Walrus {
         for f in seen_files.into_iter() {
             flush_check(f);
         }
+        
+        unsafe {
+            self.allocator.fast_forward(next_block_id as u64);
+        }
+
         Ok(())
     }
 }
@@ -457,7 +469,7 @@ mod tests {
         loop {
             // Read a batch from the *current cursor* (which is 0 because checkpoint=false)
             // We ask for enough bytes to cover our offset + some data
-            let entries = wal.batch_read_for_topic("scan_col", offset + 1024, false).unwrap();
+            let entries = wal.batch_read_for_topic("scan_col", offset + 1024, false, None).unwrap();
             if entries.is_empty() {
                 break;
             }

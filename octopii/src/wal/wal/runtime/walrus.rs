@@ -182,7 +182,9 @@ impl Walrus {
                 let mut probe = [0u8; 8];
                 mmap.read(block_offset as usize, &mut probe);
                 if probe.iter().all(|&b| b == 0) {
-                    break;
+                    block_offset += DEFAULT_BLOCK_SIZE;
+                    next_block_id += 1;
+                    continue;
                 }
 
                 let mut used: u64 = 0;
@@ -192,7 +194,9 @@ impl Walrus {
                 mmap.read(block_offset as usize, &mut meta_buf);
                 let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                    break;
+                    block_offset += DEFAULT_BLOCK_SIZE;
+                    next_block_id += 1;
+                    continue;
                 }
                 let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
                 aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
@@ -297,6 +301,11 @@ impl Walrus {
         for f in seen_files.into_iter() {
             flush_check(f);
         }
+
+        unsafe {
+            self.allocator.fast_forward(next_block_id as u64);
+        }
+
         Ok(())
     }
 }

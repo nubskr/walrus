@@ -196,7 +196,7 @@ impl WalStorage {
         // Since hard_state entries are small, they should all fit in one batch
         const MAX_BATCH_BYTES: usize = 10_000_000; // 10MB - plenty for all hard states
 
-        match walrus.batch_read_for_topic(TOPIC_HARD_STATE_RECOVERY, MAX_BATCH_BYTES, false) {
+        match walrus.batch_read_for_topic(TOPIC_HARD_STATE_RECOVERY, MAX_BATCH_BYTES, false, None) {
             Ok(batch) => {
                 for entry in batch {
                     entry_count += 1;
@@ -231,7 +231,7 @@ impl WalStorage {
         // Read ALL conf_state entries in a single batch read with checkpoint=false
         const MAX_BATCH_BYTES: usize = 10_000_000; // 10MB - plenty for all conf states
 
-        match walrus.batch_read_for_topic(TOPIC_CONF_STATE_RECOVERY, MAX_BATCH_BYTES, false) {
+        match walrus.batch_read_for_topic(TOPIC_CONF_STATE_RECOVERY, MAX_BATCH_BYTES, false, None) {
             Ok(batch) => {
                 for entry in batch {
                     entry_count += 1;
@@ -328,7 +328,7 @@ impl WalStorage {
         // so we always read all entries from the beginning, regardless of checkpoint persistence
         // This ensures complete log recovery while still allowing cursor persistence for normal operations
         loop {
-            match walrus.batch_read_for_topic(TOPIC_LOG_RECOVERY, MAX_BATCH_BYTES, true) {
+            match walrus.batch_read_for_topic(TOPIC_LOG_RECOVERY, MAX_BATCH_BYTES, true, None) {
                 Ok(batch) if batch.is_empty() => break, // No more entries
                 Ok(batch) => {
                     for entry_data in batch {

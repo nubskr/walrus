@@ -66,7 +66,19 @@ TESTS := \
 	test_env_overrides_apply_to_monitor_rollover_and_retention \
 	test_historical_fetch_reads_from_sealed_generation \
 	test_read_entire_multi_rollover_history \
-	test_produce_large_payloads_up_to_cap
+	test_produce_large_payloads_up_to_cap \
+	test_throughput_3gb_write_read \
+	test_truncated_produce_frame_preserves_offsets_after_disconnect \
+	test_produce_negative_topic_count_drops_connection \
+	test_fetch_negative_topic_count_drops_connection \
+	test_unsupported_api_key_closes_connection_and_cluster_recovers \
+	test_membership_remove_current_leader_noop_and_io_continues \
+	test_weird_topic_name_is_sanitized_and_roundtrips \
+	test_metadata_negative_topic_count_returns_all_topics \
+	test_create_topic_consumes_assignments_and_configs \
+	test_soak_parallel_produce_multi_topics_and_cross_read \
+	test_soak_multi_client_produce_and_fetch_read_your_writes \
+	test_soak_long_running_mixed_load_survives
 
 .PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long soak-test-20m cluster-up cluster-down cluster-restart cluster-logs cluster-bootstrap $(TESTS)
 

@@ -361,6 +361,7 @@ impl Walrus {
         col_name: &str,
         max_bytes: usize,
         checkpoint: bool,
+        start_offset: Option<u64>,
     ) -> io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
@@ -388,102 +389,211 @@ impl Walrus {
             }
         };
 
-        // 1) Get or create reader info
-        let info_arc = if let Some(arc) = {
+        // 1) Prepare state (Chain + Position)
+        let held_arc: Option<Arc<RwLock<ColReaderInfo>>>;
+        
+        let (chain, mut cur_idx, mut cur_off, tail_block_id, tail_offset, mut info_guard, mut initial_trim, mut first_end_hint) = if let Some(req_offset) = start_offset {
+            held_arc = None;
+            // --- Stateless Read (Offset Provided) ---
             let map = self.reader.data.read().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
             })?;
-            map.get(col_name).cloned()
-        } {
-            arc
-        } else {
-            let mut map = self.reader.data.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned")
-            })?;
-            map.entry(col_name.to_string())
-                .or_insert_with(|| {
-                    Arc::new(RwLock::new(ColReaderInfo {
-                        chain: Vec::new(),
-                        cur_block_idx: 0,
-                        cur_block_offset: 0,
-                        reads_since_persist: 0,
-                        tail_block_id: 0,
-                        tail_offset: 0,
-                        hydrated_from_index: false,
-                    }))
-                })
-                .clone()
-        };
+            
+            let chain = if let Some(arc) = map.get(col_name) {
+                let guard = arc.read().map_err(|_| {
+                     io::Error::new(io::ErrorKind::Other, "col info read lock poisoned")
+                })?;
+                guard.chain.clone()
+            } else {
+                Vec::new()
+            };
 
-        let mut info = info_arc
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+            // Find block containing offset
+            let mut c_idx = 0;
+            let mut rem = req_offset;
+            let mut found = false;
+            
+            for (i, b) in chain.iter().enumerate() {
+                if rem < b.used {
+                    c_idx = i;
+                    found = true;
+                    break;
+                }
+                rem -= b.used;
+            }
+            
+            let mut c_off = 0;
+            let mut trim = 0;
+            let mut hint = 0; // Initialize hint here
 
-        // Hydrate from index if needed
-        let mut persisted_tail_for_fold: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
-        if !info.hydrated_from_index {
-            if let Ok(idx_guard) = self.read_offset_index.read() {
-                if let Some(pos) = idx_guard.get(col_name) {
-                    if (pos.cur_block_idx & TAIL_FLAG) != 0 {
-                        let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
-                        info.tail_block_id = tail_block_id;
-                        info.tail_offset = pos.cur_block_offset;
-                        info.cur_block_idx = info.chain.len();
-                        info.cur_block_offset = 0;
-                        persisted_tail_for_fold = Some((tail_block_id, pos.cur_block_offset));
-                    } else {
-                        let mut ib = pos.cur_block_idx as usize;
-                        if ib > info.chain.len() {
-                            ib = info.chain.len();
-                        }
-                        info.cur_block_idx = ib;
-                        if ib < info.chain.len() {
-                            let used = info.chain[ib].used;
-                            info.cur_block_offset = pos.cur_block_offset.min(used);
-                        } else {
-                            info.cur_block_offset = 0;
-                        }
+            if found {
+                // Scan block headers to find entry boundary
+                let blk = &chain[c_idx];
+                let mut scan_pos = 0;
+                // Use mmap for fast scanning if possible
+                let mut meta_buf = [0u8; PREFIX_META_SIZE];
+                
+                while scan_pos < blk.used {
+                    if scan_pos + (PREFIX_META_SIZE as u64) > blk.used {
+                        break; // Should not happen in sealed block
                     }
+                    
+                    // Read header
+                    blk.mmap.read(scan_pos as usize, &mut meta_buf);
+                    let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
+                     if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+                        break; // Corrupt/Zeroed
+                    }
+                    
+                    // Decode metadata to get read_size
+                    let mut aligned = AlignedVec::with_capacity(meta_len);
+                    aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                    let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+                    let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
+                    let data_size = meta.read_size;
+                    
+                    let entry_total = (PREFIX_META_SIZE + data_size) as u64;
+                    let entry_end = scan_pos + entry_total;
+                    
+                    if entry_end > rem {
+                        // Found the entry containing 'rem'
+                        c_off = scan_pos;
+                        let payload_start = scan_pos + (PREFIX_META_SIZE as u64);
+                        if rem > payload_start {
+                            trim = (rem - payload_start) as usize;
+                        }
+                        break;
+                    }
+                    
+                    scan_pos = entry_end;
+                }
+                
+                // If loop finished without finding (shouldn't happen if rem < used), 
+                // we default to c_off=scan_pos (end of valid data)
+                if scan_pos >= blk.used {
+                    c_off = blk.used; 
+                }
+            } else {
+                c_idx = chain.len();
+                c_off = 0;
+                // rem is now offset into tail (writer)
+            }
 
-                    info.hydrated_from_index = true;
-                } else {
-                    info.hydrated_from_index = true;
+            (chain, c_idx, c_off, 0, rem, None, trim, hint)
+        } else {
+            // --- Stateful Read (Shared State) ---
+            let info_arc = if let Some(arc) = {
+                let map = self.reader.data.read().map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
+                })?;
+                map.get(col_name).cloned()
+            } {
+                arc
+            } else {
+                let mut map = self.reader.data.write().map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned")
+                })?;
+                map.entry(col_name.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(RwLock::new(ColReaderInfo {
+                            chain: Vec::new(),
+                            cur_block_idx: 0,
+                            cur_block_offset: 0,
+                            reads_since_persist: 0,
+                            tail_block_id: 0,
+                            tail_offset: 0,
+                            hydrated_from_index: false,
+                        }))
+                    })
+                    .clone()
+            };
+            
+            held_arc = Some(info_arc);
+            let mut info = held_arc.as_ref().unwrap()
+                .write()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+
+            // Hydrate from index if needed
+            let mut persisted_tail_for_fold: Option<(u64, u64)> = None;
+            if !info.hydrated_from_index {
+                if let Ok(idx_guard) = self.read_offset_index.read() {
+                    if let Some(pos) = idx_guard.get(col_name) {
+                        if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+                            let tail_bid = pos.cur_block_idx & (!TAIL_FLAG);
+                            info.tail_block_id = tail_bid;
+                            info.tail_offset = pos.cur_block_offset;
+                            info.cur_block_idx = info.chain.len();
+                            info.cur_block_offset = 0;
+                            persisted_tail_for_fold = Some((tail_bid, pos.cur_block_offset));
+                        } else {
+                            let mut ib = pos.cur_block_idx as usize;
+                            if ib > info.chain.len() {
+                                ib = info.chain.len();
+                            }
+                            info.cur_block_idx = ib;
+                            if ib < info.chain.len() {
+                                let used = info.chain[ib].used;
+                                info.cur_block_offset = pos.cur_block_offset.min(used);
+                            } else {
+                                info.cur_block_offset = 0;
+                            }
+                        }
+                        info.hydrated_from_index = true;
+                    } else {
+                        info.hydrated_from_index = true;
+                    }
                 }
             }
-        }
 
-        // Fold persisted tail into sealed blocks if possible
-        if let Some((tail_block_id, tail_off)) = persisted_tail_for_fold {
-            if let Some(idx) = info
-                .chain
-                .iter()
-                .enumerate()
-                .find(|(_, b)| b.id == tail_block_id)
-                .map(|(idx, _)| idx)
-            {
-                let used = info.chain[idx].used;
-                info.cur_block_idx = idx;
-                info.cur_block_offset = tail_off.min(used);
+            // Fold persisted tail into sealed blocks if possible
+            if let Some((tail_bid, tail_off)) = persisted_tail_for_fold {
+                if let Some(idx) = info
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .find(|(_, b)| b.id == tail_bid)
+                    .map(|(idx, _)| idx)
+                {
+                    let used = info.chain[idx].used;
+                    info.cur_block_idx = idx;
+                    info.cur_block_offset = tail_off.min(used);
+                }
             }
-        }
+
+            let c_chain = info.chain.clone();
+            let c_idx = info.cur_block_idx;
+            let c_off = info.cur_block_offset;
+            let t_bid = info.tail_block_id;
+            let t_off = info.tail_offset;
+
+            (c_chain, c_idx, c_off, t_bid, t_off, Some(info), 0, 0)
+        };
 
         // 2) Build read plan up to byte and entry limits
         let mut plan: Vec<ReadPlan> = Vec::new();
         let mut planned_bytes: usize = 0;
-        let chain_len_at_plan = info.chain.len();
-        let mut cur_idx = info.cur_block_idx;
-        let mut cur_off = info.cur_block_offset;
+        let chain_len_at_plan = chain.len();
 
-        while cur_idx < info.chain.len() && planned_bytes < max_bytes {
-            let block = info.chain[cur_idx].clone();
+        while cur_idx < chain.len() && planned_bytes < max_bytes {
+            let block = chain[cur_idx].clone();
             if cur_off >= block.used {
-                BlockStateTracker::set_checkpointed_true(block.id as usize);
+                if info_guard.is_some() {
+                     BlockStateTracker::set_checkpointed_true(block.id as usize);
+                }
                 cur_idx += 1;
                 cur_off = 0;
                 continue;
             }
 
-            let end = block.used.min(cur_off + (max_bytes - planned_bytes) as u64);
+            let mut want = (max_bytes - planned_bytes) as u64;
+            if planned_bytes == 0 && first_end_hint > cur_off {
+                 want = want.max(first_end_hint - cur_off);
+            }
+
+            let end = block.used.min(cur_off + want);
             if end > cur_off {
                 plan.push(ReadPlan {
                     blk: block.clone(),
@@ -501,12 +611,50 @@ impl Walrus {
         // Plan tail if we're at the end of sealed chain
         if cur_idx >= chain_len_at_plan {
             if let Some((active_block, written)) = writer_snapshot.clone() {
-                // Use in-memory tail progress if available for this block
-                let tail_start = if info.tail_block_id == active_block.id {
-                    info.tail_offset
+                // Determine start of tail read
+                let mut tail_start = if start_offset.is_some() {
+                    tail_offset // 'rem'
+                } else if tail_block_id == active_block.id {
+                    tail_offset
                 } else {
                     0
                 };
+                
+                // Scan writer block if start_offset provided (to align to entry)
+                if start_offset.is_some() && tail_start > 0 {
+                    let mut scan_pos = 0;
+                    let mut meta_buf = [0u8; PREFIX_META_SIZE];
+                    let rem = tail_start;
+                    let mut found_start = 0;
+                    
+                    while scan_pos < written {
+                         if scan_pos + (PREFIX_META_SIZE as u64) > written { break; }
+                         active_block.mmap.read(scan_pos as usize, &mut meta_buf);
+                         let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
+                         if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 { break; }
+                         
+                         let mut aligned = AlignedVec::with_capacity(meta_len);
+                         aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                         let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+                         let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
+                            Ok(m) => m,
+                            Err(_) => break,
+                         };
+                         let data_size = meta.read_size;
+                         let entry_end = scan_pos + (PREFIX_META_SIZE as u64) + (data_size as u64);
+                         
+                         if entry_end > rem {
+                             found_start = scan_pos;
+                             if rem > scan_pos + (PREFIX_META_SIZE as u64) {
+                                 initial_trim = (rem - (scan_pos + (PREFIX_META_SIZE as u64))) as usize;
+                             }
+                             break;
+                         }
+                         scan_pos = entry_end;
+                    }
+                    tail_start = found_start;
+                }
+                
                 if tail_start < written {
                     let end = written; // read up to current writer offset
                     plan.push(ReadPlan {
@@ -527,16 +675,15 @@ impl Walrus {
         // Hold lock across IO/parse for StrictlyAtOnce to avoid duplicate consumption
         let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce);
         // Manage the guard explicitly to satisfy the borrow checker
-        let mut info_opt = Some(info);
-        if !hold_lock_during_io {
-            // Release lock for AtLeastOnce before IO
-            drop(info_opt.take().unwrap());
+        if !hold_lock_during_io && info_guard.is_some() {
+             // Release lock for AtLeastOnce before IO
+             drop(info_guard.take().unwrap());
         }
 
         // 3) Read ranges via io_uring (FD backend) or mmap
         #[cfg(target_os = "linux")]
         let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) {
-            // io_uring path - try to initialize, fall back to mmap if not supported
+            // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
             let ring = match io_uring::IoUring::new(ring_size) {
                 Ok(r) => Some(r),
@@ -719,10 +866,24 @@ impl Walrus {
                     ));
                 }
 
+                // Handle trimming
+                let mut final_data = data_slice.to_vec();
+                if initial_trim > 0 {
+                    if initial_trim < final_data.len() {
+                        final_data = final_data[initial_trim..].to_vec();
+                    } else {
+                        final_data.clear();
+                    }
+                    initial_trim = 0; // Only for first entry
+                }
+
                 // Add to results
-                entries.push(Entry {
-                    data: data_slice.to_vec(),
-                });
+                if !final_data.is_empty() {
+                    entries.push(Entry {
+                        data: final_data,
+                    });
+                }
+                
                 total_data_bytes = next_total;
                 entries_parsed += 1;
 
@@ -743,91 +904,98 @@ impl Walrus {
         }
 
         // 5) Commit progress (optional)
-        if entries_parsed > 0 {
-            enum PersistTarget {
-                Tail { blk_id: u64, off: u64 },
-                Sealed { idx: u64, off: u64 },
-                None,
-            }
-            let mut target = PersistTarget::None;
+        if let Some(mut info) = info_guard {
+            if entries_parsed > 0 {
+                enum PersistTarget {
+                    Tail { blk_id: u64, off: u64 },
+                    Sealed { idx: u64, off: u64 },
+                    None,
+                }
+                let mut target = PersistTarget::None;
 
-            if hold_lock_during_io {
-                // We still hold the original write guard here
-                let mut info = info_opt.take().expect("column lock should be held");
-                if checkpoint {
-                    if saw_tail {
-                        info.cur_block_idx = chain_len_at_plan;
-                        info.cur_block_offset = 0;
-                        info.tail_block_id = final_tail_block_id;
-                        info.tail_offset = final_tail_offset;
-                        target = PersistTarget::Tail {
-                            blk_id: final_tail_block_id,
-                            off: final_tail_offset,
-                        };
-                    } else {
-                        info.cur_block_idx = final_block_idx;
-                        info.cur_block_offset = final_block_offset;
-                        target = PersistTarget::Sealed {
-                            idx: final_block_idx as u64,
-                            off: final_block_offset,
-                        };
+                if hold_lock_during_io {
+                    // We still hold the original write guard here
+                    if checkpoint {
+                        if saw_tail {
+                            info.cur_block_idx = chain_len_at_plan;
+                            info.cur_block_offset = 0;
+                            info.tail_block_id = final_tail_block_id;
+                            info.tail_offset = final_tail_offset;
+                            target = PersistTarget::Tail {
+                                blk_id: final_tail_block_id,
+                                off: final_tail_offset,
+                            };
+                        } else {
+                            info.cur_block_idx = final_block_idx;
+                            info.cur_block_offset = final_block_offset;
+                            target = PersistTarget::Sealed {
+                                idx: final_block_idx as u64,
+                                off: final_block_offset,
+                            };
+                        }
+                    }
+                } else {
+                    // Reacquire to update
+                    let arc = {
+                         let map = self.reader.data.read().unwrap();
+                         map.get(col_name).cloned()
+                    };
+                    
+                    if let Some(arc) = arc {
+                        let mut info2 = arc.write().map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
+                        })?;
+                        
+                        if checkpoint {
+                            if saw_tail {
+                                info2.cur_block_idx = chain_len_at_plan;
+                                info2.cur_block_offset = 0;
+                                info2.tail_block_id = final_tail_block_id;
+                                info2.tail_offset = final_tail_offset;
+                                if let ReadConsistency::AtLeastOnce { persist_every } =
+                                    self.read_consistency
+                                {
+                                    // Clamp contribution
+                                    let room = persist_every
+                                        .saturating_sub(1)
+                                        .saturating_sub(info2.reads_since_persist);
+                                    let add = entries_parsed.min(room);
+                                    info2.reads_since_persist =
+                                        info2.reads_since_persist.saturating_add(add);
+                                }
+                            } else {
+                                info2.cur_block_idx = final_block_idx;
+                                info2.cur_block_offset = final_block_offset;
+                                if let ReadConsistency::AtLeastOnce { persist_every } =
+                                    self.read_consistency
+                                {
+                                    let room = persist_every
+                                        .saturating_sub(1)
+                                        .saturating_sub(info2.reads_since_persist);
+                                    let add = entries_parsed.min(room);
+                                    info2.reads_since_persist =
+                                        info2.reads_since_persist.saturating_add(add);
+                                }
+                            }
+                        }
                     }
                 }
-                drop(info);
-            } else {
-                // Reacquire to update
-                let mut info2 = info_arc.write().map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
-                })?;
+                
+                // Commit to index
                 if checkpoint {
-                    if saw_tail {
-                        info2.cur_block_idx = chain_len_at_plan;
-                        info2.cur_block_offset = 0;
-                        info2.tail_block_id = final_tail_block_id;
-                        info2.tail_offset = final_tail_offset;
-                        if let ReadConsistency::AtLeastOnce { persist_every } =
-                            self.read_consistency
-                        {
-                            // Clamp contribution so a single call can't reach the threshold
-                            let room = persist_every
-                                .saturating_sub(1)
-                                .saturating_sub(info2.reads_since_persist);
-                            let add = entries_parsed.min(room);
-                            info2.reads_since_persist =
-                                info2.reads_since_persist.saturating_add(add);
-                            // target remains None here to avoid persisting to end in one batch
+                    match target {
+                        PersistTarget::Tail { blk_id, off } => {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
+                            }
                         }
-                    } else {
-                        info2.cur_block_idx = final_block_idx;
-                        info2.cur_block_offset = final_block_offset;
-                        if let ReadConsistency::AtLeastOnce { persist_every } =
-                            self.read_consistency
-                        {
-                            let room = persist_every
-                                .saturating_sub(1)
-                                .saturating_sub(info2.reads_since_persist);
-                            let add = entries_parsed.min(room);
-                            info2.reads_since_persist =
-                                info2.reads_since_persist.saturating_add(add);
+                        PersistTarget::Sealed { idx, off } => {
+                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                                let _ = idx_guard.set(col_name.to_string(), idx, off);
+                            }
                         }
+                        PersistTarget::None => {}
                     }
-                }
-                drop(info2);
-            }
-
-            if checkpoint {
-                match target {
-                    PersistTarget::Tail { blk_id, off } => {
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
-                        }
-                    }
-                    PersistTarget::Sealed { idx, off } => {
-                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), idx, off);
-                        }
-                    }
-                    PersistTarget::None => {}
                 }
             }
         }

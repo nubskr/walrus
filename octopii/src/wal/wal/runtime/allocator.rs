@@ -157,6 +157,15 @@ impl BlockAllocator {
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
     }
+
+    pub(super) unsafe fn fast_forward(&self, next_id: u64) {
+        self.lock();
+        let data = unsafe { &mut *self.next_block.get() };
+        if next_id > data.id {
+            data.id = next_id;
+        }
+        self.unlock();
+    }
 }
 
 // SAFETY: `BlockAllocator` uses an internal spin lock to guard all mutable
