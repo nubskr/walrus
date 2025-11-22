@@ -2360,6 +2360,127 @@ def test_produce_large_payloads_up_to_cap():
     assert fetch[0]["high_watermark"] >= total_bytes, "high watermark did not advance after large writes"
 
 
+def test_throughput_3gb_write_read():
+    """
+    Write 3GB of data in 20MB chunks to a single topic and verify all data is readable.
+    Disables GC to ensure history remains available.
+    """
+    ensure_cluster_ready(timeout=180)
+    
+    # Disable GC so sealed segments remain for the duration of this test.
+    resp = send_test_control(63)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    assert decode_test_control_code(resp) is not None
+
+    topic = f"throughput-3gb-{uuid4().hex[:6]}"
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+    wait_for_topics([topic], timeout=60)
+    send_test_control(2)  # sync leases
+
+    target_bytes = 3 * 1024 * 1024 * 1024
+    chunk_size = 20 * 1024 * 1024
+    # Use a repeatable pattern to avoid massive memory usage but allow verification
+    # Pattern: first 16 bytes = chunk index, rest = 'X'
+    
+    sent_bytes = 0
+    chunk_idx = 0
+    
+    print(f"Starting 3GB write to {topic} in {chunk_size} chunks...")
+    start_write = time.time()
+    
+    while sent_bytes < target_bytes:
+        # Construct payload: Index (8 bytes) + 'X' padding
+        prefix = struct.pack(">Q", chunk_idx)
+        payload = prefix + b"X" * (chunk_size - 8)
+        
+        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+        sent_bytes += len(payload)
+        chunk_idx += 1
+        
+        if chunk_idx % 10 == 0:
+            print(f"Written {sent_bytes / 1024 / 1024:.2f} MB...")
+
+    write_duration = time.time() - start_write
+    print(f"Write complete: {sent_bytes} bytes in {write_duration:.2f}s ({sent_bytes/1024/1024/write_duration:.2f} MB/s)")
+
+    # Allow metadata to settle
+    time.sleep(2)
+
+    print("Starting sequential read verification...")
+    start_read = time.time()
+    
+    read_physical_offset = 0
+    read_payload_bytes = 0
+    read_chunks = 0
+    buffer = b""
+    HEADER_OVERHEAD = 256
+    
+    # Read in 1MB chunks to be robust against boundaries/network behaviors
+    fetch_size = 1024 * 1024 
+
+    while read_payload_bytes < sent_bytes:
+        payload = b""
+        # Retry loop for fetch
+        for _ in range(10):
+            fetch = decode_fetch(
+                send_frame_with_retry(
+                    *NODES[1], make_fetch_with_offset(topic, 0, read_physical_offset, max_bytes=fetch_size)
+                )
+                or b""
+            )
+            if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
+                payload = fetch[0]["payload"]
+                break
+            time.sleep(0.5)
+        
+        if len(payload) == 0:
+             # Debug dump
+             print(f"Stuck reading at offset {read_physical_offset} (target payload {sent_bytes})")
+             print("--- DATA DIR CONTENT ---")
+             subprocess.run(["ls", "-laR", "test_data"], check=False, cwd=PROJECT_ROOT)
+             print("--- NODE 1 LOGS ---")
+             subprocess.run(COMPOSE + ["logs", "--tail", "500", "node1"], check=False, cwd=PROJECT_ROOT)
+             print("--- END LOGS ---")
+             
+             state = decode_internal_state(send_frame_with_retry(*NODES[1], make_internal_state_request([topic])) or b"")
+             print(f"Internal state: {state}")
+             # Force fail
+             assert False, f"Stuck reading at offset {read_physical_offset}"
+
+        buffer += payload
+        read_payload_bytes += len(payload)
+        # Assuming each fetch returns exactly one entry payload (because 20MB entry > 1MB fetch size)
+        # But if fetch returned multiple entries (e.g. if chunk_size was small), this logic would be wrong.
+        # Here chunk_size is 20MB, so we always get 1 entry per fetch (or partial if supported, but walrus returns full).
+        # So we advance physical offset by payload + header.
+        read_physical_offset += len(payload) + HEADER_OVERHEAD
+        
+        # Verify complete chunks
+        while len(buffer) >= chunk_size:
+            chunk = buffer[:chunk_size]
+            buffer = buffer[chunk_size:]
+            
+            idx_check = struct.unpack(">Q", chunk[:8])[0]
+            if idx_check != read_chunks:
+                print(f"Chunk mismatch! Expected index {read_chunks}, got {idx_check}")
+                # Dump some context
+                print(f"Chunk start: {chunk[:32].hex()}")
+            assert idx_check == read_chunks, f"Chunk index mismatch: expected {read_chunks}, got {idx_check}"
+            read_chunks += 1
+            
+            if read_chunks % 10 == 0:
+                 print(f"Verified {read_chunks} chunks ({(read_chunks * chunk_size) / 1024 / 1024:.2f} MB)...")
+
+    read_duration = time.time() - start_read
+    print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
+    
+    assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
+
+
 def test_env_overrides_apply_to_monitor_rollover_and_retention():
     """
     Verify docker env overrides are present and drive monitor rollover + retention behaviour.

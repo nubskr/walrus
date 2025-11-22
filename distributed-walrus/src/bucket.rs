@@ -89,7 +89,7 @@ impl BucketService {
         let key = pid.to_wal_key();
         let engine = self.engine.clone();
         let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false)
+            engine.batch_read_for_topic(&key, max_bytes, false, None)
         })
         .await??;
         Ok(entries)
@@ -119,7 +119,7 @@ impl BucketService {
         let engine = self.engine.clone();
         let key = wal_key.to_string();
         let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false)
+            engine.batch_read_for_topic(&key, max_bytes, false, None)
         })
         .await??;
         Ok(entries)
@@ -131,31 +131,20 @@ impl BucketService {
         start_offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<Entry>> {
-        // Walrus does not expose random access reads today; best-effort by requesting
-        // enough bytes and trimming in-memory.
-        let offset_as_usize = usize::try_from(start_offset).unwrap_or(usize::MAX);
-        let fetch_bytes = max_bytes.saturating_add(offset_as_usize);
-        let entries = self.read_by_key(wal_key, fetch_bytes).await?;
-        if start_offset == 0 {
-            return Ok(entries);
+        let engine = self.engine.clone();
+        let key = wal_key.to_string();
+        
+        let entries = tokio::task::spawn_blocking(move || {
+            engine.batch_read_for_topic(&key, max_bytes, false, Some(start_offset))
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
+        
+        if entries.is_empty() {
+             tracing::warn!("bucket read returned empty for {} (size request {})", wal_key, max_bytes);
         }
-
-        let mut skipped = 0u64;
-        let mut out = Vec::new();
-        for mut entry in entries.into_iter() {
-            let len = entry.data.len() as u64;
-            if skipped + len <= start_offset {
-                skipped += len;
-                continue;
-            }
-            let within_entry = (start_offset - skipped) as usize;
-            let remaining = &entry.data[within_entry..];
-            let capped_len = remaining.len().min(max_bytes);
-            entry.data = remaining[..capped_len].to_vec();
-            out.push(entry);
-            break;
-        }
-        Ok(out)
+        
+        Ok(entries)
     }
 
     pub async fn sync_leases(&self, expected: &HashSet<String>) {
