@@ -68,6 +68,7 @@ TESTS := \
 	test_read_entire_multi_rollover_history \
 	test_produce_large_payloads_up_to_cap \
 	test_throughput_3gb_write_read \
+	test_throughput_multi_topic_3gb_parallel \
 	test_truncated_produce_frame_preserves_offsets_after_disconnect \
 	test_produce_negative_topic_count_drops_connection \
 	test_fetch_negative_topic_count_drops_connection \

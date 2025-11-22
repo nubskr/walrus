@@ -2417,6 +2417,7 @@ def test_throughput_3gb_write_read():
     read_payload_bytes = 0
     read_chunks = 0
     buffer = b""
+    # Wal entries store a fixed 256-byte metadata prefix (PREFIX_META_SIZE in wal config)
     HEADER_OVERHEAD = 256
     
     # Read in 1MB chunks to be robust against boundaries/network behaviors
@@ -2479,6 +2480,136 @@ def test_throughput_3gb_write_read():
     print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
     
     assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
+
+
+def test_throughput_multi_topic_3gb_parallel():
+    """
+    Write 3GB of data to 3 topics in parallel (9GB total) using 20MB chunks, then verify all data.
+    Disables GC to ensure history remains available.
+    """
+    ensure_cluster_ready(timeout=180)
+    
+    # Disable GC so sealed segments remain for the duration of this test.
+    resp = send_test_control(63)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    assert decode_test_control_code(resp) is not None
+
+    # Create 3 topics
+    topics = [f"multi-3gb-{i}-{uuid4().hex[:4]}" for i in range(3)]
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(t, 1) for t in topics])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+    wait_for_topics(topics, timeout=60)
+    send_test_control(2)  # sync leases
+
+    target_bytes = 3 * 1024 * 1024 * 1024
+    chunk_size = 20 * 1024 * 1024
+    
+    def writer(topic_info):
+        idx, topic_name = topic_info
+        sent_bytes = 0
+        chunk_count = 0
+        # Payload pattern: TopicIndex (1 byte) + ChunkIndex (8 bytes) + Padding
+        prefix_fmt = ">BQ"
+        prefix_len = struct.calcsize(prefix_fmt)
+        
+        while sent_bytes < target_bytes:
+            prefix = struct.pack(prefix_fmt, idx, chunk_count)
+            payload = prefix + b"X" * (chunk_size - prefix_len)
+            
+            # Retry produce internally to avoid failing the whole test on a transient hiccup
+            success = False
+            for _ in range(5):
+                resp = send_frame_with_retry(*NODES[1], make_produce_request(topic_name, payload, partition=0))
+                if resp and all(code == 0 for code in parse_produce_error_codes(resp)):
+                    success = True
+                    break
+                time.sleep(1)
+            assert success, f"Produce failed for {topic_name} chunk {chunk_count}"
+
+            sent_bytes += len(payload)
+            chunk_count += 1
+            
+            if chunk_count % 20 == 0:
+                print(f"[{topic_name}] Written {sent_bytes / 1024 / 1024:.2f} MB...")
+        return sent_bytes
+
+    print(f"Starting parallel 3GB writes to {topics}...")
+    start_write = time.time()
+    
+    with ThreadPoolExecutor(max_workers=len(topics)) as pool:
+        futures = {pool.submit(writer, (i, t)): t for i, t in enumerate(topics)}
+        results = {}
+        for f in futures:
+            topic = futures[f]
+            results[topic] = f.result()
+
+    write_duration = time.time() - start_write
+    total_written = sum(results.values())
+    print(f"Parallel write complete: {total_written / 1024 / 1024:.2f} MB in {write_duration:.2f}s")
+
+    # Allow metadata to settle
+    time.sleep(5)
+
+    print("Starting sequential read verification...")
+    # Wal entries store a fixed 256-byte metadata prefix (PREFIX_META_SIZE in wal config)
+    HEADER_OVERHEAD = 256
+    fetch_size = 1024 * 1024 
+
+    for i, topic in enumerate(topics):
+        sent_bytes = results[topic]
+        print(f"Verifying {topic} ({sent_bytes} bytes)...")
+        
+        read_physical_offset = 0
+        read_payload_bytes = 0
+        read_chunks = 0
+        buffer = b""
+        prefix_fmt = ">BQ"
+        prefix_len = struct.calcsize(prefix_fmt)
+
+        try:
+            while read_payload_bytes < sent_bytes:
+                payload = b""
+                for _ in range(10):
+                    fetch = decode_fetch(
+                        send_frame_with_retry(
+                            *NODES[1], make_fetch_with_offset(topic, 0, read_physical_offset, max_bytes=fetch_size)
+                        )
+                        or b""
+                    )
+                    if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
+                        payload = fetch[0]["payload"]
+                        break
+                    time.sleep(0.5)
+                
+                if len(payload) == 0:
+                     print(f"Stuck reading {topic} at offset {read_physical_offset}")
+                     assert False, f"Stuck reading {topic} at offset {read_physical_offset}"
+
+                buffer += payload
+                read_payload_bytes += len(payload)
+                read_physical_offset += len(payload) + HEADER_OVERHEAD
+                
+                while len(buffer) >= chunk_size:
+                    chunk = buffer[:chunk_size]
+                    buffer = buffer[chunk_size:]
+                    
+                    t_idx, c_idx = struct.unpack(prefix_fmt, chunk[:prefix_len])
+                    assert t_idx == i, f"Topic index mismatch in {topic}: expected {i}, got {t_idx}"
+                    assert c_idx == read_chunks, f"Chunk index mismatch in {topic}: expected {read_chunks}, got {c_idx}"
+                    read_chunks += 1
+                    
+                    if read_chunks % 20 == 0:
+                         print(f"[{topic}] Verified {read_chunks} chunks...")
+
+            assert read_payload_bytes == sent_bytes, f"[{topic}] Read total {read_payload_bytes} != {sent_bytes}"
+            print(f"[{topic}] Verification successful.")
+        except Exception:
+            print("Dumping logs due to failure...")
+            subprocess.run(COMPOSE + ["logs", "--tail", "2000", "node1"], check=False, cwd=PROJECT_ROOT)
+            raise
 
 
 def test_env_overrides_apply_to_monitor_rollover_and_retention():

@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
+use walrus_rust::wal::PREFIX_META_SIZE;
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -17,7 +18,7 @@ fn cleanup_test_env() {
 
 
 fn entry_offset(data_len: usize) -> usize {
-    64 + data_len
+    PREFIX_META_SIZE + data_len
 }
 
 
@@ -72,7 +73,7 @@ fn test_zeroed_header_stops_block_scanning() {
             .unwrap();
 
 
-        let zeros = vec![0u8; 64];
+        let zeros = vec![0u8; PREFIX_META_SIZE];
         file.write_at(&zeros, offset_2 as u64)
             .expect("Failed to zero header");
         file.sync_all().unwrap();
@@ -325,7 +326,7 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
 
         let offset_large = entry_offset("small_1".len());
 
-        let zeros = vec![0u8; 64];
+        let zeros = vec![0u8; PREFIX_META_SIZE];
         file.write_at(&zeros, offset_large as u64)
             .expect("Failed to zero header");
         file.sync_all().unwrap();

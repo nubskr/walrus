@@ -35,12 +35,15 @@ impl NodeController {
         Duration::from_millis(ms)
     }
 
+    // Each WAL entry reserves a fixed prefix (matches wal::config::PREFIX_META_SIZE).
+    const ENTRY_OVERHEAD: u64 = 256;
+
     pub async fn handle_rpc(&self, op: InternalOp) -> InternalResp {
         tracing::info!("handle_rpc: processing op {:?}", op);
         match op {
             InternalOp::ForwardAppend { wal_key, data } => {
                 self.sync_leases_now().await;
-                let data_len = data.len() as u64;
+                let data_len = data.len() as u64 + Self::ENTRY_OVERHEAD;
                 match self.append_with_retry(&wal_key, data).await {
                     Ok(_) => {
                         tracing::info!("handle_rpc: append success for {}", wal_key);
@@ -163,7 +166,7 @@ impl NodeController {
             tracing::info!("writing locally on node {}", self.node_id);
             // Ensure local bucket has the latest leases from metadata before appending.
             self.sync_leases_now().await;
-            let bytes = data.len() as u64;
+            let bytes = data.len() as u64 + Self::ENTRY_OVERHEAD;
             self.append_with_retry(&key, data).await?;
             self.record_append(&key, bytes).await;
         } else {
@@ -217,27 +220,125 @@ impl NodeController {
             .metadata
             .get_partition_state(topic, partition)
             .ok_or_else(|| anyhow!("unknown topic/partition"))?;
-        let head_start = state.history.last().map(|s| s.end_offset).unwrap_or(0);
 
-        if req_offset >= head_start {
-            let local_offset = req_offset - head_start;
+        // Check history segments
+        for (i, seg) in state.history.iter().enumerate() {
+            // Adjust the logical start of this segment if the previous segment (on this node) actually extended further.
+            let mut corrected_start = seg.start_offset;
+            let mut prev_actual_end: Option<u64> = None;
+            if i > 0 {
+                let prev = &state.history[i - 1];
+                if prev.stored_on_node == self.node_id {
+                    let prev_key = wal_key(topic, partition, prev.generation);
+                    let prev_len = self.active_bytes_for_key(&prev_key).await;
+                    let end = prev.start_offset + prev_len;
+                    prev_actual_end = Some(end);
+                    if end > corrected_start {
+                        corrected_start = end;
+                    }
+                }
+            }
+
+            // Compute this segment's actual end if we have local bytes; otherwise fall back to metadata.
+            let mut actual_end = seg.end_offset;
+            if seg.stored_on_node == self.node_id {
+                let seg_key = wal_key(topic, partition, seg.generation);
+                let seg_len = self.active_bytes_for_key(&seg_key).await;
+                actual_end = corrected_start + seg_len;
+            }
+
+            if req_offset >= corrected_start && req_offset < actual_end {
+                // Gap Fix: Check if the *previous* segment actually contains this offset
+                if let Some(prev_end) = prev_actual_end {
+                    if req_offset < prev_end {
+                        tracing::info!("Gap Fix (History): req_offset={} falls in gap of prev_gen={} (start={}, meta_end={}, actual_end={}). Redirecting.", 
+                            req_offset, state.history[i - 1].generation, state.history[i - 1].start_offset, state.history[i - 1].end_offset, prev_end);
+                        let local_offset = req_offset - state.history[i - 1].start_offset;
+                        return self
+                            .read_historical_segment(
+                                topic,
+                                partition,
+                                &state,
+                                &state.history[i - 1],
+                                local_offset,
+                                max_bytes,
+                            )
+                            .await;
+                    }
+                }
+
+                let local_offset = req_offset - corrected_start;
+                return self
+                    .read_historical_segment(topic, partition, &state, seg, local_offset, max_bytes)
+                    .await;
+            }
+        }
+
+        let head_meta_end = state.history.last().map(|s| s.end_offset).unwrap_or(0);
+        let last_actual_end = if let Some(last_seg) = state.history.last() {
+            // If the previous segment (on this node) actually extended further, treat that as the true start.
+            let mut corrected_start = last_seg.start_offset;
+            if state.history.len() >= 2 {
+                let prev = &state.history[state.history.len() - 2];
+                if prev.stored_on_node == self.node_id {
+                    let prev_key = wal_key(topic, partition, prev.generation);
+                    let prev_len = self.active_bytes_for_key(&prev_key).await;
+                    let prev_end = prev.start_offset + prev_len;
+                    if prev_end > corrected_start {
+                        corrected_start = prev_end;
+                    }
+                }
+            }
+
+            if last_seg.stored_on_node == self.node_id {
+                let last_key = wal_key(topic, partition, last_seg.generation);
+                let last_len = self.active_bytes_for_key(&last_key).await;
+                Some(corrected_start + last_len)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if req_offset >= head_meta_end {
+            // Gap Fix for Head
+            if let Some(last_seg) = state.history.last() {
+                if last_seg.stored_on_node == self.node_id {
+                    let actual_end =
+                        last_actual_end.unwrap_or_else(|| last_seg.start_offset + (last_seg.end_offset - last_seg.start_offset));
+
+                    if req_offset < actual_end {
+                        tracing::info!("Gap Fix (Head): req_offset={} falls in gap of last_gen={} (start={}, meta_end={}, actual_end={}). Redirecting.", 
+                            req_offset, last_seg.generation, last_seg.start_offset, last_seg.end_offset, actual_end);
+                        let local_offset = req_offset - last_seg.start_offset;
+                        return self
+                            .read_historical_segment(
+                                topic,
+                                partition,
+                                &state,
+                                last_seg,
+                                local_offset,
+                                max_bytes,
+                            )
+                            .await;
+                    } else {
+                        tracing::debug!("Gap Fix (Head): req_offset={} NOT in last_gen={} (actual_end={}).", req_offset, last_seg.generation, actual_end);
+                    }
+                }
+            }
+
+            let adjusted_head_start = last_actual_end.unwrap_or(head_meta_end).max(head_meta_end);
+            let local_offset = req_offset - adjusted_head_start;
             return self
                 .read_active_head(topic, partition, &state, local_offset, max_bytes)
                 .await;
         }
 
-        if let Some(seg) = state
-            .history
-            .iter()
-            .find(|s| req_offset >= s.start_offset && req_offset < s.end_offset)
-        {
-            let local_offset = req_offset - seg.start_offset;
-            return self
-                .read_historical_segment(topic, partition, &state, seg, local_offset, max_bytes)
-                .await;
-        }
-
-        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+        Ok((
+            Vec::new(),
+            self.partition_high_watermark(topic, partition).await,
+        ))
     }
 
     pub async fn sync_leases_now(&self) {
@@ -482,15 +583,49 @@ impl NodeController {
         let Some(state) = self.metadata.get_partition_state(topic, partition) else {
             return 0;
         };
-        let head_start = state.history.last().map(|s| s.end_offset).unwrap_or(0);
+        let head_start_meta = state.history.last().map(|s| s.end_offset).unwrap_or(0);
+        let head_start = if let Some(last_seg) = state.history.last() {
+            if last_seg.stored_on_node == self.node_id {
+                let last_key = wal_key(topic, partition, last_seg.generation);
+                let last_len = self.active_bytes_for_key(&last_key).await;
+                let mut corrected_start = last_seg.start_offset;
+                if state.history.len() >= 2 {
+                    let prev = &state.history[state.history.len() - 2];
+                    if prev.stored_on_node == self.node_id {
+                        let prev_key = wal_key(topic, partition, prev.generation);
+                        let prev_len = self.active_bytes_for_key(&prev_key).await;
+                        let prev_end = prev.start_offset + prev_len;
+                        if prev_end > corrected_start {
+                            corrected_start = prev_end;
+                        }
+                    }
+                }
+
+                let actual_end = corrected_start + last_len;
+                actual_end.max(head_start_meta)
+            } else {
+                head_start_meta
+            }
+        } else {
+            head_start_meta
+        };
         let key = wal_key(topic, partition, state.current_generation);
         let active_bytes = self.active_bytes_for_key(&key).await;
         head_start + active_bytes
     }
 
     async fn active_bytes_for_key(&self, wal_key: &str) -> u64 {
-        let guard = self.offsets.read().await;
-        guard.get(wal_key).copied().unwrap_or(0)
+        let tracked = {
+            let guard = self.offsets.read().await;
+            guard.get(wal_key).copied().unwrap_or(0)
+        };
+        // Trust the WAL engine as the source of truth; the tracked map can drift if rollovers race with writes.
+        let actual = self.bucket.get_topic_size_blocking(wal_key);
+        if actual > 0 {
+            actual
+        } else {
+            tracked
+        }
     }
 
     async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
