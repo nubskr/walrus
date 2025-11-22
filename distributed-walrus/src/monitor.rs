@@ -66,13 +66,27 @@ impl Monitor {
         for (topic, partition, generation) in assignments {
             let wal = wal_key(&topic, partition, generation);
             let path = walrus_path_for_key(&root, &wal);
-            let size = match dir_size(&path).await {
+            let disk_size = match dir_size(&path).await {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     error!("dir_size failed for {:?}: {}", path, e);
                     continue;
                 }
             };
+            let logical_head_start = self
+                .controller
+                .metadata
+                .get_partition_state(&topic, partition)
+                .and_then(|p| p.history.last().map(|h| h.end_offset))
+                .unwrap_or(0);
+            let logical_watermark = self
+                .controller
+                .partition_high_watermark(&topic, partition)
+                .await;
+            let logical_size = logical_watermark.saturating_sub(logical_head_start);
+
+            // Use the larger of disk vs. logical offsets to decide rollover and record size.
+            let size = disk_size.max(logical_size);
             if size <= max_segment_size() {
                 continue;
             }

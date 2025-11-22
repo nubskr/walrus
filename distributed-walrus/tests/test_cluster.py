@@ -443,6 +443,7 @@ def list_generations(node_id: int, topic: str = "logs") -> list[int]:
             continue
         for part in topic_info["partitions"]:
             gens.append(int(part["generation"]))
+    gens.sort()
     return gens
 
 
