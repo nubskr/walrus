@@ -1,6 +1,5 @@
 services:
   node1:
-    user: "${LOCAL_UID}:${LOCAL_GID}"
     build:
       context: ..
       dockerfile: distributed-walrus/Dockerfile
@@ -38,7 +37,6 @@ services:
       - walrus-net
 
   node2:
-    user: "${LOCAL_UID}:${LOCAL_GID}"
     image: distributed-walrus-node
     container_name: walrus-2
     hostname: node2
@@ -77,7 +75,6 @@ services:
       - walrus-net
 
   node3:
-    user: "${LOCAL_UID}:${LOCAL_GID}"
     image: distributed-walrus-node
     container_name: walrus-3
     hostname: node3
@@ -118,7 +115,6 @@ services:
   # Hot-join test node (only started when --profile hotjoin is set)
   node4:
     profiles: ["hotjoin"]
-    user: "${LOCAL_UID}:${LOCAL_GID}"
     image: distributed-walrus-node
     container_name: walrus-4
     hostname: node4
