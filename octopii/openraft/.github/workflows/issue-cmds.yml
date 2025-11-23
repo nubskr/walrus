@@ -1,0 +1,47 @@
+on:
+  issue_comment:
+    types:
+      - created
+
+jobs:
+  assignme:
+    name: /assignme
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.comment.body, '/assignme')
+
+    steps:
+      - uses: xt0rted/slash-command-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          command: assignme
+          reaction: "true"
+          reaction-type: "rocket"
+          permission-level: read
+
+      - uses: actions-ecosystem/action-add-assignees@v1
+        with:
+          github_token: ${{ secrets.github_token }}
+          assignees: ${{ github.actor }}
+
+
+  help:
+    name: /help
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.comment.body, '/help')
+
+    steps:
+      - uses: xt0rted/slash-command-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          command: help
+          reaction: "true"
+          reaction-type: "rocket"
+
+      - uses: peter-evans/create-or-update-comment@v1
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            Get help or engage by:
+
+            - `/help` : to print help messages.
+            - `/assignme` : to assign this issue to you.

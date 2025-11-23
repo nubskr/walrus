@@ -1,0 +1,3925 @@
+================================================
+FILE: README.md
+================================================
+# Walrus Documentation Site
+
+This directory contains the Walrus docs built with the [Just the Docs] Jekyll theme. The goal is to give users product-facing guides that explain what Walrus is, how to use it, and how its major pieces fit together.
+
+## Page Overview
+
+- `index.md` — landing page with highlights and quick navigation
+- `getting-started.md` — installation, configuration, and benchmarking walkthrough
+- `configuration.md` — durability, backend, and environment options
+- `api-reference.md` — constructors, topic APIs, and storage layout details
+- `architecture.md` — high-level view of the engine internals
+- `keyed-instances.md` — how to isolate workloads with namespaced storage
+
+Work-in-progress research notes (for example `clustering.md`) stay out of the navigation until they are ready for publication.
+
+## Local Preview
+
+```bash
+cd docs-site
+bundle install          # first time
+bundle exec jekyll serve
+```
+
+The preview runs at `http://localhost:4000`. Generated artefacts are written to `_site/`.
+
+## Deployment
+
+- GitHub Pages: add a workflow under `.github/workflows/` that builds from `docs-site/`.
+- Custom hosting: `bundle exec jekyll build` and publish the contents of `_site/`.
+
+## Customisation Hooks
+
+- `_config.yml` controls theme metadata and links.
+- `assets/css/custom.css` holds any site-specific styling.
+- Adjust ordering through each page’s `nav_order` front matter.
+
+[Just the Docs]: https://just-the-docs.github.io/just-the-docs/
+
+
+
+================================================
+FILE: api-reference.md
+================================================
+---
+title: API Reference
+layout: default
+nav_order: 3
+---
+
+# API Reference
+
+Walrus exposes a small set of ergonomic constructors and topic-centric read/write APIs. This page summarizes the most frequently used functions and data types. For tuning guidance, pair it with the [Configuration](configuration.html) overview.
+
+## Constructors
+
+#### `Walrus::new() -> std::io::Result<Self>`
+Creates a WAL instance with `ReadConsistency::StrictlyAtOnce` and the default 1 s fsync cadence.
+
+#### `Walrus::with_consistency(mode: ReadConsistency) -> std::io::Result<Self>`
+Configures the read checkpointing strategy while keeping the default fsync schedule.
+
+#### `Walrus::with_consistency_and_schedule(mode: ReadConsistency, schedule: FsyncSchedule) -> std::io::Result<Self>`
+Gives full control over read persistence and fsync cadence.
+
+#### `Walrus::new_for_key(key: &str) -> std::io::Result<Self>`
+Creates a namespaced WAL rooted at `wal_files/<sanitized-key>/`. Ideal when different workloads need independent durability surfaces.
+
+#### `Walrus::with_consistency_for_key(key: &str, mode: ReadConsistency) -> std::io::Result<Self>`
+Combines keyed storage with a custom read consistency mode.
+
+#### `Walrus::with_consistency_and_schedule_for_key(key: &str, mode: ReadConsistency, schedule: FsyncSchedule) -> std::io::Result<Self>`
+Full configuration control plus per-key isolation. Pair with `WALRUS_INSTANCE_KEY` to apply the same behaviour to default constructors.
+
+## Write APIs
+
+#### `append_for_topic(&self, topic: &str, data: &[u8]) -> std::io::Result<()>`
+Appends a single entry. Topics are created lazily. Returns `ErrorKind::WouldBlock` if a batch write is in flight for the topic.
+
+#### `batch_append_for_topic(&self, topic: &str, batch: &[&[u8]]) -> std::io::Result<()>`
+Writes up to 2,000 entries atomically (bounded to ~10 GB including metadata). Uses `io_uring` on Linux when the fd backend is active and falls back to sequential writes under the mmap backend.
+
+## Read APIs
+
+#### `read_next(&self, topic: &str, checkpoint: bool) -> std::io::Result<Option<Entry>>`
+Returns the next entry for the topic. Passing `checkpoint = true` advances and persists the cursor according to the configured consistency mode; `false` leaves offsets untouched for peek semantics.
+
+#### `batch_read_for_topic(&self, topic: &str, max_bytes: usize, checkpoint: bool) -> std::io::Result<Vec<Entry>>`
+Streams up to `max_bytes` of payload (and never more than 2,000 entries). Honors the same checkpoint semantics as `read_next`. Validation ensures every entry passes checksum verification before it is returned to the caller.
+
+## Backend Toggles
+
+```rust
+use walrus_rust::{enable_fd_backend, disable_fd_backend};
+
+enable_fd_backend();  // default on Linux
+disable_fd_backend(); // forces mmap paths
+```
+
+- FD backend unlocks io_uring fast paths for batch operations.
+- Mmap backend keeps compatibility across non-Linux platforms.
+
+Set `WALRUS_QUIET=1` to silence debug output when switching.
+
+## Data Types
+
+#### `Entry`
+```rust
+pub struct Entry {
+    pub data: Vec<u8>,
+}
+```
+
+Entries contain opaque payload bytes; metadata is stripped during read parsing after checksum validation.
+
+## Storage Layout
+
+```
+wal_files/
+├── 1700000000                  # Default instance log file (preallocated to 1 GB)
+├── read_offset_idx_index.db    # Default instance read-offset index
+├── analytics/                  # Keyed instance for "analytics"
+│   ├── 1700000100
+│   └── read_offset_idx_index.db
+└── transactions/               # Keyed instance for "transactions"
+    ├── 1700000200
+    └── read_offset_idx_index.db
+```
+
+- Blocks are 10 MB each, 100 per file, yielding 1 GB log segments.
+- Index files persist reader cursors for crash recovery.
+
+## Benchmarks & Tooling
+
+- `make bench-and-show-reads` runs read benchmarks and opens plots (requires `pandas` and `matplotlib`).
+- `make show-writes`, `make show-reads`, and `make show-scaling` visualize CSV output generated during benchmarking.
+- Environment variables such as `WALRUS_FSYNC`, `WALRUS_THREADS`, and `WALRUS_DURATION` offer quick tuning without editing code.
+
+Refer back to [Getting Started](getting-started.html) for installation details and environment variable descriptions.
+
+
+
+================================================
+FILE: architecture.md
+================================================
+---
+layout: default
+title: Architecture
+nav_order: 5
+---
+
+# Walrus Architecture
+
+Walrus keeps the public API tiny while a bunch of specialised components handle
+allocation, durability, and cleanup behind the scenes. This section describes
+how the engine in `src/` is actually wired together.
+
+```
+clients ─┐
+         │  append / batch_append          ┌──────────────┐
+         ├────────────────────────────────►│ Walrus facade│
+         │                                 └────┬─────────┘
+         │                                      │ get/create writer
+         │                                      ▼
+         │                           ┌──────────────────┐
+         │                           │ per-topic Writer │◄─┐
+         │                           └───┬──────────────┘  │ alloc sealed blocks
+         │                               │ writes          │
+         │                               ▼                 │
+         │                     ┌──────────────────┐        │
+         │                     │ BlockAllocator   │────────┘
+         │                     └───┬──────────────┘
+         │                         │ hands out 10 MB units, tracks files
+         │                         ▼
+         │              wal_files/<namespace>/<timestamp>
+         │                         ▲
+         │                         │ sealed blocks appended
+         │ read / batch_read       │
+         ├─────────────────────────┘
+         │
+         │          ┌──────────────────┐
+         └─────────►│ Reader + WalIndex│───► persisted checkpoints
+                    └──────────────────┘
+```
+
+## Pieces you meet in `src/wal`
+
+- **`Walrus` facade (`runtime/walrus.rs`)** – Owns the shared services:
+  `BlockAllocator`, the global `Reader`, a `RwLock<HashMap>` of per-topic
+  `Writer`s, the fsync channel, and the persisted `WalIndex`. Constructors pick
+  the data directory (`paths.rs`), set the global fsync schedule, and run
+  recovery before returning an instance.
+- **`Writer` (`runtime/writer.rs`)** – One per topic. Holds the live block,
+  current offset, and an atomic flag to keep batch appends exclusive. When a
+  block fills it flushes, seals it, hands it to the reader chain, and requests a
+  fresh block from the allocator.
+- **`Reader` (`runtime/reader.rs`, `walrus_read.rs`)** – Keeps a sealed block
+  chain per topic plus in-memory tail progress for the active writer block.
+  `read_next` walks sealed blocks first, then falls through to the live tail
+  using a snapshot from the writer, and persists offsets based on the selected
+  `ReadConsistency`.
+- **`BlockAllocator` (`runtime/allocator.rs`)** – Spin-locked allocator that
+  hands out 10 MB units inside pre-sized 1 GB files. Tracks block/file state so
+  sealed + checkpointed files can be reclaimed.
+- **Storage backends (`storage.rs`)** – `SharedMmap` (portable default) or the
+  fd-backed path that enables io_uring on Linux. `config.rs` exposes
+  `enable_fd_backend` / `disable_fd_backend`; the active schedule decides if we
+  open files with `O_SYNC`.
+- **`WalIndex` (`runtime/index.rs`)** – rkyv-serialised map of per-topic read
+  positions, fsync’d every time we persist a checkpoint.
+- **Background workers (`runtime/background.rs`)** – Drain the fsync queue,
+  batch flushes (single io_uring submit on Linux), and delete files once every
+  block in them is sealed, unlocked, and checkpointed.
+- **Path manager (`paths.rs`)** – Builds namespaced directory roots, creates new
+  timestamped WAL files, and fsyncs directory entries so the files survive a
+  crash.
+
+## Storage layout & block lifecycle
+
+- Files live under `wal_files/<namespace>/`. Each file is 1 GB
+  (`DEFAULT_BLOCK_SIZE` × `BLOCKS_PER_FILE`) preallocated on disk.
+- Writers operate on 10 MB logical blocks. Batch appends can reserve multiple
+  contiguous blocks; regular appends seal the block when there is no room left.
+- Every entry is prefixed with a 64-byte header carrying the topic name, payload
+  length, checksum (FNV-1a), and a hint pointing at the next block boundary.
+  Reads verify the checksum before returning data.
+- `BlockStateTracker` / `FileStateTracker` record lock, checkpoint, and
+  allocation state. When a file is fully allocated AND every block is released
+  + checkpointed, the deletion worker removes the file.
+
+![Topic Block Mapping](https://raw.githubusercontent.com/nubskr/nubskr.github.io/refs/heads/master/_posts/Topic%20continuous%20Mapping(5).png)
+
+**Per-Topic View (continuous abstraction):**
+```
+Topic A sees:
+┌────────┬────────┬────────┬────────┐
+│Block 0 │Block 2 │Block 5 │Block 8 │  ← Appears continuous
+└────────┴────────┴────────┴────────┘
+  (file 0)  (file 0)  (file 0)  (file 1)
+
+Topic B sees:
+┌────────┬────────┬────────┐
+│Block 1 │Block 3 │Block 6 │          ← Also appears continuous
+└────────┴────────┴────────┘
+  (file 0)  (file 0)  (file 0)
+
+Actual layout on disk (interleaved):
+File 0: [B0:A][B1:B][B2:A][B3:B][B4:?][B5:A][B6:B]...
+        Block allocation is dynamic, topics don't know about each other
+```
+
+## Write path (single entry)
+
+```
+User calls append_for_topic("events", data)
+        │
+        ▼
+┌────────────────────────┐
+│ 1. Get/create Writer   │  ◄─── Walrus.writers RwLock
+└────────┬───────────────┘
+         │
+         ▼
+┌────────────────────────────┐
+│ 2. Check space in block?   │
+├────────┬───────────────────┤
+│  Yes   │  No               │
+└────┬───┴───────────────────┘
+     │           │
+     │           ▼
+     │    ┌──────────────────┐
+     │    │ Seal current blk │
+     │    │ → Reader chain   │
+     │    │ Alloc new block  │
+     │    └──────┬───────────┘
+     │           │
+     ▼           ▼
+┌───────────────────────────┐
+│ 3. Block::write()         │
+│  • Serialize metadata     │
+│  • Compute checksum       │
+│  • memcpy to mmap/fd      │
+│  • Update offset          │
+└────────┬──────────────────┘
+         │
+         ▼
+┌────────────────────────────┐
+│ 4. Fsync policy            │
+├────────────────────────────┤
+│ • SyncEach → flush now     │
+│ • Milliseconds(n) → queue  │
+│ • NoFsync → skip           │
+└────────────────────────────┘
+```
+
+1. `Walrus::append_for_topic` fetches or creates the topic's `Writer`.
+2. The writer verifies there is enough room; if not, it flushes and seals the
+   block, appends it to the reader chain, and grabs a new block from the
+   allocator.
+3. `Block::write` serialises metadata + payload into the shared mmap/fd.
+4. Fsync policy:
+   - `SyncEach` → flush immediately.
+   - `Milliseconds(n)` → enqueue the path on the fsync channel.
+   - `NoFsync` → skip flush entirely for raw throughput.
+
+### Batch appends
+
+- Guarded by a compare-and-swap flag so only one batch per topic runs at a time.
+- Precomputes how many blocks it needs and borrows them from the allocator up
+  front.
+- On Linux with the fd backend, the batch turns into a series of io_uring write
+  ops submitted together; other platforms fall back to sequential writes.
+- Any failure (allocation, write, completion) rolls back offsets and releases
+  provisional blocks.
+
+## Read path
+
+```
+User calls read_next("events", checkpoint=true)
+        │
+        ▼
+┌───────────────────────────┐
+│ 1. Get ColReaderInfo      │  ◄─── Hydrate from WalIndex if first read
+│    (cur_block_idx,        │
+│     cur_block_offset,     │
+│     tail_block_id,        │
+│     tail_offset)          │
+└────────┬──────────────────┘
+         │
+         ▼
+┌───────────────────────────────────┐
+│ 2. Try sealed chain first         │
+├───────────────────────────────────┤
+│ If cur_block_idx < chain.len():   │
+│   • Read block[idx] at offset     │
+│   • Advance offset                │
+│   • Mark checkpointed if done     │
+│   • Return entry                  │
+└────────┬──────────────────────────┘
+         │ Chain exhausted?
+         ▼
+┌───────────────────────────────────┐
+│ 3. Try tail (active writer block) │
+├───────────────────────────────────┤
+│ • Snapshot writer (block_id, off) │
+│ • If rotated: fold tail→sealed    │
+│ • Read from tail_offset           │
+│ • Advance tail_offset (in-memory) │
+│ • Return entry                    │
+└────────┬──────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────┐
+│ 4. Checkpoint decision             │
+├────────────────────────────────────┤
+│ • StrictlyAtOnce: persist now      │
+│ • AtLeastOnce: count++             │
+│   if count % persist_every == 0:   │
+│     persist to WalIndex            │
+│                                    │
+│ Index stores:                      │
+│  • Sealed: (idx, offset)           │
+│  • Tail: (block_id | 1<<63, offset)│
+└────────────────────────────────────┘
+```
+
+1. `Walrus::read_next` (and `batch_read_for_topic`) obtain the per-topic
+   `ColReaderInfo`. On first use we hydrate the position from `WalIndex`.
+2. Sealed chain first: walk blocks in order, marking each block checkpointed as
+   we drain it.
+3. Tail second: snapshot the writer's live block + offset and read new entries
+   directly from it, keeping a tail cursor in-memory.
+4. Checkpointing rules:
+   - `StrictlyAtOnce` persists after every successful read.
+   - `AtLeastOnce { persist_every }` counts reads and only persists every *N*
+     reads unless we *must* force a checkpoint (e.g., folding the tail into the
+     sealed chain).
+5. `WalIndex` stores either a sealed chain index/offset or a tail sentinel
+   (`block_id | 1<<63`) that represents progress inside the writer's live block.
+
+`batch_read_for_topic` follows the same logic but builds a bounded read plan so
+we never exceed `max_bytes` or the global `MAX_BATCH_ENTRIES` (2000) limit.
+
+## Background fsync & reclamation
+
+- Writers push file paths onto the fsync channel whenever they produce data
+  under `FsyncSchedule::Milliseconds(_)`.
+- The background worker deduplicates paths, opens storage handles on demand,
+  and flushes in batches. With the fd backend on Linux we emit one io_uring
+  `FSYNC` opcode per file and submit them together.
+- `flush_check` watches block/file counters. Once a file is fully allocated,
+  unlocked, and every block is checkpointed, the deletion queue removes it the
+  next time the worker drops its mmap/fd cache.
+
+## Recovery (startup choreography)
+
+1. Walk the namespace directory, ignoring `_index.db` files.
+2. For each timestamped file:
+   - mmap or open through the fd backend,
+   - scan in 10 MB strides until we hit zeroed regions,
+   - replay metadata to rebuild the per-topic block chains and populate block
+     trackers.
+3. Rehydrate the read index to restore cursor positions (including tail
+   sentinels).
+4. Trigger `flush_check` on every file so the background worker can immediately
+   reclaim anything that is already sealed and checkpointed.
+
+With this setup the external API stays minimal (`append`, `batch_append`,
+`read_next`, `batch_read`), while the engine beneath handles allocation,
+durability, and cleanup without the caller having to micromanage anything.
+
+
+
+================================================
+FILE: ascii_flow.md
+================================================
+---
+title: ASCII flow
+layout: default
+nav_order: 9
+---
+
+```
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                          WALRUS BATCH READ/WRITE ARCHITECTURE                                         ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                    API LAYER (Public Interface)                                     │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                │
+                      ┌─────────────────────────┼─────────────────────────┐
+                      │                         │                         │
+                      ▼                         ▼                         ▼
+          ┌──────────────────┐     ┌──────────────────────┐   ┌──────────────────────┐
+          │ append_for_topic │     │batch_append_for_topic│   │batch_read_for_topic  │
+          │   (single write) │     │  (batch write API)   │   │  (batch read API)    │
+          └────────┬─────────┘     └──────────┬───────────┘   └──────────┬───────────┘
+                   │                          │                           │
+                   │                          │                           │
+                   └───────┬──────────────────┘                           │
+                           │                                              │
+                           ▼                                              ▼
+          ┌─────────────────────────────────────┐         ┌─────────────────────────────────┐
+          │        WRITER SUBSYSTEM             │         │       READER SUBSYSTEM          │
+          │  (src/wal/runtime/writer.rs)        │         │  (src/wal/runtime/walrus_read.rs)│
+          └─────────────────────────────────────┘         └─────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                  BATCH WRITE FLOW (batch_append_for_topic)                            ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐
+     │  PHASE 0: VALIDATION                                                                 │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  • Check batch size: ≤ MAX_BATCH_ENTRIES (2,000)                                     │
+     │  • Check total bytes: ≤ MAX_BATCH_BYTES (10GB)                                       │
+     │  • Acquire atomic flag: is_batch_writing (compare_exchange)                          │
+     │  • Create RAII BatchGuard to ensure flag release                                     │                                                       │                                                                                       │
+     │  FAIL ─► Return ErrorKind::InvalidInput (size) or WouldBlock (flag busy)             │                                                       └───────────────────────────────────────┬──────────────────────────────────────────────┘
+                                             │ SUCCESS
+                                             ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐                                                       │  PHASE 1: PRE-ALLOCATION & PLANNING                                                  │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  • Acquire locks: current_block (Mutex) + current_offset (Mutex)                     │
+     │  • Save revert info: original_offset, allocated_block_ids[]                          │
+     │  • Build write plan: Vec<(Block, offset, batch_index)>                               │
+     │                                                                                       │
+     │    FOR EACH entry in batch:                                                          │
+     │      need = PREFIX_META_SIZE (64 bytes) + data.len()                                 │
+     │      IF need fits in current_block:                                                  │                                                       │        ├─► Add to write_plan: (current_block, planning_offset, idx)                  │
+     │        └─► planning_offset += need                                                   │
+     │      ELSE (need new block):                                                          │                                                       │        ├─► Seal current block (set used, flush, append to reader chain)              │
+     │        ├─► BlockAllocator::alloc_block(need) ─► new_block                            │
+     │        ├─► Track: allocated_block_ids.push(new_block.id)                             │
+     │        ├─► current_block = new_block                                                 │
+     │        └─► planning_offset = 0                                                       │
+     │                                                                                       │
+     │  • Result: Complete write plan with all blocks pre-allocated                         │                                                       └───────────────────────────────────────┬──────────────────────────────────────────────┘
+                                             │                                                                                                                      ┌───────────────────────┴────────────────────────┐                                                                                             │ Backend Selection (Linux + FD backend?)         │
+                     └───┬─────────────────────────────────────────┬──┘
+                         │ YES (io_uring)                          │ NO (mmap)
+                         ▼                                         ▼
+     ┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐                                                             │ PHASE 2+3: IO_URING PATH            │    │ FALLBACK: SEQUENTIAL MMAP PATH      │
+     ├─────────────────────────────────────┤    ├─────────────────────────────────────┤                                                             │ PHASE 2: Preparation                │    │ FOR EACH (block, offset, idx):      │                                                             │  • Create io_uring (size = plan.len)│    │   ├─► block.write(offset, data)     │
+     │  • Build buffers[] for each entry:  │    │   └─► ON ERROR: zero headers,       │
+     │    ├─► Serialize Metadata:          │    │       flush, rollback offset        │
+     │    │   • read_size, checksum (FNV-1a)│   │                                      │
+     │    │   • owned_by, next_block_start  │    │ Fsync all touched files            │
+     │    ├─► Build combined buffer:        │    │ Update writer offset = planning    │
+     │    │   [64B metadata][data payload]  │    └─────────────────────────────────────┘
+     │    └─► Push io_uring::opcode::Write │
+     │        with file_offset = blk.offset│
+     │                                      │
+     │ PHASE 3: Atomic Submission           │
+     │  • submit_and_wait(plan.len())      │
+     │  • Check ALL completion queue entries│
+     │  • Validate: result == expected_bytes│
+     │                                      │
+     │  IF ANY FAILURE:                     │
+     │    ├─► Zero all entry headers        │
+     │    ├─► Fsync zeros to disk           │
+     │    ├─► Rollback offset               │
+     │    ├─► Mark allocated blocks unlocked│
+     │    └─► Return Error                  │
+     │                                      │
+     │  SUCCESS:                            │
+     │    ├─► Fsync all touched files       │
+     │    ├─► Update writer offset = planning│
+     │    └─► Release locks & RAII guard    │
+     └─────────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                  BATCH READ FLOW (batch_read_for_topic)                               ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐
+     │  PHASE 1: INITIALIZATION & CURSOR HYDRATION                                          │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  • Get or create ColReaderInfo (Arc<RwLock<ColReaderInfo>>)                          │
+     │  • Snapshot active writer state: (active_block, written_offset)                      │
+     │                                                                                       │
+     │  IF NOT hydrated_from_index:                                                         │
+     │    ├─► Read from ReadOffsetIndex                                                     │
+     │    ├─► Check for TAIL_FLAG (bit 63): cursor in active tail vs sealed chain          │
+     │    │   ├─► TAIL: extract block_id, set cur_block_idx = chain.len()                  │
+     │    │   └─► SEALED: use cur_block_idx, cur_block_offset from index                   │
+     │    └─► Mark hydrated_from_index = true                                               │
+     │                                                                                       │
+     │  IF persisted tail exists AND that block is now sealed:                              │
+     │    └─► Fold into sealed chain: find block_id in chain, update cur_block_idx/offset  │
+     └───────────────────────────────────────┬──────────────────────────────────────────────┘
+                                             ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐
+     │  PHASE 2: BUILD READ PLAN                                                            │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  Initialize: plan = Vec<ReadPlan>, planned_bytes = 0                                 │
+     │                                                                                       │
+     │  SEALED CHAIN PLANNING (cur_idx < chain.len()):                                      │
+     │    WHILE cur_idx < chain.len() AND planned_bytes < max_bytes:                        │
+     │      block = chain[cur_idx]                                                          │
+     │      IF cur_offset >= block.used:                                                    │
+     │        ├─► Mark block as checkpointed                                                │
+     │        └─► Advance: cur_idx++, cur_offset = 0, continue                              │
+     │      ELSE:                                                                           │
+     │        end = min(block.used, cur_offset + (max_bytes - planned_bytes))               │
+     │        plan.push(ReadPlan { blk, start: cur_offset, end, is_tail: false })           │
+     │        planned_bytes += (end - cur_offset)                                           │
+     │        cur_idx++, cur_offset = 0                                                     │
+     │                                                                                       │
+     │  TAIL PLANNING (if cur_idx >= chain.len()):                                          │
+     │    tail_start = if tail_block_id == active_block.id { tail_offset } else { 0 }      │
+     │    IF tail_start < written:                                                          │
+     │      plan.push(ReadPlan { blk: active_block, start: tail_start, end: written,        │
+     │                          is_tail: true })                                            │
+     │                                                                                       │
+     │  IF plan.is_empty(): Return empty Vec                                                │
+     └───────────────────────────────────────┬──────────────────────────────────────────────┘
+                                             │
+                     ┌───────────────────────┴────────────────────────┐
+                     │ Lock Strategy (StrictlyAtOnce vs AtLeastOnce)   │
+                     └───┬─────────────────────────────────────────┬──┘
+                         │ StrictlyAtOnce                          │ AtLeastOnce
+                         ▼                                         ▼
+                ┌──────────────────┐                      ┌──────────────────┐
+                │ HOLD LOCK        │                      │ RELEASE LOCK     │
+                │ during I/O       │                      │ before I/O       │
+                │ (prevents dup    │                      │ (allows parallel │
+                │  consumption)    │                      │  readers)        │
+                └────────┬─────────┘                      └────────┬─────────┘
+                         └───────────────────┬────────────────────┘
+                                             ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐
+     │  PHASE 3: EXECUTE READS                                                              │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  ┌────────────────────────────┐        ┌────────────────────────────┐               │
+     │  │ LINUX + FD BACKEND         │        │ FALLBACK (mmap)            │               │
+     │  ├────────────────────────────┤        ├────────────────────────────┤               │
+     │  │ • Create io_uring          │        │ FOR EACH read_plan:        │               │
+     │  │ • FOR EACH read_plan:      │        │   size = end - start       │               │
+     │  │   ├─► Allocate buffer[size]│        │   buffer = vec![0; size]   │               │
+     │  │   ├─► Get FD from block    │        │   offset = blk.offset +    │               │
+     │  │   ├─► Push Read opcode:    │        │            read_plan.start │               │
+     │  │   │   fd, buffer, size,    │        │   blk.mmap.read(offset,    │               │
+     │  │   │   offset, user_data    │        │                 buffer)    │               │
+     │  │   └─► Store buffer         │        │   buffers.push(buffer)     │               │
+     │  │                             │        └────────────────────────────┘               │
+     │  │ • submit_and_wait(plan.len)│                                                      │
+     │  │ • Validate completions:    │                                                      │
+     │  │   ├─► result >= 0          │                                                      │
+     │  │   └─► result == expected   │                                                      │
+     │  │   FAIL ─► UnexpectedEof    │                                                      │
+     │  └────────────────────────────┘                                                      │
+     └───────────────────────────────────────┬──────────────────────────────────────────────┘
+                                             ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────────┐
+     │  PHASE 4: PARSE ENTRIES & COMMIT PROGRESS                                            │
+     ├──────────────────────────────────────────────────────────────────────────────────────┤
+     │  Initialize: entries = Vec, total_data_bytes = 0, entries_parsed = 0                 │
+     │                                                                                       │
+     │  FOR EACH (plan_idx, read_plan) in plan:                                             │
+     │    buffer = buffers[plan_idx]                                                        │
+     │    buf_offset = 0                                                                    │
+     │                                                                                       │
+     │    WHILE buf_offset < buffer.len() AND entries.len() < MAX_BATCH_ENTRIES:            │
+     │      ┌─ Read 64-byte metadata header ─────────────────────────────────┐             │
+     │      │ Bytes 0-1: meta_len (little-endian)                            │             │
+     │      │ Bytes 2+:  rkyv-serialized Metadata                            │             │
+     │      │   ├─► read_size (data payload size)                            │             │
+     │      │   ├─► checksum (FNV-1a hash)                                   │             │
+     │      │   ├─► owned_by (topic name)                                    │             │
+     │      │   └─► next_block_start                                         │             │
+     │      └────────────────────────────────────────────────────────────────┘             │
+     │                                                                                       │
+     │      entry_consumed = PREFIX_META_SIZE (64) + data_size                              │
+     │                                                                                       │
+     │      ┌─ Enforce Budget ───────────────────────────────────────────────┐             │
+     │      │ next_total = total_data_bytes + data_size                      │             │
+     │      │ IF next_total > max_bytes AND entries is not empty:            │             │
+     │      │   └─► BREAK (budget exceeded, stop parsing)                    │             │
+     │      │ ELSE always allow at least 1 entry                             │             │
+     │      └────────────────────────────────────────────────────────────────┘             │
+     │                                                                                       │
+     │      ┌─ Verify Checksum ──────────────────────────────────────────────┐             │
+     │      │ data_slice = buffer[buf_offset+64 .. buf_offset+64+data_size]  │             │
+     │      │ IF checksum64(data_slice) != meta.checksum:                    │             │
+     │      │   └─► Return ErrorKind::InvalidData                            │             │
+     │      └────────────────────────────────────────────────────────────────┘             │
+     │                                                                                       │
+     │      entries.push(Entry { data: data_slice.to_vec() })                               │
+     │      total_data_bytes = next_total                                                   │
+     │      entries_parsed++                                                                │
+     │                                                                                       │
+     │      ┌─ Track Position ───────────────────────────────────────────────┐             │
+     │      │ in_block_offset = read_plan.start + buf_offset + entry_consumed│             │
+     │      │ IF read_plan.is_tail:                                          │             │
+     │      │   └─► final_tail_block_id, final_tail_offset = ...             │             │
+     │      │ ELSE (sealed chain):                                           │             │
+     │      │   └─► final_block_idx, final_block_offset = ...                │             │
+     │      └────────────────────────────────────────────────────────────────┘             │
+     │                                                                                       │
+     │      buf_offset += entry_consumed                                                    │
+     │                                                                                       │
+     │  ┌─ Commit Progress (if checkpoint=true) ─────────────────────────────┐             │
+     │  │ IF saw_tail:                                                       │             │
+     │  │   ├─► Update: tail_block_id, tail_offset                           │             │
+     │  │   └─► Persist to index with TAIL_FLAG                              │             │
+     │  │ ELSE (sealed):                                                     │             │
+     │  │   ├─► Update: cur_block_idx, cur_block_offset                      │             │
+     │  │   └─► Persist to index                                             │             │
+     │  │                                                                     │             │
+     │  │ StrictlyAtOnce: ALWAYS persist                                     │             │
+     │  │ AtLeastOnce: persist every N reads (threshold-based)               │             │
+     │  └────────────────────────────────────────────────────────────────────┘             │
+     │                                                                                       │
+     │  RETURN entries (Vec<Entry>)                                                         │
+     └──────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                      CORE COMPONENTS                                                  ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  WRITER (per topic)                                    READER (per topic)                          │
+  │  ┌──────────────────────────────────────┐              ┌──────────────────────────────────────┐   │
+  │  │ Writer {                             │              │ ColReaderInfo {                      │   │
+  │  │   allocator: Arc<BlockAllocator>     │              │   chain: Vec<Block>  // sealed       │   │
+  │  │   current_block: Mutex<Block>        │              │   cur_block_idx: usize               │   │
+  │  │   current_offset: Mutex<u64>         │              │   cur_block_offset: u64              │   │
+  │  │   is_batch_writing: AtomicBool ◄─────┼──┐           │   tail_block_id: u64                 │   │
+  │  │   reader: Arc<Reader>                │  │           │   tail_offset: u64                   │   │
+  │  │   fsync_schedule: FsyncSchedule      │  │           │   reads_since_persist: u32           │   │
+  │  │ }                                    │  │           │   hydrated_from_index: bool          │   │
+  │  └──────────────────────────────────────┘  │           │ }                                    │   │
+  │                                            │           └──────────────────────────────────────┘   │
+  │  Concurrency Control:                      │           Read Consistency:                          │
+  │  • Mutex locks prevent concurrent writes   │           • StrictlyAtOnce: hold lock during I/O    │
+  │  • AtomicBool prevents batch + regular ────┘           • AtLeastOnce: release lock, parallel OK  │
+  │  • Regular write() checks is_batch_writing                                                        │
+  │    returns WouldBlock if batch in progress                                                        │
+  └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  BLOCK ALLOCATOR                                       READ OFFSET INDEX                           │
+  │  ┌──────────────────────────────────────┐              ┌──────────────────────────────────────┐   │
+  │  │ BlockAllocator {                     │              │ ReadOffsetIndex {                    │   │
+  │  │   // Manages block lifecycle         │              │   <topic>_index.db files             │   │
+  │  │   // Pre-allocates 10MB blocks       │              │   Stores:                            │   │
+  │  │   // Tracks file usage (1GB files)   │              │     cur_block_idx | TAIL_FLAG        │   │
+  │  │   // Block states: locked/unlocked   │              │     cur_block_offset                 │   │
+  │  │ }                                    │              │   TAIL_FLAG = 1 << 63                │   │
+  │  │                                      │              │ }                                    │   │
+  │  │ alloc_block(need: u64) -> Block      │              │                                      │   │
+  │  │   ├─► Returns pre-allocated block    │              │ Persistence Strategy:                │   │
+  │  │   └─► Marks as locked                │              │   StrictlyAtOnce: every read         │   │
+  │  │                                      │              │   AtLeastOnce: threshold-based       │   │
+  │  └──────────────────────────────────────┘              └──────────────────────────────────────┘   │
+  └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                      STORAGE LAYOUT                                                   ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  Filesystem Structure:
+  ┌─────────────────────────────────────────────────────────────────────────────────────────┐
+  │ wal_files/<namespace>/                                                                  │
+  │   ├── <timestamp_1>.wal   (1GB file = 100 × 10MB blocks)                                │
+  │   ├── <timestamp_2>.wal                                                                 │
+  │   ├── ...                                                                                │
+  │   ├── topic_A_index.db    (persisted read cursor)                                       │
+  │   ├── topic_B_index.db                                                                  │
+  │   └── ...                                                                                │
+  └─────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Block Structure (10MB logical blocks):
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Block {                                                                                  │
+  │   id: u64                  // unique block identifier                                    │
+  │   offset: u64              // byte offset in file                                        │
+  │   limit: u64               // 10MB capacity                                              │
+  │   used: u64                // bytes written (sealed blocks only)                         │
+  │   mmap: SharedMmap         // storage backend (FD or mmap)                               │
+  │   file_path: String                                                                      │
+  │ }                                                                                        │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Entry Layout (within block):
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ ┌──────────────────────────┬────────────────────────────────────────────────┐           │
+  │ │  METADATA PREFIX (64B)   │         DATA PAYLOAD (variable)                │           │
+  │ ├──────────────────────────┼────────────────────────────────────────────────┤           │
+  │ │ [0-1]: meta_len (u16 LE) │                                                │           │
+  │ │ [2+]:  rkyv Metadata {   │         Raw bytes (max ~10MB)                  │           │
+  │ │          read_size       │                                                │           │
+  │ │          checksum (FNV)  │                                                │           │
+  │ │          owned_by        │                                                │           │
+  │ │          next_block_start│                                                │           │
+  │ │        }                 │                                                │           │
+  │ └──────────────────────────┴────────────────────────────────────────────────┘           │
+  │                                                                                          │
+  │ Checksum: FNV-1a hash computed over data payload only                                   │
+  │ Verified on every read before returning to caller                                       │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Storage Backend Selection:
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ FD Backend (enable_fd_backend)          │  Mmap Backend (default/fallback)              │
+  │ ├─► Linux + io_uring support            │  ├─► Non-Linux platforms                      │
+  │ ├─► Batch writes via io_uring           │  ├─► Sequential writes                        │
+  │ ├─► Batch reads via io_uring            │  ├─► Direct mmap read/write                   │
+  │ └─► Better throughput for large batches │  └─► Simpler, universal compatibility         │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                      KEY CONSTRAINTS & LIMITS                                         ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Constant                 │ Value      │ Purpose                                         │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ MAX_BATCH_ENTRIES        │ 2,000      │ Entry cap for batch read/write                  │
+  │                          │            │ (stays below io_uring SQ limit of 2,047)        │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ MAX_BATCH_BYTES          │ 10 GB      │ Total size limit for batch writes               │
+  │                          │            │ (enables pre-computation of block requirements) │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ DEFAULT_BLOCK_SIZE       │ 10 MB      │ Logical block size                              │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ BLOCKS_PER_FILE          │ 100        │ Blocks per WAL file                             │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ MAX_FILE_SIZE            │ 1 GB       │ 10MB × 100 blocks                               │
+  ├──────────────────────────┼────────────┼─────────────────────────────────────────────────┤
+  │ PREFIX_META_SIZE         │ 64 bytes   │ Metadata prefix per entry                       │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Error Handling:
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Error                    │ Cause                          │ Recovery Action           │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ InvalidInput             │ Batch > 2000 entries or 10GB   │ Immediate return          │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ WouldBlock               │ Concurrent batch write         │ Client retry with backoff │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ UnexpectedEof            │ Short read from io_uring/mmap  │ Data corruption detected  │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ InvalidData              │ Checksum mismatch              │ Data corruption detected  │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ Unsupported              │ FD backend not available       │ Fallback to mmap or fail  │
+  ├──────────────────────────┼────────────────────────────────┼───────────────────────────┤
+  │ Write failure (batch)    │ io_uring error                 │ Zero headers, rollback    │
+  │                          │                                │ offset, unlock blocks     │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                   ATOMICITY GUARANTEES                                                ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  Batch Write Atomicity:
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ All entries in a batch are written atomically - either ALL or NONE                    │
+  │                                                                                        │
+  │ Mechanism:                                                                             │
+  │  1. io_uring batched submission    → Kernel-level atomicity                            │
+  │  2. Pre-allocation                 → No mid-batch allocation failures                  │
+  │  3. Held locks                     → No concurrent modifications during batch          │
+  │  4. Atomic flag (is_batch_writing) → Prevents concurrent regular writes                │
+  │  5. Rollback on failure:                                                               │
+  │     ├─► Zero all entry headers (make unreadable)                                       │
+  │     ├─► Restore original writer offset                                                 │
+  │     └─► Mark allocated blocks as unlocked/reclaimable                                  │
+  │                                                                                        │
+  │ Writer offset is ONLY updated on complete success (Phase 4)                            │
+  │ Readers will see either all entries or none                                            │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Read Consistency Models:
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ StrictlyAtOnce                          │  AtLeastOnce                                 │
+  │ ├─► Hold write lock during I/O         │  ├─► Release lock before I/O                 │
+  │ ├─► Prevents duplicate consumption     │  ├─► Allows parallel readers                 │
+  │ ├─► Persist after every read           │  ├─► Persist every N reads (threshold)       │
+  │ └─► Single consumer guarantee          │  └─► Multiple consumers OK, may re-read      │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+
+================================================
+FILE: clustering.md
+================================================
+## this is a WIP file and MUST not be shown on the site and must not be touched too!!
+
+## Global state
+this state is shared across cluster
+
+### Readers:
+```
+Topic A: reader meta chain [][][][][][]...
+Topic B: reader meta chain [][][][][][]...
+...
+```
+
+### Readers:
+```
+Topic A: active block []
+Topic B: active block []
+...
+```
+
+
+
+================================================
+FILE: configuration.md
+================================================
+---
+title: Configuration
+layout: default
+nav_order: 4
+---
+
+# Configuring Walrus
+
+Walrus keeps the API surface small while letting you tune durability, storage layout, and performance characteristics. This guide gathers the knobs you can adjust and explains when each option fits.
+
+## Instance Constructors
+
+Use the provided constructors to set defaults for read consistency and fsync cadence at startup:
+
+- `Walrus::new()` — strict read checkpoints, 1 s fsync cadence.
+- `Walrus::with_consistency(ReadConsistency)` — pick the read model while keeping the default fsync schedule.
+- `Walrus::with_consistency_and_schedule(ReadConsistency, FsyncSchedule)` — full control over both read checkpoints and fsync behaviour.
+- `Walrus::new_for_key(&str)` and the `_for_key` variants — place the instance under `wal_files/<sanitized-key>/` for workload isolation.
+
+You can also set `WALRUS_INSTANCE_KEY=<key>` before constructing `Walrus` to namespace the default constructors without changing call-sites.
+
+## Read Consistency Modes
+
+Walrus persists read offsets according to the configured consistency:
+
+### `ReadConsistency::StrictlyAtOnce`
+
+- Persists the cursor on every checkpointed read.
+- Guarantees at-most-once replays after restarts.
+- Suitable when duplicate processing is unacceptable.
+
+```rust
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+```
+
+### `ReadConsistency::AtLeastOnce { persist_every: u32 }`
+
+- Buffers cursor updates and flushes them every _N_ reads.
+- Higher throughput, but the last window of entries may repeat after a crash.
+- Works well for streaming pipelines that can tolerate occasional duplicates.
+
+```rust
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 5_000 },
+)?;
+```
+
+## Fsync Scheduling
+
+Durability behaviour is controlled via `FsyncSchedule`:
+
+| Schedule | Behaviour | Typical Use |
+|----------|-----------|-------------|
+| `FsyncSchedule::SyncEach` | Flush to disk after every write; slowest but safest | Financial or safety-critical systems |
+| `FsyncSchedule::Milliseconds(n)` | Background thread flushes every _n_ milliseconds (default: 1000) | Balanced throughput vs. durability |
+| `FsyncSchedule::NoFsync` | Leave writes in the OS page cache | Performance testing or workloads with external durability |
+
+```rust
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1_000 },
+    FsyncSchedule::Milliseconds(2_000),
+)?;
+```
+
+## Backend Selection
+
+Walrus ships with two storage backends:
+
+- **FD backend** (`enable_fd_backend()`): default on Linux; unlocks io_uring acceleration for batch operations.
+- **Mmap backend** (`disable_fd_backend()`): portable fallback when file descriptor-backed io_uring is unavailable.
+
+Toggling the backend is a process-wide decision. Set `WALRUS_QUIET=1` to suppress log noise while switching.
+
+```rust
+use walrus_rust::{enable_fd_backend, disable_fd_backend};
+
+enable_fd_backend();  // Linux fast-path
+// ...
+disable_fd_backend(); // enforce mmap-only behaviour
+```
+
+## Data Directory & Namespacing
+
+- Files live under `wal_files/` by default.
+- Set `WALRUS_DATA_DIR=/custom/path` to relocate the entire tree.
+- Use the `_for_key` constructors or `WALRUS_INSTANCE_KEY` to isolate workloads under `wal_files/<sanitized-key>/`.
+
+Example layout:
+
+```
+wal_files/
+├── 1700000000                  # default instance log (1 GB preallocated)
+├── read_offset_idx_index.db    # default read-offset index
+├── analytics/
+│   ├── 1700000100
+│   └── read_offset_idx_index.db
+└── transactions/
+    ├── 1700000200
+    └── read_offset_idx_index.db
+```
+
+## Runtime Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `WALRUS_DATA_DIR` | Override the root directory for WAL files and indexes. |
+| `WALRUS_INSTANCE_KEY` | Namespace instances created via default constructors. |
+| `WALRUS_QUIET` | Suppress debug output when flipping backends. |
+
+## Benchmark & Tooling Variables
+
+Walrus includes benchmarking harnesses under `Makefile` targets. Tune them by exporting the following variables before running a benchmark:
+
+| Variable | Description |
+|----------|-------------|
+| `WALRUS_FSYNC` / `FSYNC` | Set fsync cadence (`sync-each`, `no-fsync`, `async`, `<n>ms`). |
+| `WALRUS_THREADS` / `THREADS` | Control thread counts (`<n>` or `<start-end>`). |
+| `WALRUS_DURATION` | Total benchmark duration (`30s`, `2m`, `1h`, …). |
+| `WALRUS_WRITE_DURATION` | Override write phase duration. |
+| `WALRUS_READ_DURATION` | Override read phase duration. |
+| `WALRUS_BATCH_SIZE` / `BATCH` | Entries per batch for batch benchmarks. |
+
+Example:
+
+```bash
+FSYNC=sync-each THREADS=16 WALRUS_DURATION=5m make bench-scaling
+```
+
+## Choosing a Profile
+
+| Goal | Suggested Settings |
+|------|--------------------|
+| Maximum throughput | `ReadConsistency::AtLeastOnce { persist_every: 10_000 }`, `FsyncSchedule::NoFsync`, FD backend enabled. |
+| Balanced production | `ReadConsistency::AtLeastOnce { persist_every: 1_000 }`, `FsyncSchedule::Milliseconds(1_000)`. |
+| Maximum durability | `ReadConsistency::StrictlyAtOnce`, `FsyncSchedule::SyncEach`, consider smaller `persist_every` if using AtLeastOnce. |
+
+Combine these with keyed instances when separate workloads need different durability guarantees on the same host.
+
+
+
+================================================
+FILE: configurations.md
+================================================
+## this is a WIP file and MUST not be shown on the site and must not be touched too!!
+
+all the darn configurations that exist (both in code and in my head atm)
+
+## ReadConsistency
+- StrictlyAtOnce
+- AtLeastOnce {persist_every:X} // persist every X reads (for linear read modes, super legacy)
+
+## FsyncSchedule
+legacy stuff from single node times
+- Milliseconds(X) // fsync dirty files every X milliseconds
+- SyncEach // fsync sync every single entry
+- NoFsync // rely entirely on linux's dirty page backpressure for durability
+
+above shits are legacy shits from single node times that need to be maintained in some capacity
+
+---
+distributed stuff:
+
+## BlockWriteConsistency
+- Quorum
+- LeaderSync (fsync on leader and async replication)
+
+## BlockReadConsistency
+- Quorum ?? (or just confirm with leader via lightweight rpc ? quorum might not be needed, can use quorum when no leader is present though)
+
+## TopicRead
+need to select this consistency mode while initializing a topic
+- LinearReads (legacy read pointer acknowledgement stuff)
+- RandomReads (modern id based acknowledgement stuff)
+
+
+
+
+
+================================================
+FILE: distributed coordination.md
+================================================
+## this is a WIP file and MUST not be shown on the site and must not be touched too!!
+
+walrus runs on this coordination philosophy of having heirchical consensus where each layer can choose it's desired consistency levels 
+
+it's philosophically inspired by the way britishers ruled india
+
+consider this analogy:
+
+the queen of england doesnt bothers with how a british viceroy handles conflicts between two farmers in an indian village, he can:
+
+1. Be the mediator (quorum in sub-cluster of 3)
+2. Let them fight (eventual consistency)
+3. Get the classified time machine from britain and interrupt the sex of two indian couples in the past (need queen's permission to use the classified time machine though)
+
+in technical terms:
+
+we use raft across the whole cluster for strong consistency(whenever required eg: global configs, cluster membership, member health checks) and as a 'bus' for strong consensus stuff, nodes can use this path to replicate something IMPORTANT globally by consulting the leader
+
+once that's set, the undelying cluster under the watchful eye of the leader can do whatever they please, leader would occasionally step in and give partition leases to `sub-clusters` and as I like to call them "logical clusters" and would just step away, it's the sub-cluster's choice to do whatever it pleases(within itself), it could:
+
+1. async replication via "logical" leader and followers
+2. run it's own separate consensus stuff(again, WITHIN it's sub-cluster) via "logical" leaders and followers
+3. it can do whatever it pleases: have it's own sub-leases, own heart-beats, timers, whatever it wants untill it's lease expires,
+
+it's like VM(s) inside a VM
+
+after the lease expires, it's up to the queen of england to decide who's the viceroy next ;)
+
+
+================================================
+FILE: examples.md
+================================================
+---
+title: Examples
+layout: default
+nav_order: 11
+---
+
+# Practical Examples
+
+Real-world code patterns for common use cases. All examples assume basic familiarity with the [Getting Started](getting-started.html) guide.
+
+## Table of Contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## Basic Patterns
+
+### Simple Event Log
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+use std::io;
+
+fn main() -> io::Result<()> {
+    let wal = Walrus::new()?;
+
+    // Append events
+    wal.append_for_topic("user-events", b"user:123 logged in")?;
+    wal.append_for_topic("user-events", b"user:123 viewed page /home")?;
+    wal.append_for_topic("user-events", b"user:123 clicked button")?;
+
+    // Read them back
+    while let Some(entry) = wal.read_next("user-events", true)? {
+        println!("Event: {}", String::from_utf8_lossy(&entry.data));
+    }
+
+    Ok(())
+}
+```
+
+**Output:**
+```
+Event: user:123 logged in
+Event: user:123 viewed page /home
+Event: user:123 clicked button
+```
+
+---
+
+### Structured Data with Serialization
+
+```rust
+use walrus_rust::Walrus;
+use serde::{Serialize, Deserialize};
+use bincode;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct OrderEvent {
+    order_id: u64,
+    user_id: u64,
+    amount: f64,
+    status: String,
+}
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+
+    // Write structured event
+    let event = OrderEvent {
+        order_id: 12345,
+        user_id: 999,
+        amount: 149.99,
+        status: "completed".to_string(),
+    };
+
+    let bytes = bincode::serialize(&event).unwrap();
+    wal.append_for_topic("orders", &bytes)?;
+
+    // Read it back
+    if let Some(entry) = wal.read_next("orders", true)? {
+        let decoded: OrderEvent = bincode::deserialize(&entry.data).unwrap();
+        println!("Order: {:?}", decoded);
+    }
+
+    Ok(())
+}
+```
+
+---
+
+### Multiple Topics
+
+```rust
+use walrus_rust::Walrus;
+use std::sync::Arc;
+use std::thread;
+
+fn main() -> std::io::Result<()> {
+    let wal = Arc::new(Walrus::new()?);
+
+    // Writer threads for different topics
+    let mut handles = vec![];
+
+    for topic in ["metrics", "logs", "events"] {
+        let wal_clone = Arc::clone(&wal);
+        let topic = topic.to_string();
+
+        let handle = thread::spawn(move || {
+            for i in 0..1000 {
+                let msg = format!("{}: message {}", topic, i);
+                wal_clone.append_for_topic(&topic, msg.as_bytes()).unwrap();
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for writers
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Read from each topic
+    for topic in ["metrics", "logs", "events"] {
+        println!("\n=== {} ===", topic);
+        let mut count = 0;
+        while let Some(_) = wal.read_next(topic, true)? {
+            count += 1;
+        }
+        println!("Read {} entries from {}", count, topic);
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## High-Throughput Patterns
+
+### Batched Writes
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+use std::io;
+
+fn main() -> io::Result<()> {
+    // Configure for high throughput
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+        FsyncSchedule::Milliseconds(5_000),
+    )?;
+
+    // Collect entries to batch
+    let entries: Vec<Vec<u8>> = (0..1000)
+        .map(|i| format!("entry {}", i).into_bytes())
+        .collect();
+
+    // Convert to slice of slices
+    let batch: Vec<&[u8]> = entries.iter().map(|v| v.as_slice()).collect();
+
+    // Atomic batch append
+    wal.batch_append_for_topic("high-volume", &batch)?;
+
+    println!("Wrote {} entries atomically", batch.len());
+
+    Ok(())
+}
+```
+
+---
+
+### Batched Reads
+
+```rust
+use walrus_rust::Walrus;
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+
+    // ... write some data ...
+
+    // Read up to 10 MB at a time
+    let max_bytes = 10 * 1024 * 1024;
+
+    loop {
+        let entries = wal.batch_read_for_topic("events", max_bytes, true)?;
+
+        if entries.is_empty() {
+            break;  // No more data
+        }
+
+        println!("Processing batch of {} entries", entries.len());
+
+        for entry in entries {
+            process_entry(&entry.data);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_entry(data: &[u8]) {
+    // Your processing logic here
+    println!("  Entry: {} bytes", data.len());
+}
+```
+
+---
+
+## Concurrency Patterns
+
+### Multi-Threaded Producer
+
+```rust
+use walrus_rust::Walrus;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+fn main() -> std::io::Result<()> {
+    let wal = Arc::new(Walrus::new()?);
+    let num_producers = 8;
+    let messages_per_producer = 10_000;
+
+    let start = std::time::Instant::now();
+    let mut handles = vec![];
+
+    for producer_id in 0..num_producers {
+        let wal_clone = Arc::clone(&wal);
+
+        let handle = thread::spawn(move || {
+            for i in 0..messages_per_producer {
+                let msg = format!("producer-{}: msg-{}", producer_id, i);
+                wal_clone.append_for_topic("messages", msg.as_bytes()).unwrap();
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all producers
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let total_msgs = num_producers * messages_per_producer;
+    let throughput = total_msgs as f64 / elapsed.as_secs_f64();
+
+    println!("Wrote {} messages in {:?}", total_msgs, elapsed);
+    println!("Throughput: {:.0} msgs/sec", throughput);
+
+    Ok(())
+}
+```
+
+---
+
+### Producer-Consumer Pattern
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::time::Duration;
+
+fn main() -> std::io::Result<()> {
+    let wal = Arc::new(Walrus::with_consistency(
+        ReadConsistency::StrictlyAtOnce,
+    )?);
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Producer thread
+    let producer_wal = Arc::clone(&wal);
+    let producer_running = Arc::clone(&running);
+    let producer = thread::spawn(move || {
+        let mut counter = 0;
+        while producer_running.load(Ordering::Relaxed) {
+            let msg = format!("job-{}", counter);
+            producer_wal.append_for_topic("jobs", msg.as_bytes()).unwrap();
+            counter += 1;
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!("Producer: wrote {} jobs", counter);
+    });
+
+    // Consumer thread
+    let consumer_wal = Arc::clone(&wal);
+    let consumer_running = Arc::clone(&running);
+    let consumer = thread::spawn(move || {
+        let mut processed = 0;
+        while consumer_running.load(Ordering::Relaxed) {
+            if let Some(entry) = consumer_wal.read_next("jobs", true).unwrap() {
+                let job = String::from_utf8_lossy(&entry.data);
+                println!("Processing: {}", job);
+                processed += 1;
+                thread::sleep(Duration::from_millis(20));  // Simulate work
+            } else {
+                thread::sleep(Duration::from_millis(10));  // Wait for data
+            }
+        }
+        println!("Consumer: processed {} jobs", processed);
+    });
+
+    // Run for 5 seconds
+    thread::sleep(Duration::from_secs(5));
+    running.store(false, Ordering::Relaxed);
+
+    // Wait for threads
+    producer.join().unwrap();
+    consumer.join().unwrap();
+
+    Ok(())
+}
+```
+
+---
+
+## Durability Patterns
+
+### Critical Transactions (Maximum Durability)
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+fn process_payment(wal: &Walrus, payment_data: &[u8]) -> std::io::Result<()> {
+    // Configure for zero data loss
+    let txn_wal = Walrus::with_consistency_and_schedule_for_key(
+        "transactions",
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::SyncEach,  // Fsync every write
+    )?;
+
+    // Write transaction
+    txn_wal.append_for_topic("payments", payment_data)?;
+
+    // At this point, data is on disk and survives crashes
+    println!("Payment persisted to disk");
+
+    Ok(())
+}
+```
+
+---
+
+### Analytics Pipeline (High Throughput)
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+fn main() -> std::io::Result<()> {
+    // Optimize for throughput, tolerate 5s data loss
+    let wal = Walrus::with_consistency_and_schedule_for_key(
+        "analytics",
+        ReadConsistency::AtLeastOnce { persist_every: 100_000 },
+        FsyncSchedule::Milliseconds(5_000),
+    )?;
+
+    // High-volume ingestion
+    for batch in get_event_batches() {
+        let entries: Vec<&[u8]> = batch.iter().map(|e| e.as_slice()).collect();
+        wal.batch_append_for_topic("events", &entries)?;
+    }
+
+    Ok(())
+}
+
+fn get_event_batches() -> Vec<Vec<Vec<u8>>> {
+    // Your data source here
+    vec![]
+}
+```
+
+---
+
+## Recovery Patterns
+
+### Crash Recovery with Replay
+
+```rust
+use walrus_rust::Walrus;
+use std::collections::HashMap;
+
+#[derive(Default)]
+struct AppState {
+    user_balances: HashMap<u64, f64>,
+}
+
+impl AppState {
+    fn apply_transaction(&mut self, user_id: u64, amount: f64) {
+        *self.user_balances.entry(user_id).or_insert(0.0) += amount;
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+    let mut state = AppState::default();
+
+    // Replay WAL to rebuild state
+    println!("Replaying WAL...");
+    while let Some(entry) = wal.read_next("transactions", true)? {
+        let parts: Vec<&str> = std::str::from_utf8(&entry.data)
+            .unwrap()
+            .split(',')
+            .collect();
+
+        let user_id: u64 = parts[0].parse().unwrap();
+        let amount: f64 = parts[1].parse().unwrap();
+
+        state.apply_transaction(user_id, amount);
+    }
+
+    println!("State rebuilt from WAL:");
+    for (user_id, balance) in &state.user_balances {
+        println!("  User {}: ${:.2}", user_id, balance);
+    }
+
+    // Continue normal operation
+    state.apply_transaction(123, 50.0);
+    wal.append_for_topic("transactions", b"123,50.0")?;
+
+    Ok(())
+}
+```
+
+---
+
+### Checkpoint-Based State Management
+
+```rust
+use walrus_rust::Walrus;
+use serde::{Serialize, Deserialize};
+use std::fs;
+
+#[derive(Serialize, Deserialize, Default)]
+struct Snapshot {
+    version: u64,
+    last_offset: u64,
+    data: Vec<String>,
+}
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+
+    // Load latest snapshot
+    let mut snapshot = load_snapshot().unwrap_or_default();
+
+    // Replay from snapshot point
+    // (In practice, you'd track offset per-topic and resume)
+    println!("Resuming from version {}", snapshot.version);
+
+    // Process new entries
+    let mut count = 0;
+    while let Some(entry) = wal.read_next("data", true)? {
+        let item = String::from_utf8_lossy(&entry.data).to_string();
+        snapshot.data.push(item);
+        count += 1;
+
+        // Checkpoint every 1000 entries
+        if count % 1000 == 0 {
+            snapshot.version += 1;
+            save_snapshot(&snapshot)?;
+            println!("Checkpoint saved at version {}", snapshot.version);
+        }
+    }
+
+    Ok(())
+}
+
+fn load_snapshot() -> Option<Snapshot> {
+    let data = fs::read("snapshot.bin").ok()?;
+    bincode::deserialize(&data).ok()
+}
+
+fn save_snapshot(snapshot: &Snapshot) -> std::io::Result<()> {
+    let data = bincode::serialize(snapshot).unwrap();
+    fs::write("snapshot.bin.tmp", data)?;
+    fs::rename("snapshot.bin.tmp", "snapshot.bin")?;
+    Ok(())
+}
+```
+
+---
+
+## Advanced Patterns
+
+### Topic-Per-User Isolation
+
+```rust
+use walrus_rust::Walrus;
+use std::sync::Arc;
+
+struct UserEventLog {
+    wal: Arc<Walrus>,
+}
+
+impl UserEventLog {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            wal: Arc::new(Walrus::new()?),
+        })
+    }
+
+    fn log_event(&self, user_id: u64, event: &str) -> std::io::Result<()> {
+        let topic = format!("user-{}", user_id);
+        self.wal.append_for_topic(&topic, event.as_bytes())
+    }
+
+    fn get_user_events(&self, user_id: u64) -> std::io::Result<Vec<String>> {
+        let topic = format!("user-{}", user_id);
+        let mut events = vec![];
+
+        while let Some(entry) = self.wal.read_next(&topic, true)? {
+            events.push(String::from_utf8_lossy(&entry.data).to_string());
+        }
+
+        Ok(events)
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let log = UserEventLog::new()?;
+
+    // Log events for different users
+    log.log_event(123, "logged in")?;
+    log.log_event(456, "viewed dashboard")?;
+    log.log_event(123, "clicked button")?;
+
+    // Retrieve per-user
+    let user_123_events = log.get_user_events(123)?;
+    println!("User 123: {:?}", user_123_events);
+
+    let user_456_events = log.get_user_events(456)?;
+    println!("User 456: {:?}", user_456_events);
+
+    Ok(())
+}
+```
+
+**Output:**
+```
+User 123: ["logged in", "clicked button"]
+User 456: ["viewed dashboard"]
+```
+
+---
+
+### Namespaced Instances for Multi-Tenancy
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+use std::collections::HashMap;
+
+struct TenantManager {
+    wals: HashMap<String, Walrus>,
+}
+
+impl TenantManager {
+    fn new() -> Self {
+        Self {
+            wals: HashMap::new(),
+        }
+    }
+
+    fn get_or_create_wal(&mut self, tenant_id: &str) -> std::io::Result<&Walrus> {
+        if !self.wals.contains_key(tenant_id) {
+            // Each tenant gets isolated WAL instance
+            let wal = Walrus::with_consistency_for_key(
+                tenant_id,
+                ReadConsistency::StrictlyAtOnce,
+            )?;
+            self.wals.insert(tenant_id.to_string(), wal);
+        }
+        Ok(self.wals.get(tenant_id).unwrap())
+    }
+
+    fn log_event(&mut self, tenant_id: &str, topic: &str, data: &[u8])
+        -> std::io::Result<()>
+    {
+        let wal = self.get_or_create_wal(tenant_id)?;
+        wal.append_for_topic(topic, data)
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let mut manager = TenantManager::new();
+
+    // Tenants have completely isolated WALs
+    manager.log_event("acme-corp", "events", b"user signup")?;
+    manager.log_event("widgets-inc", "events", b"purchase")?;
+    manager.log_event("acme-corp", "metrics", b"cpu:45%")?;
+
+    // Files stored separately:
+    // wal_files/acme-corp/
+    // wal_files/widgets-inc/
+
+    Ok(())
+}
+```
+
+---
+
+### Retry with Exponential Backoff
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+use std::io::{Error, ErrorKind};
+use std::time::Duration;
+use std::thread;
+
+fn append_with_retry(
+    wal: &Walrus,
+    topic: &str,
+    data: &[u8],
+    max_retries: u32,
+) -> std::io::Result<()> {
+    let mut attempt = 0;
+    let mut backoff_ms = 100;
+
+    loop {
+        match wal.append_for_topic(topic, data) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // Batch write in progress, retry
+                attempt += 1;
+                if attempt >= max_retries {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "Max retries exceeded",
+                    ));
+                }
+
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;  // Exponential backoff
+            }
+            Err(e) => return Err(e),  // Other errors, fail immediately
+        }
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+
+    // Try appending with automatic retry
+    append_with_retry(&wal, "events", b"important data", 5)?;
+
+    println!("Write succeeded (possibly after retries)");
+
+    Ok(())
+}
+```
+
+---
+
+## Testing Patterns
+
+### Mock for Unit Tests
+
+```rust
+use walrus_rust::Walrus;
+use std::collections::HashMap;
+
+trait WalInterface {
+    fn append(&self, topic: &str, data: &[u8]) -> std::io::Result<()>;
+    fn read(&self, topic: &str) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+// Real implementation
+struct RealWal {
+    wal: Walrus,
+}
+
+impl WalInterface for RealWal {
+    fn append(&self, topic: &str, data: &[u8]) -> std::io::Result<()> {
+        self.wal.append_for_topic(topic, data)
+    }
+
+    fn read(&self, topic: &str) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.wal.read_next(topic, true)?.map(|e| e.data))
+    }
+}
+
+// Mock for testing
+struct MockWal {
+    data: HashMap<String, Vec<Vec<u8>>>,
+}
+
+impl MockWal {
+    fn new() -> Self {
+        Self { data: HashMap::new() }
+    }
+}
+
+impl WalInterface for MockWal {
+    fn append(&self, topic: &str, data: &[u8]) -> std::io::Result<()> {
+        // In real mock, use interior mutability (RefCell, etc.)
+        Ok(())
+    }
+
+    fn read(&self, topic: &str) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.data.get(topic).and_then(|v| v.first().cloned()))
+    }
+}
+
+// Your business logic works with trait
+fn process_events<W: WalInterface>(wal: &W) -> std::io::Result<()> {
+    wal.append("events", b"event1")?;
+    if let Some(data) = wal.read("events")? {
+        println!("Processed: {:?}", data);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_mock() {
+        let mock = MockWal::new();
+        process_events(&mock).unwrap();
+        // Assert on mock state
+    }
+}
+```
+
+---
+
+## Performance Patterns
+
+### Measure Throughput
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+use std::time::Instant;
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+        FsyncSchedule::NoFsync,  // Max throughput
+    )?;
+
+    let num_entries = 1_000_000;
+    let entry_size = 1024;
+    let data = vec![0u8; entry_size];
+
+    let start = Instant::now();
+
+    for _ in 0..num_entries {
+        wal.append_for_topic("benchmark", &data)?;
+    }
+
+    let elapsed = start.elapsed();
+    let ops_per_sec = num_entries as f64 / elapsed.as_secs_f64();
+    let mb_per_sec = (num_entries * entry_size) as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+
+    println!("Throughput: {:.0} ops/sec", ops_per_sec);
+    println!("Bandwidth: {:.2} MB/sec", mb_per_sec);
+    println!("Latency: {:.2} μs/op", elapsed.as_micros() as f64 / num_entries as f64);
+
+    Ok(())
+}
+```
+
+---
+
+## Error Handling Patterns
+
+### Graceful Degradation
+
+```rust
+use walrus_rust::Walrus;
+use std::io::{Error, ErrorKind};
+
+struct ResilientLogger {
+    wal: Option<Walrus>,
+}
+
+impl ResilientLogger {
+    fn new() -> Self {
+        let wal = match Walrus::new() {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("WARNING: WAL initialization failed: {}", e);
+                None
+            }
+        };
+
+        Self { wal }
+    }
+
+    fn log(&self, topic: &str, message: &str) {
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.append_for_topic(topic, message.as_bytes()) {
+                eprintln!("WARNING: Failed to log to WAL: {}", e);
+                // Fall back to stderr
+                eprintln!("[{}] {}", topic, message);
+            }
+        } else {
+            // WAL unavailable, log to stderr
+            eprintln!("[{}] {}", topic, message);
+        }
+    }
+}
+
+fn main() {
+    let logger = ResilientLogger::new();
+
+    logger.log("events", "Application started");
+    logger.log("events", "Processing request");
+
+    // Even if WAL fails, application continues
+    println!("Application running normally");
+}
+```
+
+---
+
+## More Examples
+
+For additional examples and patterns:
+
+- **Test suite:** `tests/` directory in the repo contains 4000+ lines of real-world scenarios
+- **Benchmarks:** `benches/` shows high-performance usage patterns
+- **GitHub issues:** Search for "example" tag for community contributions
+
+**Contribute your own:**
+If you build something cool with Walrus, share it! We accept PRs for this examples page.
+
+
+
+================================================
+FILE: getting-started.md
+================================================
+---
+title: Getting Started
+layout: default
+nav_order: 2
+---
+
+# Getting Started
+
+Walrus provides a durable, topic-aware write-ahead log for Rust services that need predictable latency under load. This guide walks through installation, core APIs, and the configuration surfaces you are likely to touch first. For a full tour of every knob, see [Configuration](configuration.html).
+
+## Key Features
+
+- **High performance append and read paths** optimized for concurrent producers and consumers
+- **Topic-based isolation** with independent cursors and persistent read offsets
+- **Configurable durability** through read consistency and fsync scheduling controls
+- **Atomic batch operations** for both writes and reads with io_uring acceleration on Linux
+- **Benchmark tooling** that captures throughput, latency, and resource usage
+
+## Install the Crate
+
+Add Walrus to your `Cargo.toml` dependencies:
+
+```toml
+[dependencies]
+walrus-rust = "0.1.0"
+```
+
+Then run `cargo build` to fetch the crate.
+
+## First WAL Instance
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;                         // StrictlyAtOnce by default
+    wal.append_for_topic("events", b"hello walrus")?; // append a payload
+
+    if let Some(entry) = wal.read_next("events", true)? {
+        println!("read {:?}", String::from_utf8_lossy(&entry.data));
+    }
+
+    Ok(())
+}
+```
+
+- Passing `checkpoint = true` advances the persisted cursor according to the configured consistency mode.
+- Use `checkpoint = false` to peek without consuming the entry.
+
+## Read Consistency Modes
+
+Walrus ships with two read models. Choose what matches your durability needs:
+
+- **`ReadConsistency::StrictlyAtOnce`** — persists the read offset every time you checkpoint. Guarantees at-most-once delivery after crashes at the cost of extra I/O.
+- **`ReadConsistency::AtLeastOnce { persist_every }`** — buffers cursor updates and persists every _N_ reads. Higher throughput, but the last window of entries may repeat after restarts.
+
+```rust
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 5_000 },
+)?;
+```
+
+## Fsync Scheduling
+
+Tune when Walrus flushes dirty data to disk:
+
+- **`FsyncSchedule::Milliseconds(n)`** — background thread flushes every _n_ milliseconds (default: 1000 ms).
+- **`FsyncSchedule::SyncEach`** — fsync immediately after every write; slowest but safest.
+- **`FsyncSchedule::NoFsync`** — rely on the OS page cache for durability (fastest, least safe).
+
+```rust
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(2_000),
+)?;
+```
+
+## Batch Operations
+
+- `batch_append_for_topic` writes up to **2,000 entries atomically**. On Linux, the fd backend drives io_uring submissions; otherwise writes fall back to sequential mmap I/O.
+- `batch_read_for_topic` streams entries in commit order, respecting both a caller-provided byte cap and the same 2,000-entry ceiling.
+
+See the [API reference](api-reference.html#write-apis) for details on these batch APIs.
+
+## Environment Variables
+
+Fine-tune behaviour without changing code:
+
+- `WALRUS_DATA_DIR` — relocate the entire `wal_files/` tree.
+- `WALRUS_INSTANCE_KEY` — namespace default constructors under `wal_files/<sanitized-key>/`.
+- `WALRUS_QUIET` — silence debug logging when toggling backends.
+- `WALRUS_FSYNC` — configure benchmark fsync cadence (`sync-each`, `no-fsync`, `async`, `<n>ms`).
+- `WALRUS_THREADS` — control benchmark thread counts (`<n>` or `<start-end>`).
+- `WALRUS_DURATION`, `WALRUS_WRITE_DURATION`, `WALRUS_READ_DURATION` — set benchmark runtimes.
+- `WALRUS_BATCH_SIZE` — override entries per batch for batch benchmarks.
+
+## Performance Profiles
+
+Mix and match read consistency and fsync scheduling to suit your workload:
+
+### Maximum Throughput (No Durability)
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+    FsyncSchedule::NoFsync,
+)?;
+```
+
+### High Throughput (Some Durability)
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+    FsyncSchedule::Milliseconds(5_000),
+)?;
+```
+
+### Maximum Durability
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach,
+)?;
+```
+
+### Balanced Performance
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1_000 },
+    FsyncSchedule::Milliseconds(1_000),
+)?;
+```
+
+| Configuration | Throughput | Durability | Typical Use Case |
+|---------------|------------|------------|------------------|
+| `NoFsync` | Highest | None | Performance experiments, disposable data |
+| `Milliseconds(5000)` | High | Low | High-volume logging |
+| `Milliseconds(1000)` | Medium | Medium | Balanced production workloads |
+| `Milliseconds(100)` | Lower | High | Near real-time guarantees |
+| `SyncEach` | Lowest | Highest | Financial/safety-critical systems |
+
+## Benchmark Quick Start
+
+Walrus ships with Make targets and plotting scripts:
+
+```bash
+pip install pandas matplotlib  # plotting dependencies
+make bench-and-show-reads      # run read benchmarks and open graphs
+```
+
+Additional targets such as `make show-writes`, `make show-reads`, and `make show-scaling` visualize CSV output from the benchmarking suite.
+
+
+
+================================================
+FILE: index.md
+================================================
+---
+title: Home
+layout: home
+nav_order: 1
+---
+
+# Walrus
+
+Walrus is a high-performance Log based storage engine for Rust applications that need durable, topic-aware streams with predictable latency.
+
+## Highlights
+
+- **High throughput** append and batch pipelines tuned for streaming workloads
+- **Topic isolation** with independent read/write offsets and checkpointing
+- **Configurable durability** via fsync scheduling and read consistency modes
+- **Batch APIs** that combine atomic multi-entry writes with capped batch reads
+- **Benchmark suite** and visualization helpers for repeatable performance testing
+
+## Blog posts
+
+[walrus v0.2.0: beating kafka at their own game](https://nubskr.com/2025/10/20/walrus_v0.2.0/)
+
+[walrus v0.1.0: ingesting data at memory speeds](https://nubskr.com/2025/10/06/walrus/)
+
+## Quick Start
+
+Add Walrus to your project by declaring the dependency in `Cargo.toml`:
+
+```toml
+[dependencies]
+walrus-rust = "0.1.0"
+```
+
+Create a WAL instance and start reading and writing topics:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::new()?;                     // StrictlyAtOnce by default
+wal.append_for_topic("my-topic", b"hello")?;  // append a payload
+
+if let Some(entry) = wal.read_next("my-topic", true)? {
+    println!("read {:?}", String::from_utf8_lossy(&entry.data));
+}
+```
+
+For peek semantics, pass `false` to `read_next` so the cursor stays put. Prefer `Walrus::with_consistency_and_schedule` when you need to tune read persistence or fsync cadence.
+
+## Where to Next
+
+- [Getting Started](getting-started.html) — install, configure, and explore the basics
+- [Configuration](configuration.html) — tune durability, backends, and environments
+- [API Reference](api-reference.html) — constructors, read/write APIs, and storage layout
+- [Architecture](architecture.html) — how Walrus organises storage and pipelines requests
+- [Keyed Instances](keyed-instances.html) — isolate workloads with namespaced WAL trees
+
+## Project Links
+
+- [Crate on crates.io](https://crates.io/crates/walrus-rust)
+- [API documentation](https://docs.rs/walrus-rust)
+- [GitHub repository](https://github.com/nubskr/walrus)
+- [Issue tracker](https://github.com/nubskr/walrus/issues)
+
+
+
+================================================
+FILE: internals.md
+================================================
+---
+title: Internals
+layout: default
+nav_order: 7
+---
+
+# Walrus Internals
+
+This page explores the engineering decisions, performance optimizations, and implementation details that make Walrus fast and reliable. If you want to understand how the pieces actually work under the hood, you're in the right place.
+
+## Table of Contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## High-Level Architecture
+
+Before diving into specifics, here's how all the pieces fit together:
+
+![Walrus Architecture](https://raw.githubusercontent.com/nubskr/nubskr.github.io/refs/heads/master/_posts/main%20architecture(2).png)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Walrus Facade                            │
+│  (coordinates: allocator, readers, writers, index, bg worker)   │
+└────┬─────────────────────┬──────────────────────┬───────────────┘
+     │                     │                      │
+     │ append              │ read                 │ background
+     ▼                     ▼                      ▼
+┌──────────┐          ┌──────────┐         ┌─────────────┐
+│  Writer  │          │  Reader  │         │ Fsync/Delete│
+│(per topic│──────────▶(per topic│         │   Worker    │
+│  mutex)  │ seal blk │  chains) │         └─────────────┘
+└────┬─────┘          └────┬─────┘
+     │                     │
+     │ alloc block         │ read from sealed/tail
+     ▼                     ▼
+┌──────────────────────────────────────────┐
+│         BlockAllocator (spin lock)        │
+│   hands out 10MB blocks from 1GB files   │
+└────┬─────────────────────────────────────┘
+     │
+     ▼
+┌──────────────────────────────────────────┐
+│       Storage Layer (Mmap or FD)         │
+│  memory-mapped 1GB files (sparse alloc)  │
+└──────────────────────────────────────────┘
+```
+
+---
+
+## The Spin-Lock Allocator
+
+One of Walrus's key performance features is the `BlockAllocator`, which hands out 10 MB blocks in **sub-microsecond time** using a spin lock instead of OS-level synchronization.
+
+### Why Spin Locks?
+
+Traditional mutexes involve syscalls, which cost 1-5 microseconds even in the fast path. For an operation that needs to:
+1. Increment an offset
+2. Check if we've exceeded file size
+3. Return a block descriptor
+
+...that's unacceptable overhead when allocating thousands of blocks per second.
+
+### The Implementation
+
+```rust
+pub struct BlockAllocator {
+    next_block: UnsafeCell<Block>,     // Pre-computed next block
+    lock: AtomicBool,                  // Spin lock (userspace only)
+    paths: Arc<WalPathManager>,
+}
+```
+
+The spin lock uses a simple compare-and-swap loop:
+
+```rust
+loop {
+    match self.lock.compare_exchange_weak(
+        false, true,                    // Acquire lock
+        Ordering::AcqRel,
+        Ordering::Relaxed
+    ) {
+        Ok(_) => break,                 // Got it!
+        Err(_) => std::hint::spin_loop(), // Try again
+    }
+}
+```
+
+**Critical section operations:**
+1. Check if `next_block.offset + size > MAX_FILE_SIZE`
+2. If rollover: create new file, update mmap, reset offset
+3. Register block in state tracker
+4. Increment `next_block.id`
+5. Release lock
+
+**Amortized cost:** ~200-500 nanoseconds per allocation (no syscalls).
+
+### Block Allocation Flow
+
+```
+Thread requests block
+        │
+        ▼
+   ┌─────────┐
+   │ CAS loop│ ◄──── Spin if contended
+   │ acquire │       (std::hint::spin_loop)
+   └────┬────┘
+        │ Got lock!
+        ▼
+   ┌──────────────────────────┐
+   │ Check: offset + size      │
+   │       > MAX_FILE_SIZE?    │
+   └────┬───────────────┬──────┘
+        │ No            │ Yes
+        │               ▼
+        │          ┌─────────────────┐
+        │          │ Create new file │
+        │          │ Update mmap ref │
+        │          │ Reset offset=0  │
+        │          └────┬────────────┘
+        │               │
+        ▼               ▼
+   ┌────────────────────────────┐
+   │ Register block in tracker  │
+   │ Increment next_block.id    │
+   └────┬───────────────────────┘
+        ▼
+   ┌─────────┐
+   │ Release │
+   │  lock   │
+   └────┬────┘
+        ▼
+   Return block to writer
+   (path, offset, limit, mmap)
+```
+
+### Safety Invariants
+
+The `UnsafeCell<Block>` requires careful handling:
+- The spin lock guarantees exclusive access during allocation
+- Once handed out, blocks have unique ownership (single writer per topic)
+- Blocks are never deallocated (recycled via file deletion instead)
+
+---
+
+## Storage Backend Architecture
+
+Walrus supports two storage backends optimized for different platforms and workloads.
+
+### Dual Backend Design
+
+**Mmap Backend** (default fallback):
+- Uses memory-mapped files via `memmap2`
+- Portable across all platforms
+- OS manages page cache automatically
+- Writes are volatile until `msync()` or `flush()`
+
+**FD Backend** (Linux optimization):
+- Uses file descriptors with `pwrite`/`pread`
+- Enables `io_uring` batching (see below)
+- Supports `O_SYNC` flag for kernel-managed durability
+- Position-independent I/O (thread-safe without seek)
+
+### Backend Architecture Diagram
+
+```
+┌─────────────────────────────────────────┐
+│          StorageImpl (enum)             │
+├──────────────────┬──────────────────────┤
+│   Mmap Backend   │     FD Backend       │
+│   (portable)     │   (Linux optimized)  │
+├──────────────────┼──────────────────────┤
+│ memmap2 crate    │ raw file descriptor  │
+│ memory-mapped    │ pwrite/pread         │
+│ msync() flush    │ O_SYNC or io_uring   │
+│ OS page cache    │ io_uring batching    │
+└──────────────────┴──────────────────────┘
+         │                    │
+         └──────────┬─────────┘
+                    ▼
+         ┌─────────────────────┐
+         │    SharedMmap       │
+         │  (Arc<RwLock<...>>) │
+         │  + atomic timestamp │
+         └─────────────────────┘
+                    │
+                    ▼
+         ┌─────────────────────┐
+         │  Global Keeper Map  │
+         │ (path → SharedMmap) │
+         │  deduplicates mmaps │
+         └─────────────────────┘
+```
+
+### When Each Backend Shines
+
+| Workload | Recommended Backend | Why |
+|----------|-------------------|-----|
+| Linux production | FD backend | io_uring batching, O_SYNC support |
+| macOS/Windows | Mmap backend | Only portable option |
+| Benchmarking | FD backend (no sync) | Eliminates OS noise |
+| Single-threaded | Either | Minimal difference |
+
+### Switching at Runtime
+
+```rust
+use walrus_rust::{enable_fd_backend, disable_fd_backend};
+
+enable_fd_backend();   // Use FD + io_uring on Linux
+disable_fd_backend();  // Force mmap everywhere
+```
+
+Set `WALRUS_QUIET=1` to suppress backend switch logging.
+
+### The SharedMmap Abstraction
+
+Both backends implement a common interface through `SharedMmap`:
+
+```rust
+pub struct SharedMmap {
+    inner: Arc<RwLock<StorageImpl>>,   // Mmap or FD backend
+    last_modified: AtomicU64,          // Timestamp tracking
+}
+```
+
+**Interior mutability pattern:**
+- Implements `Sync + Send` for concurrent access
+- `RwLock` protects the storage handle
+- Atomic timestamp prevents stale handle reuse
+- Global "keeper" map deduplicates file handles
+
+---
+
+## io_uring Batching: The Secret Sauce
+
+On Linux with the FD backend enabled, Walrus batches multiple operations into **a single syscall** using `io_uring`. This is the key to sub-millisecond batch operations.
+
+### Traditional I/O vs io_uring
+
+**Traditional approach (N syscalls):**
+```
+for each entry:
+    pwrite(fd, data)      // syscall
+
+Result: 2000 entries = 2000 syscalls
+```
+
+**io_uring approach (1 syscall):**
+```
+Userspace                          Kernel
+─────────────────────────────────────────────
+
+for each entry:
+  prepare_write() ────────┐
+  queue in SQ ring        │
+                          │
+submit_and_wait() ────────┼──────────────────┐
+                          │                  │
+    (BLOCKS)              │                  │
+                          ▼                  ▼
+                     io_uring processes all ops
+                          │                  │
+                          ▼                  │
+                     completions in CQ ring  │
+                          │                  │
+                          └──────────────────┘
+    (UNBLOCKS)            │
+                          ▼
+check completion results
+```
+
+**Result:** 2000 entries written with 1 syscall instead of 2000.
+
+### The Three-Phase Batch Write
+
+When you call `batch_append_for_topic(topic, entries)`, here's what happens:
+
+```
+┌───────────────────────────────────────────────────────┐
+│ Phase 1: Planning (no locks held)                     │
+├───────────────────────────────────────────────────────┤
+│ • Calculate entry sizes                               │
+│ • Determine how many blocks needed                    │
+│ • Pre-allocate blocks from BlockAllocator             │
+│ • Build write plan (block, offset, size) tuples      │
+└─────────────────────┬─────────────────────────────────┘
+                      ▼
+┌───────────────────────────────────────────────────────┐
+│ Phase 2: io_uring Prep (FD backend, Linux only)      │
+├───────────────────────────────────────────────────────┤
+│ • Serialize all entries to buffers                    │
+│ • For each entry:                                     │
+│     - prep_write(fd, buf, len, offset)                │
+│     - queue in submission queue (SQ)                  │
+│ • NO syscalls yet (all userspace)                     │
+└─────────────────────┬─────────────────────────────────┘
+                      ▼
+┌───────────────────────────────────────────────────────┐
+│ Phase 3: Submit & Verify (SINGLE syscall)            │
+├───────────────────────────────────────────────────────┤
+│ • io_uring.submit_and_wait(num_entries)               │
+│ • Kernel executes all writes                          │
+│ • Check completion queue (CQ) for errors              │
+│ • If any failure → rollback (zero headers)            │
+│ • If success → update writer offset, seal blocks      │
+└───────────────────────────────────────────────────────┘
+```
+
+#### Phase 1: Planning (no locks held)
+```rust
+// Compute block layout
+let mut needed_blocks = vec![];
+let mut current_block_space = self.current_block.lock().limit - offset;
+
+for entry in batch {
+    let entry_size = PREFIX_META_SIZE + entry.len();
+    if entry_size > current_block_space {
+        needed_blocks.push(allocator.alloc_block(entry_size)?);
+        current_block_space = block_size;
+    }
+    current_block_space -= entry_size;
+}
+```
+
+**Why this matters:** Pre-allocating blocks without holding writer locks prevents blocking other operations.
+
+#### Phase 2: io_uring Preparation (FD backend only)
+```rust
+let ring = IoUring::new(batch.len())?;
+let mut buffers = Vec::new();
+
+for (block, entry, offset) in &write_plan {
+    let buf = serialize_entry(entry, topic);
+    buffers.push(buf);
+
+    unsafe {
+        let sqe = ring.submission().next_sqe().unwrap();
+        sqe.prep_write(
+            block.fd,
+            buf.as_ptr(),
+            buf.len(),
+            offset
+        );
+    }
+}
+```
+
+**Why it's fast:** All write operations are queued in userspace.
+
+#### Phase 3: Submission (single syscall)
+```rust
+ring.submit_and_wait(batch.len())?;
+
+// Check completion results
+for cqe in ring.completion() {
+    if cqe.result() < 0 {
+        // Rollback: zero headers, revert offsets
+        return Err(...);
+    }
+}
+```
+
+**Result:** 2000 entries written with 1 syscall instead of 2000.
+
+### Batch Read Optimization
+
+The same principle applies to `batch_read_for_topic`:
+
+```rust
+// Build read plan (up to max_bytes)
+let plan = build_read_plan(sealed_chain, tail_block, max_bytes);
+
+// Submit all reads via io_uring (Linux FD backend)
+let ring = IoUring::new(plan.len())?;
+for (block, start, end) in &plan {
+    let sqe = ring.submission().next_sqe().unwrap();
+    sqe.prep_read(block.fd, buffer, end - start, start);
+}
+ring.submit_and_wait(plan.len())?;
+
+// Parse entries from buffers
+let entries = parse_entries_from_buffers(buffers)?;
+```
+
+**Performance impact:** Batch reads complete in ~100-500 microseconds vs 2-10 milliseconds with traditional I/O.
+
+### Fallback Behavior
+
+When io_uring is unavailable (non-Linux or mmap backend):
+- Batch writes: Sequential `mmap.write()` calls (still atomic via offset tracking)
+- Batch reads: Sequential `block.read()` calls
+- Still correct, just slower (~5-10x overhead)
+
+---
+
+## Tail Reading: The Zero-Copy Optimization
+
+One of Walrus's cleverest tricks is allowing readers to consume from the **active writer's block** without forcing block rotation.
+
+![Reader's Perspective](https://raw.githubusercontent.com/nubskr/nubskr.github.io/refs/heads/master/_posts/reader's%20pespective.png)
+
+### The Problem
+
+Traditional WAL designs require:
+1. Writer fills block completely
+2. Writer seals block
+3. Writer notifies readers
+4. Readers can now read sealed block
+
+**Issue:** Low-throughput topics waste space and add latency (must wait for block to fill).
+
+```
+Traditional WAL (forced rotation):
+
+Writer must wait:     Reader must wait:
+    ▼                     ▼
+┌─────────────────────────────────────┐
+│ Block 1 [###########·············] │  ← 50% full, but...
+└─────────────────────────────────────┘
+         │
+         │  Writer: "Need to fill whole block before sealing"
+         │  Reader: "Can't read until sealed"
+         │  Latency: seconds to hours for low-volume topics!
+         ▼
+    (waiting...)
+```
+
+### The Walrus Solution: Tail Reads
+
+Readers can read from the writer's **current block** using snapshot semantics:
+
+```
+Walrus (tail reading):
+
+Writer continues:        Reader reads immediately:
+    ▼                           ▼
+┌─────────────────────────────────────┐
+│ Active Block [###########·········] │
+│               ▲         ▲           │
+│               │         │           │
+│           last_read  current_offset │
+└───────────────┼─────────┼───────────┘
+                │         │
+                │         └─ Writer appending here (atomic)
+                │
+                └─ Reader can read [last_read..current_offset)
+                   (snapshot semantics, no locks!)
+
+Latency: sub-millisecond!
+```
+
+```rust
+// Reader requests snapshot
+let (block_id, current_offset) = writer.snapshot_block();
+
+// Reader reads entries from [last_offset, current_offset)
+for offset in last_offset..current_offset {
+    let entry = block.read(offset)?;
+    process(entry);
+}
+```
+
+**Key insight:** Writers only append (monotonically increasing offset), so readers can safely read behind the write cursor without blocking.
+
+### In-Memory Tail Progress
+
+Readers track two positions:
+
+```rust
+pub struct ColReaderInfo {
+    // Sealed chain position
+    cur_block_idx: usize,
+    cur_block_offset: u64,
+
+    // Tail position (in active writer block)
+    tail_block_id: u64,
+    tail_offset: u64,
+}
+```
+
+**Reading algorithm:**
+1. Try sealed chain first (fully checkpointed blocks)
+2. If exhausted, request writer snapshot
+3. Read from `[tail_offset, writer.current_offset)`
+4. Update `tail_offset` (in-memory only initially)
+
+### The Tail Sentinel: Bit 63
+
+When persisting read positions, Walrus distinguishes sealed vs tail using **bit 63** in `BlockPos`:
+
+```
+BlockPos struct (persisted to index):
+
+┌──────────────────────────────────────────────────┐
+│ cur_block_idx: u64                               │
+│ ┌──┬─────────────────────────────────────────┐  │
+│ │63│ 62  ...  Block ID or Chain Index     0 │  │
+│ └┬─┴─────────────────────────────────────────┘  │
+│  │                                               │
+│  └─ TAIL_FLAG (bit 63)                          │
+│     • 0 = Reading from sealed chain             │
+│     • 1 = Reading from active writer tail       │
+└──────────────────────────────────────────────────┘
+
+Examples:
+  0x0000000000000005 = sealed chain, block index 5
+  0x800000000000002A = tail read, block ID 42
+```
+
+```rust
+pub struct BlockPos {
+    cur_block_idx: u64,  // High bit = tail flag
+    cur_block_offset: u64,
+}
+```
+
+**Encoding:**
+- Bit 63 = 0: Reading from sealed chain at `cur_block_idx`
+- Bit 63 = 1: Reading from active writer tail (block_id in lower 63 bits)
+
+**On recovery:**
+```rust
+if pos.cur_block_idx & (1u64 << 63) != 0 {
+    // Tail read in progress
+    let tail_block_id = pos.cur_block_idx & !(1u64 << 63);
+    info.tail_block_id = tail_block_id;
+    info.tail_offset = pos.cur_block_offset;
+} else {
+    // Sealed chain read
+    info.cur_block_idx = pos.cur_block_idx as usize;
+    info.cur_block_offset = pos.cur_block_offset;
+}
+```
+
+### Folding Tail into Sealed Chain
+
+When the writer rotates blocks, readers must transition:
+
+```rust
+// Writer sealed block 42
+reader.append_block_to_chain(topic, sealed_block_42);
+
+// Reader's tail progress (if on block 42) moves to sealed chain
+if reader.tail_block_id == sealed_block_42.id {
+    reader.cur_block_idx = sealed_chain.len() - 1;
+    reader.cur_block_offset = reader.tail_offset;
+    reader.tail_offset = 0;  // Reset tail
+}
+```
+
+**Result:** Seamless transition from in-memory tail to durable sealed chain.
+
+---
+
+## Block and File State Tracking
+
+Walrus tracks per-block and per-file state to determine when files are safe to delete. This happens entirely in userspace with zero syscalls.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Global State Trackers                   │
+│                  (static OnceLock<Mutex<...>>)            │
+├─────────────────────────────┬────────────────────────────┤
+│   BlockStateTracker         │   FileStateTracker         │
+│   HashMap<BlockID, State>   │   HashMap<FilePath, State> │
+├─────────────────────────────┼────────────────────────────┤
+│ • block_id → file_path      │ • locked_blocks (AtomicU16)│
+│ • is_checkpointed (bool)    │ • checkpoint_blocks (")    │
+│                             │ • total_blocks (")         │
+│                             │ • is_fully_allocated (bool)│
+└─────────────────────────────┴────────────────────────────┘
+              │                            │
+              │ Updates trigger            │ Updates trigger
+              ▼                            ▼
+    ┌──────────────────┐         ┌─────────────────┐
+    │ Reader finishes  │         │ Writer seals    │
+    │ block            │         │ block           │
+    └────────┬─────────┘         └────────┬────────┘
+             │                            │
+             ▼                            ▼
+    set_checkpointed(id) ────────► increment counters
+             │                            │
+             └─────────┬──────────────────┘
+                       ▼
+              ┌────────────────┐
+              │  flush_check() │
+              │  evaluates:    │
+              │  • fully_alloc?│
+              │  • locked==0?  │
+              │  • checkpoint  │
+              │    >= total?   │
+              └────────┬───────┘
+                       │ All true?
+                       ▼
+              ┌────────────────┐
+              │ Send to        │
+              │ deletion queue │
+              └────────────────┘
+```
+
+### BlockStateTracker
+
+Static global state (initialized once):
+
+```rust
+static BLOCK_STATE: OnceLock<Mutex<HashMap<u64, BlockState>>> = OnceLock::new();
+
+struct BlockState {
+    file_path: String,
+    is_checkpointed: bool,
+}
+```
+
+**Operations:**
+- `register_block(id, path)` - called when block allocated
+- `set_checkpointed_true(id)` - called when reader finishes block
+- Auto-increments file's `checkpointed_blocks` counter
+
+### FileStateTracker
+
+Tracks aggregate file state:
+
+```rust
+static FILE_STATE: OnceLock<Mutex<HashMap<String, FileState>>> = OnceLock::new();
+
+struct FileState {
+    locked_blocks: u32,       // Writers holding blocks
+    checkpointed_blocks: u32, // Readers finished blocks
+    total_blocks: u32,        // Blocks allocated from this file
+    is_fully_allocated: bool, // File reached MAX_FILE_SIZE
+}
+```
+
+### Deletion Conditions
+
+After every checkpoint, `flush_check()` evaluates:
+
+```rust
+fn flush_check(file_path: &str) {
+    let state = FILE_STATE.lock().get(file_path);
+
+    if state.is_fully_allocated
+       && state.locked_blocks == 0
+       && state.total_blocks > 0
+       && state.checkpointed_blocks >= state.total_blocks {
+        // Safe to delete!
+        send_to_deletion_queue(file_path);
+    }
+}
+```
+
+**English translation:**
+- File is full (no more allocations coming)
+- No writers holding blocks (all sealed)
+- At least one block was allocated (not empty file)
+- All blocks have been read (checkpointed)
+
+**Result:** Files delete automatically as soon as safe, with zero manual intervention.
+
+---
+
+## Concurrency Model
+
+Walrus supports high concurrency while maintaining safety and avoiding deadlocks.
+
+### Lock Hierarchy (to prevent deadlocks)
+
+```
+Lock Acquisition Order (top to bottom, NEVER reverse):
+
+    1. Walrus.writers (RwLock<HashMap>)
+       │  Brief: lookup/insert Writer
+       │  Scope: Minimal
+       │
+       └──> Release immediately after get_or_create
+
+    2. Writer.current_block / Writer.current_offset (Mutex)
+       │  Per-topic: No cross-topic contention
+       │  Scope: During write operation
+       │
+       └──> Can hold while allocating blocks
+
+    3. Reader.data (outer RwLock, inner per-topic RwLock)
+       │  Outer: Read lock for topic lookup
+       │  Inner: Write lock for position updates
+       │  Scope: Per-read operation
+       │
+       └──> Release before index persistence
+
+    4. WalIndex (RwLock)
+       │  Global: Protects index file
+       │  Scope: Brief, during flush to disk
+       │
+       └──> Held LAST, released ASAP
+
+Deadlock Prevention:
+  ✓ Always acquire in this order
+  ✗ Never hold multiple topic locks simultaneously
+  ✗ Never acquire Walrus.writers after any other lock
+```
+
+1. **Walrus.writers** (RwLock<HashMap>)
+   - Held briefly to get/create Writer
+   - Released before calling Writer methods
+
+2. **Writer.current_block** + **Writer.current_offset** (Mutex)
+   - Held during writes
+   - Per-topic locks (no global contention)
+
+3. **Reader data** (RwLock<HashMap<String, Arc<RwLock<ColReaderInfo>>>>)
+   - Outer RwLock: read-locked for topic lookup
+   - Inner RwLock: write-locked for position updates
+   - Per-topic granularity
+
+4. **WalIndex** (RwLock)
+   - Held last, during persistence
+   - Brief critical section
+
+**Rule:** Always acquire locks in this order. Never hold multiple topic locks simultaneously.
+
+### Thread Safety Guarantees
+
+| Component | Concurrency Model |
+|-----------|-------------------|
+| `Walrus` | Shared across threads (`Arc<Walrus>`) |
+| `Writer` | One per topic, callable from any thread |
+| `Reader` | Shared global, per-topic locks |
+| `BlockAllocator` | Thread-safe via spin lock |
+| `WalIndex` | Thread-safe via RwLock |
+
+### Snapshot Semantics
+
+Readers never block writers (and vice versa):
+
+```
+Timeline: Writer and Reader Operating Concurrently
+
+Writer Thread:                Reader Thread:
+─────────────────────────────────────────────────────────
+
+t0: Lock(current_offset)
+t1: Append entry A
+t2: offset = 100
+t3: Unlock
+    ║
+    ║                         t4: Request snapshot
+    ║                         t5: Read offset atomically
+    ║                         t6: (got: block_id=42, offset=100)
+    ║                         t7: Release (no writer lock needed!)
+    ║
+t8: Lock(current_offset)      t8: Read entries [0..100)
+t9: Append entry B            t9:   (from snapshot, no lock!)
+t10: offset = 200             t10:  (writer continues freely)
+t11: Unlock                   t11:
+    ║                         t12: Process entries
+    ║
+    ║                         Later: Request new snapshot
+    ║                         (got: block_id=42, offset=200)
+
+Key: Writer and reader never wait for each other!
+```
+
+```rust
+// Writer path
+writer.append(data);  // Holds writer locks only
+
+// Reader path
+let snapshot = writer.snapshot_block();  // Quick atomic reads
+// Writer lock released here!
+reader.read_from_snapshot(snapshot);     // No writer involvement
+```
+
+**Key:** Snapshot captures `(block_id, offset)` atomically, then releases writer lock. Reader works with stale-but-consistent snapshot.
+
+### Batch Write Exclusion
+
+Only one batch write per topic allowed:
+
+```rust
+pub struct Writer {
+    is_batch_writing: AtomicBool,
+    // ...
+}
+
+pub fn batch_write(&self, entries: &[&[u8]]) -> io::Result<()> {
+    // Try to acquire batch lock
+    if self.is_batch_writing.compare_exchange(
+        false, true,
+        Ordering::AcqRel,
+        Ordering::Acquire
+    ).is_err() {
+        return Err(ErrorKind::WouldBlock);
+    }
+
+    // ... perform batch ...
+
+    self.is_batch_writing.store(false, Ordering::Release);
+    Ok(())
+}
+```
+
+**Why:** Prevents two threads from concurrently batching to the same topic (which would corrupt block layout).
+
+**User experience:** `ErrorKind::WouldBlock` returned if collision occurs (rare, and retryable).
+
+---
+
+## Checksum Verification and Corruption Handling
+
+Every entry carries a **FNV-1a 64-bit checksum** verified on read.
+
+```
+Entry Structure in Block:
+
+┌────────────────────────────────────────────────────────┐
+│ 2-byte Length Prefix                                   │
+├────────────────────────────────────────────────────────┤
+│ Metadata (rkyv serialized):                            │
+│   • read_size: usize                                   │
+│   • owned_by: String (topic name)                      │
+│   • next_block_start: u64                              │
+│   • checksum: u64  ◄─── FNV-1a(payload data)          │
+├────────────────────────────────────────────────────────┤
+│ Payload Data (read_size bytes)                         │
+│ [user data bytes...]                                   │
+└────────────────────────────────────────────────────────┘
+
+On Read:
+  1. Deserialize metadata
+  2. Read payload
+  3. Compute FNV-1a(payload)
+  4. Compare with metadata.checksum
+  5. If mismatch → ErrorKind::InvalidData
+```
+
+### Why FNV-1a?
+
+| Algorithm | Speed | Collision Resistance | Use Case |
+|-----------|-------|---------------------|----------|
+| CRC32 | Fast | Good | Network packets |
+| FNV-1a | Faster | Good enough | In-memory hash tables, **WAL entries** |
+| xxHash | Fastest | Better | Modern checksums |
+| SHA256 | Slow | Cryptographic | Security |
+
+**Decision:** FNV-1a offers ~5-10 ns/byte on modern CPUs with excellent distribution for our entry sizes (KB-MB range).
+
+### Checksum Computation
+
+```rust
+pub fn checksum64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut hash = FNV_OFFSET;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+```
+
+**Stored in metadata:**
+```rust
+pub struct Metadata {
+    pub read_size: usize,
+    pub owned_by: String,
+    pub next_block_start: u64,
+    pub checksum: u64,  // <-- FNV-1a of entry data
+}
+```
+
+### Read-Time Verification
+
+Every `block.read(offset)` call:
+
+```rust
+pub fn read(&self, offset: u64) -> io::Result<Entry> {
+    // Deserialize metadata
+    let meta = deserialize_metadata(offset)?;
+
+    // Read data
+    let data = read_bytes(offset + meta_size, meta.read_size);
+
+    // Verify checksum
+    let computed = checksum64(&data);
+    if computed != meta.checksum {
+        eprintln!("Checksum mismatch at offset {}", offset);
+        return Err(ErrorKind::InvalidData.into());
+    }
+
+    Ok(Entry { data })
+}
+```
+
+### Corruption Handling
+
+**On checksum failure:**
+1. Error logged to stderr (unless `WALRUS_QUIET=1`)
+2. Entry skipped (reader advances to next)
+3. Read operation returns `None` or truncated batch
+
+**Philosophy:** Fail gracefully rather than crash. Corruption is logged for forensics, but system remains operational.
+
+**Recovery options:**
+- Re-write corrupted entries (if source available)
+- Rebuild topic from upstream source
+- Accept data loss for corrupted range
+
+---
+
+## Atomic Index Persistence
+
+Read positions survive process restarts via `WalIndex`, persisted atomically using the **write-tmp-rename** pattern.
+
+### The Classic Atomic Write Pattern
+
+```rust
+pub fn persist(&self, db_path: &str) -> io::Result<()> {
+    let tmp_path = format!("{}.tmp", db_path);
+
+    // 1. Serialize to temporary file
+    let bytes = rkyv::to_bytes(&self.positions)?;
+    fs::write(&tmp_path, bytes)?;
+
+    // 2. Fsync temporary file
+    let file = File::open(&tmp_path)?;
+    file.sync_all()?;
+    drop(file);
+
+    // 3. Atomic rename (POSIX guarantees atomicity)
+    fs::rename(&tmp_path, db_path)?;
+
+    // 4. Fsync parent directory (ensures rename is durable)
+    let parent = Path::new(db_path).parent().unwrap();
+    let dir = File::open(parent)?;
+    dir.sync_all()?;
+
+    Ok(())
+}
+```
+
+### Why This Works
+
+**POSIX guarantee:** `rename()` is atomic—either old file or new file visible, never partial.
+
+**Crash scenarios:**
+- Crash during write to .tmp: old index intact
+- Crash during fsync: .tmp may be partial, old index intact
+- Crash during rename: either old or new index visible (both valid)
+- Crash after rename, before dir fsync: new index may not survive power loss (OS-dependent)
+
+**Result:** At-most-once durability with fsync, at-least-once without.
+
+### Recovery on Startup
+
+```rust
+fn load_or_rebuild_index(db_path: &str) -> WalIndex {
+    match WalIndex::load(db_path) {
+        Ok(index) => index,
+        Err(_) => {
+            eprintln!("Index corrupted or missing, rebuilding...");
+            rebuild_index_from_wal_scan()
+        }
+    }
+}
+```
+
+**Fallback:** Scan all WAL files, infer positions from checkpointed blocks.
+
+---
+
+## Rollback Mechanism
+
+Batch writes can fail mid-flight (disk full, io_uring errors, etc.). Walrus rolls back atomically.
+
+### The Challenge
+
+Consider a batch write across 3 blocks:
+
+```
+Batch Write Failure Scenario:
+
+┌─────────────────────────────────────────────────────┐
+│ Block 100                                           │
+│ [entry1][entry2][entry3] ✓ Written successfully    │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ Block 101                                           │
+│ [entry4][entry5] ✓ Written successfully            │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ Block 102                                           │
+│ [entry6] ✗ FAILED (disk full / io error)           │
+└─────────────────────────────────────────────────────┘
+
+Problem: Partial batch visible to readers (violates atomicity)
+```
+
+```
+Block 100: [entry1, entry2, entry3] ✓ written
+Block 101: [entry4, entry5] ✓ written
+Block 102: [entry6] ✗ FAILED (disk full)
+```
+
+**Problem:** Readers might see partial batch (entries 1-5 but not 6), violating atomicity.
+
+### The Solution: Header Zeroing
+
+Walrus invalidates **metadata headers** on failure:
+
+```
+Rollback Process:
+
+1. Detect failure (io_uring completion error)
+   │
+   ▼
+2. For each block in written_blocks[]:
+   │
+   ├──> Block 100: zero_range(offset, PREFIX_META_SIZE)
+   │    ┌─────────────────────────────────────┐
+   │    │ [0x00][0x00]...    │ entry2 │ entry3│
+   │    └─────────────────────────────────────┘
+   │     ▲ Zeroed metadata = invalid entry
+   │
+   ├──> Block 101: zero_range(offset, PREFIX_META_SIZE)
+   │    ┌─────────────────────────────────────┐
+   │    │ [0x00][0x00]...    │ entry5         │
+   │    └─────────────────────────────────────┘
+   │
+   └──> Block 102: (failed write, nothing to clean)
+
+3. Revert writer.current_offset to original value
+   │
+4. Release provisional blocks to allocator
+   │
+   ▼
+5. Return error to caller
+
+Result: Readers see NO trace of failed batch (clean rollback)
+```
+
+```rust
+fn rollback(&self, written_blocks: &[(Block, u64)]) -> io::Result<()> {
+    for (block, start_offset) in written_blocks {
+        // Zero the 2-byte length prefix + metadata
+        block.zero_range(start_offset, PREFIX_META_SIZE)?;
+    }
+
+    // Revert writer offsets
+    self.current_offset.store(original_offset, Ordering::Release);
+
+    // Release provisional blocks back to allocator
+    for block in &written_blocks {
+        allocator.release(block.id);
+    }
+
+    Ok(())
+}
+```
+
+**Why this works:**
+- Readers deserialize metadata by reading 2-byte length prefix
+- Zeroed prefix → invalid length → read fails gracefully
+- Even if data bytes survived, metadata corruption prevents read
+
+**Result:** Failed batches leave no visible artifacts. Readers see consistent pre-batch state.
+
+---
+
+## Background Worker Architecture
+
+The background thread handles two jobs: **batched fsyncs** and **deferred file deletion**.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│           Background Worker Event Loop (infinite)             │
+└────┬────────────────────────────────────────┬────────────────┘
+     │                                        │
+     ▼                                        ▼
+┌─────────────────┐                  ┌─────────────────┐
+│  Fsync Channel  │                  │ Deletion Channel│
+│ (mpsc receiver) │                  │ (mpsc receiver) │
+└────────┬────────┘                  └────────┬────────┘
+         │                                    │
+         ▼                                    ▼
+    Collect paths                        Accumulate paths
+    (deduplicate)                        (pending_deletions)
+         │                                    │
+         ▼                                    │
+    ┌─────────────────┐                      │
+    │ Batch Flush:    │                      │
+    │ • Open handles  │                      │
+    │   from pool     │                      │
+    │ • io_uring prep │                      │
+    │ • submit_and_   │                      │
+    │   wait() ◄──────┼── 1 syscall/batch   │
+    └────────┬────────┘                      │
+             │                                │
+             │   Every 1000 cycles (~2 min): │
+             │   ┌───────────────────────────▼──┐
+             │   │ 1. file_pool.clear()         │
+             │   │    (drops all handles)       │
+             │   │                              │
+             │   │ 2. for path in pending:      │
+             └───┤      fs::remove_file(path)   │
+                 │                              │
+                 │ 3. pending_deletions.clear() │
+                 └──────────────────────────────┘
+                            │
+                            ▼
+                   sleep(100ms), loop
+```
+
+### The Event Loop
+
+```rust
+fn background_worker(
+    fsync_rx: mpsc::Receiver<String>,
+    del_rx: mpsc::Receiver<String>,
+) {
+    let mut fsync_cycle = 0;
+    let mut file_pool = HashMap::new();  // Cached file handles
+    let mut pending_deletions = Vec::new();
+
+    loop {
+        // Phase 1: Collect paths to flush (batch up to 1 second)
+        let mut paths = HashSet::new();
+        while let Ok(path) = fsync_rx.try_recv() {
+            paths.insert(path);
+        }
+
+        // Phase 2: Flush all files (io_uring batch on Linux)
+        if !paths.is_empty() {
+            flush_batch(&paths, &mut file_pool)?;
+        }
+
+        // Phase 3: Collect deletion requests
+        while let Ok(path) = del_rx.try_recv() {
+            pending_deletions.push(path);
+        }
+
+        // Phase 4: Perform deletions every ~1000 cycles
+        fsync_cycle += 1;
+        if fsync_cycle % 1000 == 0 {
+            // Drop all file handles first!
+            file_pool.clear();
+
+            // Now safe to delete
+            for path in pending_deletions.drain(..) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+```
+
+### Batched Fsync (io_uring)
+
+When multiple writers enqueue paths:
+
+```rust
+fn flush_batch(paths: &HashSet<String>, pool: &mut HashMap<String, FdBackend>) {
+    let ring = IoUring::new(paths.len())?;
+
+    for path in paths {
+        let storage = pool.entry(path.clone())
+            .or_insert_with(|| FdBackend::open(path));
+
+        let sqe = ring.submission().next_sqe().unwrap();
+        sqe.prep_fsync(storage.fd, 0);  // Queue fsync
+    }
+
+    ring.submit_and_wait(paths.len())?;  // Single syscall!
+}
+```
+
+**Performance:** 100 files fsynced in ~1-2 milliseconds (vs 50-100ms with sequential fsyncs).
+
+### File Handle Pooling
+
+The `file_pool` caches open handles across fsync cycles:
+
+**Benefits:**
+- Amortizes `open()` syscall cost
+- Reduces file descriptor churn
+- Better for filesystems with open/close overhead
+
+**Tradeoff:** Unbounded growth if files never deleted
+
+**Solution:** Purge every 1000 cycles (~2 minutes with 100ms sleep):
+```rust
+if fsync_cycle % 1000 == 0 {
+    file_pool.clear();  // Drops all handles
+}
+```
+
+### Deletion Timing
+
+**Why wait 1000 cycles?**
+1. Allows fsync queue to drain (files must be flushed before deletion)
+2. Batches deletions (reduces syscall overhead)
+3. Prevents race: file handle in `file_pool` while trying to delete
+
+**Sequence:**
+1. `flush_check()` sends path to `del_rx`
+2. Background worker accumulates paths
+3. Every 1000 cycles: drop handles, delete files
+4. Fresh start with empty pool
+
+---
+
+## Performance Deep Dive
+
+Let's quantify the optimizations.
+
+![Write Throughput Scaling](https://raw.githubusercontent.com/nubskr/nubskr.github.io/refs/heads/master/_posts/writer%20bench(1).png)
+
+![Thread Scaling Graph](https://raw.githubusercontent.com/nubskr/nubskr.github.io/refs/heads/master/_posts/scaling%20graph.png)
+
+### Allocation Costs
+
+| Allocator Type | Latency | Syscalls | Contention |
+|----------------|---------|----------|------------|
+| Mutex (pthread) | 1-5 μs | Yes (futex) | High |
+| Spin lock (Walrus) | 200-500 ns | No | Low |
+
+**Speedup:** 5-25x faster allocation.
+
+**Contention handling:** Spin lock uses `compare_exchange_weak` with `spin_loop()` hint, yielding to hypervisor on tight loops.
+
+### io_uring vs Sequential I/O
+
+Batch size: 1000 entries, 1 KB each
+
+| Backend | Syscalls | Latency |
+|---------|----------|---------|
+| Sequential pwrite | 1000 | ~10 ms |
+| io_uring batch | 1 | ~0.5 ms |
+
+**Speedup:** 20x reduction in latency.
+
+### Tail Read Optimization
+
+Scenario: Low-throughput topic (1 msg/sec, 10 MB blocks)
+
+| Strategy | Block Rotation Frequency | Waste |
+|----------|-------------------------|-------|
+| Seal-only reads | Every 10 MB | 0% |
+| Tail reads (Walrus) | Every 10 MB | 0% but **immediate** reads |
+
+**Benefit:** Read latency drops from "when block fills" (~10,000 seconds) to "immediately" (<1ms).
+
+### Fsync Batching
+
+Scenario: 100 active topics, fsync every 1 second
+
+| Strategy | Fsyncs/sec | Syscalls/sec |
+|----------|-----------|--------------|
+| Per-topic fsync | 100 | 100 |
+| Batched fsync (Walrus) | 1 | 1 |
+
+**Reduction:** 100x fewer syscalls.
+
+---
+
+## Design Philosophy
+
+A few words on why Walrus is built this way.
+
+### No External Dependencies (Where Possible)
+
+Notice the lack of third-party concurrency crates:
+- No `crossbeam`, `flume`, or `async`
+- Standard library `mpsc` channels
+- Hand-rolled spin locks
+
+**Why?** Predictability and control. Every microsecond matters in a WAL, and understanding exactly how your primitives behave (syscalls, memory ordering, contention) is critical.
+
+### Zero-Copy Where Safe
+
+- Memory-mapped files eliminate userspace/kernel copies
+- io_uring reduces buffer copying
+- rkyv avoids serialization overhead (zero-copy deserialization)
+
+**Tradeoff:** Unsafe code, careful alignment, manual memory management. Worth it for the throughput gains.
+
+### Fail Gracefully
+
+Corruption, disk full, slow peers—systems fail. Walrus logs, skips, and continues:
+- Checksum failures → skip entry, log error
+- Batch write failures → rollback, return error
+- Background fsync failures → log, continue
+
+**Philosophy:** Availability over correctness for transient errors. Permanent corruption (bad checksums) is logged for forensic analysis.
+
+### Optimize for the 99th Percentile
+
+Spin locks hurt worst-case latency (unbounded spinning). But:
+- P50 latency: 200 ns (vs 2 μs for mutex)
+- P99 latency: 1 μs (vs 5 μs for mutex)
+- P99.9 latency: 10 μs (vs 50 μs for mutex)
+
+**Result:** Better tail latency despite theoretical unbounded worst case.
+
+---
+
+## Future Directions
+
+Walrus is production-ready for single-node workloads. Distributed features are in progress (see WIP files in the repo).
+
+**Coming eventually:**
+- Raft-based cluster consensus (see `distributed coordination.md`)
+- Quorum writes with leader/follower replication
+- Hierarchical consensus (sub-cluster leases)
+- Lock-free MPSC/SPSC queues for inter-node ACKs (see `quorum writes.md`)
+
+The architecture is designed to extend cleanly—distributed features will layer on top without changing the core WAL engine.
+
+---
+
+## Closing Thoughts
+
+Walrus achieves high performance through careful engineering at every layer:
+- Spin locks eliminate syscalls in hot paths
+- io_uring batches operations to single syscalls
+- Tail reads provide immediate consistency without write amplification
+- Dual backends balance portability and performance
+
+If you made it this far, you now know more about Walrus internals than most database engineers know about their WALs. Go build something fast.
+
+
+
+================================================
+FILE: keyed-instances.md
+================================================
+---
+title: Keyed Instances
+layout: default
+nav_order: 6
+---
+
+# Key-based Walrus Instances
+
+Walrus supports namespaced storage so that different workloads can use distinct
+write-ahead logs with their own durability guarantees. Each instance is backed
+by its own subdirectory under `wal_files/`, and the directory name is a
+sanitized version of the key you supply.
+
+## Why It Helps
+
+- **Tailored durability**: Critical topics can fsync aggressively without
+  penalising lighter workloads.
+- **Operational isolation**: Recovery sweeps, compaction and cleanup run per
+  namespace, reducing the blast radius of corruption.
+- **Simple ergonomics**: No need to juggle environment variables or manual
+  directory management; just pick a key and go.
+
+## Creating a Keyed Instance
+
+```rust,no_run
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+# fn main() -> std::io::Result<()> {
+let wal = Walrus::with_consistency_and_schedule_for_key(
+    "transactions",
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach,
+)?;
+
+wal.append_for_topic("payments", b"txn-42 completed")?;
+# Ok(())
+# }
+```
+
+Every file that instance creates lives inside `wal_files/transactions/`. You can
+spin up additional instances with different keys to get isolated indexes and log
+segments without touching the global configuration.
+
+If you prefer to keep using the default constructors, set the environment
+variable `WALRUS_INSTANCE_KEY=<your-key>` before creating the `Walrus` instance.
+The namespace-aware path resolution will automatically place all files under
+`wal_files/<sanitized-key>/`, so even legacy code can opt into isolation without
+source changes.
+
+
+
+================================================
+FILE: quorum writes.md
+================================================
+## this is a WIP file and MUST not be shown on the site and must not be touched too!!
+
+haha, I came up with some other very cheap beasty, I just verified that we guarantee that at any given time there will be atmax one thread listening for the shit sent to a single stream, 
+
+so the overall system looks like this: we have one thread babying all the TCP connections via epoll, whenever it gets something from a stream from one connection, it just need to produce it to that stream's topic and our listerner thread would hold a consumer to that topic and consume the ACK we receive, 
+
+we could do this by making the thread babying TCP connections own the producers per stream and have the consumers per stream in an Arc so that they can be accessed by any thread which comes for write quorum (and since we've ensured that at any given time, there will be only one thread doing this per stream, only one consumer would be there) , so the thing is, we could use std::MPSC for this(I'm allergic to third party crates, I hate them, I dont like the unpredictability from someone else's code), but the thing is, we only have one producer and one consumer guaranteed by our model, AND mpsc is slow, and we are in a performance intensive system where every single microsecond counts,
+this will help us in multiple ways, 1. the writer quorum thread need to talk to the thread who does the I/O for the tcp connection (note that we can't just do the io_uring dispatch ourself because all streams depend on that tcp connection and other streams could be writing to it too and shit woudl just get jumbled) , so we need a dispatcher thread for serialization, 
+
+so essentially the problem becomes:
+
+how do we ensure performance across three threads who need to talk to each other like:
+
+thread A need to give a bunch of shit to thread B so that thread B(the dispatcher thread) can dispatch it via tcp
+
+thread C(the receiver thread) needs to give a bunch of ACKs it received from the tcp connection to thread A, so that darn thread A can complete the quorum write
+
+AND we need to do this trifold dance in a few hundred microseconds at most
+
+
+so now comes the thing, we have two categories of stuff here:
+
+thread C sending ACK to thread A, the thing is, since we have a timeout for the quorum(we wont wait for slow cluster forever, we just timeout after a second or two and just fail the quorum write) and the stream ack consumer thread just goes away, BUT we've already dispatched the request to the slow peers AND WE might get ACK for that thing later(becaues the peers are slow) and thread C would hear it and put it in the stream consumer anyway(because it's stateless and that's what it's job is, it doesnt knows that no one cares about this ack) AND the next guy who comes to do some quorum write for that stream might receive a bunch of stale ACKs(note that we will have message ids in the acks as well to recognize and skip stale ACKs) when it picks up the receiver for that stream lol
+
+so what I've come up with is, a ring buffer per stream:
+
+```rust
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::ptr;
+
+/// Lock-free overwriting queue for ACKs from receiver thread to quorum writer.
+/// Stale ACKs get overwritten - consumer uses message IDs to filter.
+/// 
+/// SAFETY: Only safe with EXACTLY one producer and one consumer.
+#[repr(align(64))]  // Align to cache line
+pub struct OverwriteQueue<T> {
+    buffer: Box<[MaybeUninit<T>]>,
+    capacity: usize,
+    
+    // Separate cache lines to avoid false sharing
+    _pad1: [u8; 64],
+    write_pos: AtomicUsize,
+    
+    _pad2: [u8; 64],
+    read_pos: AtomicUsize,
+    
+    _pad3: [u8; 64],
+}
+
+impl<T> OverwriteQueue<T> {
+    /// Creates a new overwrite queue with the given capacity.
+    /// Capacity must be a power of 2 for efficiency.
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0 && capacity.is_power_of_two(), 
+                "Capacity must be a power of 2");
+        
+        let mut buffer = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buffer.push(MaybeUninit::uninit());
+        }
+        
+        Self {
+            buffer: buffer.into_boxed_slice(),
+            capacity,
+            _pad1: [0; 64],
+            write_pos: AtomicUsize::new(0),
+            _pad2: [0; 64],
+            read_pos: AtomicUsize::new(0),
+            _pad3: [0; 64],
+        }
+    }
+    
+    /// Push a value, overwriting oldest unread value if necessary.
+    /// SAFETY: Must only be called from ONE thread (the producer).
+    pub fn push(&self, value: T) {
+        let write = self.write_pos.load(Ordering::Relaxed);  // Only we write to this
+        let read = self.read_pos.load(Ordering::Acquire);     // Consumer might update
+        
+        let next_write = (write + 1) & (self.capacity - 1);  // Fast modulo with power of 2
+        
+        // Check if we're about to overwrite unread data
+        if next_write == read {
+            // Drop oldest: advance read position (consumer loses one item)
+            // This is fine for ACKs - stale ones get filtered by message ID anyway
+            let next_read = (read + 1) & (self.capacity - 1);
+            self.read_pos.store(next_read, Ordering::Release);
+            
+            // Also need to drop the old value to prevent memory leak
+            unsafe {
+                ptr::drop_in_place(self.buffer[read].as_mut_ptr());
+            }
+        }
+        
+        // Write the new value
+        unsafe {
+            self.buffer[write].as_mut_ptr().write(value);
+        }
+        
+        // Make write visible to consumer with Release ordering
+        fence(Ordering::Release);
+        self.write_pos.store(next_write, Ordering::Release);
+    }
+    
+    /// Try to pop a value. Returns None if queue is empty.
+    /// SAFETY: Must only be called from ONE thread (the consumer).
+    pub fn pop(&self) -> Option<T> {
+        let read = self.read_pos.load(Ordering::Relaxed);   // Only we write to this
+        let write = self.write_pos.load(Ordering::Acquire);  // Producer might update
+        
+        if read == write {
+            return None;  // Empty
+        }
+        
+        // Ensure we see the producer's write
+        fence(Ordering::Acquire);
+        
+        // Read the value
+        let value = unsafe { 
+            self.buffer[read].as_ptr().read() 
+        };
+        
+        // Advance read position
+        let next_read = (read + 1) & (self.capacity - 1);
+        self.read_pos.store(next_read, Ordering::Release);
+        
+        Some(value)
+    }
+    
+    /// Non-blocking batch pop - pops up to `max` items.
+    /// Returns the number of items popped.
+    pub fn pop_batch(&self, dest: &mut Vec<T>, max: usize) -> usize {
+        let mut count = 0;
+        while count < max {
+            match self.pop() {
+                Some(v) => {
+                    dest.push(v);
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        count
+    }
+    
+    /// Returns approximate number of items in the queue.
+    /// This is a snapshot and may be stale immediately.
+    pub fn len(&self) -> usize {
+        let write = self.write_pos.load(Ordering::Acquire);
+        let read = self.read_pos.load(Ordering::Acquire);
+        
+        if write >= read {
+            write - read
+        } else {
+            self.capacity - read + write
+        }
+    }
+    
+    /// Returns true if queue is empty (may be stale).
+    pub fn is_empty(&self) -> bool {
+        let read = self.read_pos.load(Ordering::Acquire);
+        let write = self.write_pos.load(Ordering::Acquire);
+        read == write
+    }
+}
+
+impl<T> Drop for OverwriteQueue<T> {
+    fn drop(&mut self) {
+        // Drop all remaining values
+        while self.pop().is_some() {}
+    }
+}
+
+// Safety: Can be shared across threads (with SPSC guarantee)
+unsafe impl<T: Send> Send for OverwriteQueue<T> {}
+unsafe impl<T: Send> Sync for OverwriteQueue<T> {}
+```
+
+this doesnt prevents stale shit, but it makes sure that the stale shit gets overwritten if it needs to be
+
+and note that that whole thing is in userspace and we know that at any time there will be atmax one consumer and atmax one producer per stream, it's perfectly safe to do atomic shit there
+
+
+---
+the second category
+
+thread A -> dispatcher thread B , this one is critical, we can't afford to 
+
+NOW this is critical, we can have many threads passing shit to be sent for different quorum writes(for different streams) to thread B
+
+note that, in this case, there are multiple producers and one consumer (AND this shit lies in our critical path)
+
+I came up with this(I'm allergic to "someone else's code" remember ?):
+
+```rust
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
+
+/// Lock-free MPSC queue for sending requests to the dispatcher thread.
+/// Multiple producers can push concurrently, one consumer pops.
+/// 
+/// SAFETY: Multiple producers OK, but only ONE consumer allowed.
+#[repr(align(64))]
+pub struct MPSCQueue<T> {
+    buffer: Box<[MaybeUninit<T>]>,
+    capacity: usize,
+    
+    // Separate cache lines for producer/consumer positions
+    _pad1: [u8; 64],
+    write_pos: AtomicUsize,  // Multiple writers contend here
+    
+    _pad2: [u8; 64],
+    read_pos: AtomicUsize,   // Only consumer writes here
+    
+    _pad3: [u8; 64],
+}
+
+impl<T> MPSCQueue<T> {
+    /// Creates a new MPSC queue with the given capacity.
+    /// Capacity must be a power of 2.
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 1 && capacity.is_power_of_two(),
+                "Capacity must be > 1 and a power of 2");
+        
+        let mut buffer = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buffer.push(MaybeUninit::uninit());
+        }
+        
+        Self {
+            buffer: buffer.into_boxed_slice(),
+            capacity,
+            _pad1: [0; 64],
+            write_pos: AtomicUsize::new(0),
+            _pad2: [0; 64],
+            read_pos: AtomicUsize::new(0),
+            _pad3: [0; 64],
+        }
+    }
+    
+    /// Try to push a value. Returns Err(value) if queue is full.
+    /// Can be called from multiple threads concurrently.
+    pub fn push(&self, value: T) -> Result<(), T> {
+        loop {
+            let current_write = self.write_pos.load(Ordering::Acquire);
+            let current_read = self.read_pos.load(Ordering::Acquire);
+            
+            let next_write = (current_write + 1) & (self.capacity - 1);
+            
+            // Conservative full check - keep one slot empty to distinguish full from empty
+            if next_write == current_read {
+                return Err(value);  // Full
+            }
+            
+            // Try to claim this slot with CAS
+            match self.write_pos.compare_exchange_weak(
+                current_write,
+                next_write,
+                Ordering::AcqRel,  // Success: acquire + release semantics
+                Ordering::Acquire, // Failure: just acquire to retry
+            ) {
+                Ok(_) => {
+                    // We successfully claimed slot current_write!
+                    // Now write the value
+                    unsafe {
+                        self.buffer[current_write].as_mut_ptr().write(value);
+                    }
+                    
+                    // CRITICAL: Ensure the write is visible before consumer can see it
+                    // The Release in the CAS above isn't enough because the write to buffer
+                    // happens AFTER the CAS. We need a fence.
+                    fence(Ordering::Release);
+                    
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Another producer won the race, retry
+                    // Use spin_loop hint to tell CPU we're spinning
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
+        }
+    }
+    
+    /// Spin until we can push (for critical path where we can't fail).
+    /// Use with caution - can spin indefinitely if consumer is slow!
+    pub fn push_spin(&self, value: T) {
+        let mut v = value;
+        loop {
+            match self.push(v) {
+                Ok(()) => return,
+                Err(returned) => {
+                    v = returned;
+                    // Brief backoff to reduce contention
+                    for _ in 0..10 {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Try to pop a value. Returns None if queue is empty.
+    /// SAFETY: Must only be called from ONE thread (the consumer).
+    pub fn pop(&self) -> Option<T> {
+        let current_read = self.read_pos.load(Ordering::Relaxed);  // Only we modify this
+        let current_write = self.write_pos.load(Ordering::Acquire); // Producers modify this
+        
+        if current_read == current_write {
+            return None;  // Empty
+        }
+        
+        // Ensure we see the producer's write to the buffer
+        fence(Ordering::Acquire);
+        
+        // Read the value
+        let value = unsafe { 
+            self.buffer[current_read].as_ptr().read() 
+        };
+        
+        // Advance read position - use Release so producers see updated read_pos
+        let next_read = (current_read + 1) & (self.capacity - 1);
+        self.read_pos.store(next_read, Ordering::Release);
+        
+        Some(value)
+    }
+    
+    /// Pop multiple items in one batch - more efficient than calling pop() repeatedly.
+    /// Returns the number of items popped.
+    pub fn pop_batch(&self, dest: &mut Vec<T>, max: usize) -> usize {
+        let mut count = 0;
+        while count < max {
+            match self.pop() {
+                Some(v) => {
+                    dest.push(v);
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        count
+    }
+    
+    /// Returns approximate number of items in the queue.
+    /// This is a snapshot and may be immediately stale.
+    pub fn len(&self) -> usize {
+        let write = self.write_pos.load(Ordering::Acquire);
+        let read = self.read_pos.load(Ordering::Acquire);
+        
+        if write >= read {
+            write - read
+        } else {
+            self.capacity - read + write
+        }
+    }
+    
+    /// Returns true if queue appears empty (may be stale).
+    pub fn is_empty(&self) -> bool {
+        let read = self.read_pos.load(Ordering::Acquire);
+        let write = self.write_pos.load(Ordering::Acquire);
+        read == write
+    }
+}
+
+impl<T> Drop for MPSCQueue<T> {
+    fn drop(&mut self) {
+        // Drop all remaining values
+        while self.pop().is_some() {}
+    }
+}
+
+// Safety: Can be shared across threads with MPSC guarantee
+unsafe impl<T: Send> Send for MPSCQueue<T> {}
+unsafe impl<T: Send> Sync for MPSCQueue<T> {}
+```
+
+and hence, our trifold dance completes (hopefully in a few hundred microseconds at most)
+
+
+
