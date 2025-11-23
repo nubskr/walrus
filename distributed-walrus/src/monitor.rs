@@ -5,6 +5,10 @@ use anyhow::Result;
 use tokio::fs;
 use tracing::{error, info};
 
+//! Monitor: background loop that watches segment sizes (rollover) and retention (GC) using
+//! metadata for ownership and controller for watermarks. It never mutates data directly—only
+//! proposes metadata commands and deletes expired segment dirs.
+
 use crate::bucket::DATA_NAMESPACE;
 use crate::config::NodeConfig;
 use crate::controller::{wal_key, NodeController};
@@ -15,19 +19,41 @@ const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1_000_000_000;
 const DEFAULT_RETENTION_BYTES: u64 = 1_000_000_000;
 
+#[derive(Clone, Copy)]
+struct MonitorLimits {
+    check_interval: Duration,
+    max_segment_size: u64,
+    retention_bytes: u64,
+}
+
+impl MonitorLimits {
+    fn load() -> Self {
+        Self {
+            check_interval: check_interval(),
+            max_segment_size: max_segment_size(),
+            retention_bytes: retention_bytes(),
+        }
+    }
+}
+
 pub struct Monitor {
     controller: Arc<NodeController>,
     config: NodeConfig,
+    limits: MonitorLimits,
 }
 
 impl Monitor {
     pub fn new(controller: Arc<NodeController>, config: NodeConfig) -> Self {
-        Self { controller, config }
+        Self {
+            controller,
+            config,
+            limits: MonitorLimits::load(),
+        }
     }
 
     pub async fn run(self) {
         info!("Monitor loop started");
-        let mut interval = tokio::time::interval(check_interval());
+        let mut interval = tokio::time::interval(self.limits.check_interval);
         loop {
             interval.tick().await;
             if self
@@ -88,10 +114,10 @@ impl Monitor {
                 wal,
                 disk_size,
                 logical_size,
-                max_segment_size()
+                self.limits.max_segment_size
             );
 
-            if size <= max_segment_size() {
+            if size <= self.limits.max_segment_size {
                 continue;
             }
 
@@ -99,7 +125,7 @@ impl Monitor {
                 "Segment {} size {} exceeds limit {}, proposing rollover",
                 wal,
                 size,
-                max_segment_size(),
+                self.limits.max_segment_size,
             );
             let cmd = MetadataCmd::RolloverPartition {
                 name: topic.clone(),
@@ -134,7 +160,7 @@ impl Monitor {
                 if high_watermark == 0 {
                     continue;
                 }
-                let cutoff = high_watermark.saturating_sub(retention_bytes());
+                let cutoff = high_watermark.saturating_sub(self.limits.retention_bytes);
                 let mut max_trim: Option<u64> = None;
                 for segment in part_state.history.iter().filter(|seg| {
                     seg.stored_on_node == self.controller.node_id && seg.end_offset < cutoff

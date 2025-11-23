@@ -1,18 +1,27 @@
-use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut, BytesMut};
+use std::future::Future;
+use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+//! Kafka facade: protocol parsing/encoding only. It delegates all stateful work to
+//! `NodeController` (route append/read, metadata, membership). Keep it dumb: decode → call
+//! controller → encode.
+
 use crate::controller::NodeController;
 use crate::kafka::codec::{decode_string_array, KafkaPrimitive, RequestHeader};
+use crate::kafka::protocol::{encode_api_versions_response, encode_topics};
 use crate::metadata::ClusterState;
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
+type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type HandlerFn =
+    fn(&mut BytesMut, &mut Cursor<&[u8]>, &Arc<NodeController>, u16) -> HandlerFuture<'_>;
 
 pub async fn run_server(port: u16, controller: Arc<NodeController>) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -93,76 +102,173 @@ async fn handle_request(
     let mut res = BytesMut::new();
     header.encode(&mut res);
 
-    match header.api_key {
-        3 => {
-            let topics = decode_string_array(buf)?;
-            encode_metadata_response(
-                &mut res,
-                controller.metadata.snapshot_state(),
-                controller.node_id as i32,
-                advertised_port,
-                topics,
-            );
-        }
-        19 => {
-            encode_create_topics_response(&mut res, buf, controller).await?;
-        }
-        50 => {
-            let topics = decode_string_array(buf)?;
-            encode_internal_state_response(&mut res, controller.metadata.snapshot_state(), topics);
-        }
-        1 => {
-            encode_fetch_response(&mut res, buf, controller).await?;
-        }
-        0 => {
-            encode_produce_response(&mut res, buf, controller).await?;
-        }
-        51 => {
-            encode_membership_response(&mut res, buf, controller).await?;
-        }
-        18 => {
-            encode_api_versions_response(&mut res);
-        }
-        60 => {
-            encode_test_control_response(&mut res, buf, controller).await?;
-        }
-        61 => {
-            // Unadvertised test: force monitor error flag; returns a simple code.
-            let flag = i16::decode(buf)?;
-            let resp = controller
-                .handle_rpc(crate::rpc::InternalOp::TestControl(
-                    crate::rpc::TestControl::ForceMonitorError,
-                ))
-                .await;
-            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
-            res.put_i16(code | (flag != 0) as i16);
-        }
-        62 => {
-            // Unadvertised: force dir_size error path in monitor.
-            let resp = controller
-                .handle_rpc(crate::rpc::InternalOp::TestControl(
-                    crate::rpc::TestControl::ForceDirSizeError,
-                ))
-                .await;
-            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
-            res.put_i16(code);
-        }
-        63 => {
-            // Unadvertised: force GC failure in monitor.
-            let resp = controller
-                .handle_rpc(crate::rpc::InternalOp::TestControl(
-                    crate::rpc::TestControl::ForceGcError,
-                ))
-                .await;
-            let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
-            res.put_i16(code);
-        }
-        other => {
-            return Err(anyhow!("unsupported Kafka API key {}", other));
-        }
-    }
+    let Some(handler) = handler_for(header.api_key) else {
+        return Err(anyhow!("unsupported Kafka API key {}", header.api_key));
+    };
+    handler(&mut res, buf, controller, advertised_port).await?;
 
     Ok(res.to_vec())
+}
+
+fn handler_for(api_key: i16) -> Option<HandlerFn> {
+    match api_key {
+        0 => Some(handle_produce),
+        1 => Some(handle_fetch),
+        3 => Some(handle_metadata),
+        18 => Some(handle_api_versions),
+        19 => Some(handle_create_topics),
+        50 => Some(handle_internal_state),
+        51 => Some(handle_membership),
+        60 => Some(handle_test_control),
+        61 => Some(handle_force_monitor_error),
+        62 => Some(handle_force_dir_error),
+        63 => Some(handle_force_gc_error),
+        _ => None,
+    }
+}
+
+fn handle_metadata(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let topics = decode_string_array(buf)?;
+        encode_metadata_response(
+            res,
+            controller.metadata.snapshot_state(),
+            controller.node_id as i32,
+            advertised_port,
+            topics,
+        );
+        Ok(())
+    })
+}
+
+fn handle_internal_state(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let topics = decode_string_array(buf)?;
+        encode_internal_state_response(res, controller.metadata.snapshot_state(), topics);
+        Ok(())
+    })
+}
+
+fn handle_api_versions(
+    res: &mut BytesMut,
+    _buf: &mut Cursor<&[u8]>,
+    _controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        encode_api_versions_response(res);
+        Ok(())
+    })
+}
+
+fn handle_fetch(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move { encode_fetch_response(res, buf, controller).await })
+}
+
+fn handle_produce(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move { encode_produce_response(res, buf, controller).await })
+}
+
+fn handle_create_topics(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move { encode_create_topics_response(res, buf, controller).await })
+}
+
+fn handle_membership(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move { encode_membership_response(res, buf, controller).await })
+}
+
+fn handle_test_control(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move { encode_test_control_response(res, buf, controller).await })
+}
+
+fn handle_force_monitor_error(
+    res: &mut BytesMut,
+    buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let flag = i16::decode(buf)?;
+        let resp = controller
+            .handle_rpc(crate::rpc::InternalOp::TestControl(
+                crate::rpc::TestControl::ForceMonitorError,
+            ))
+            .await;
+        let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+        res.put_i16(code | (flag != 0) as i16);
+        Ok(())
+    })
+}
+
+fn handle_force_dir_error(
+    res: &mut BytesMut,
+    _buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let resp = controller
+            .handle_rpc(crate::rpc::InternalOp::TestControl(
+                crate::rpc::TestControl::ForceDirSizeError,
+            ))
+            .await;
+        let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+        res.put_i16(code);
+        Ok(())
+    })
+}
+
+fn handle_force_gc_error(
+    res: &mut BytesMut,
+    _buf: &mut Cursor<&[u8]>,
+    controller: &Arc<NodeController>,
+    _advertised_port: u16,
+) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let resp = controller
+            .handle_rpc(crate::rpc::InternalOp::TestControl(
+                crate::rpc::TestControl::ForceGcError,
+            ))
+            .await;
+        let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+        res.put_i16(code);
+        Ok(())
+    })
 }
 
 fn encode_metadata_response(
@@ -176,24 +282,9 @@ fn encode_metadata_response(
     res.put_i32(local_node_id);
     String::from(LOOPBACK_HOST).encode(res);
     res.put_i32(port as i32);
-
-    let requested: HashSet<String> = topics_filter.into_iter().collect();
-    let use_filter = !requested.is_empty();
-    let mut topics: Vec<_> = state.topics.into_iter().collect();
-    topics.sort_by(|a, b| a.0.cmp(&b.0));
-    res.put_i32(
-        topics
-            .iter()
-            .filter(|(name, _)| !use_filter || requested.contains(name))
-            .count() as i32,
-    );
-    for (name, info) in topics.into_iter() {
-        if use_filter && !requested.contains(&name) {
-            continue;
-        }
+    encode_topics(res, state, topics_filter, |res, name, mut parts| {
         res.put_i16(0);
         name.encode(res);
-        let mut parts: Vec<_> = info.partition_states.into_iter().collect();
         parts.sort_by_key(|(id, _)| *id);
         res.put_i32(parts.len() as i32);
         for (partition_id, state) in parts {
@@ -205,7 +296,7 @@ fn encode_metadata_response(
             res.put_i32(1);
             res.put_i32(state.leader_node as i32);
         }
-    }
+    });
 }
 
 async fn encode_produce_response(
@@ -344,50 +435,13 @@ async fn encode_fetch_response(
     Ok(())
 }
 
-fn encode_api_versions_response(res: &mut BytesMut) {
-    res.put_i16(0);
-    let supported = [
-        (0i16, 0i16),
-        (1, 0i16),
-        (3, 0),
-        (18, 0),
-        (19, 0),
-        (50, 0),
-        (51, 0),
-        (60, 0),
-        (61, 0),
-        (62, 0),
-        (63, 0),
-    ];
-    res.put_i32(supported.len() as i32);
-    for (api, version) in supported {
-        res.put_i16(api);
-        res.put_i16(version);
-        res.put_i16(version);
-    }
-}
-
 fn encode_internal_state_response(
     res: &mut BytesMut,
     state: ClusterState,
     topics_filter: Vec<String>,
 ) {
-    let requested: HashSet<String> = topics_filter.into_iter().collect();
-    let use_filter = !requested.is_empty();
-    let mut topics: Vec<_> = state.topics.into_iter().collect();
-    topics.sort_by(|a, b| a.0.cmp(&b.0));
-    res.put_i32(
-        topics
-            .iter()
-            .filter(|(name, _)| !use_filter || requested.contains(name))
-            .count() as i32,
-    );
-    for (name, info) in topics.into_iter() {
-        if use_filter && !requested.contains(&name) {
-            continue;
-        }
+    encode_topics(res, state, topics_filter, |res, name, mut parts| {
         name.encode(res);
-        let mut parts: Vec<_> = info.partition_states.into_iter().collect();
         parts.sort_by_key(|(id, _)| *id);
         res.put_i32(parts.len() as i32);
         for (partition_id, state) in parts {
@@ -395,7 +449,7 @@ fn encode_internal_state_response(
             res.put_i32(state.leader_node as i32);
             res.put_i64(state.current_generation as i64);
         }
-    }
+    });
 }
 
 async fn encode_create_topics_response(

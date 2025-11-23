@@ -1,3 +1,8 @@
+//! Controller: glues together metadata (who owns what), the bucket (Walrus IO behind leases),
+//! and RPC surfaces (Kafka facade + internal forwards). Its only jobs are routing appends/reads,
+//! mapping logical offsets onto Walrus’ physical offsets, and keeping leases in sync with
+//! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
+
 use crate::bucket::BucketService;
 use crate::metadata::{MetadataStateMachine, NodeId, PartitionState, SegmentRecord};
 use crate::rpc::TestControl;
@@ -14,6 +19,27 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::warn;
 
+mod logical_wal;
+mod types;
+use logical_wal::LogicalWal;
+pub use types::{parse_wal_key, wal_key, TopicPartition, WalKeyParts};
+
+#[derive(Clone, Copy)]
+pub struct ControllerConfig {
+    pub forward_timeout: Duration,
+}
+
+impl ControllerConfig {
+    pub fn from_env() -> Self {
+        let forward_timeout = std::env::var("WALRUS_RPC_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(2_000));
+        Self { forward_timeout }
+    }
+}
+
 pub struct NodeController {
     pub node_id: NodeId,
     pub bucket: Arc<BucketService>,
@@ -24,17 +50,10 @@ pub struct NodeController {
     pub test_fail_monitor: AtomicBool,
     pub test_fail_dir_size: AtomicBool,
     pub test_fail_gc: AtomicBool,
+    pub config: ControllerConfig,
 }
 
 impl NodeController {
-    fn forward_timeout() -> Duration {
-        let ms = std::env::var("WALRUS_RPC_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(2_000);
-        Duration::from_millis(ms)
-    }
-
     // Each WAL entry reserves a fixed prefix (matches wal::config::PREFIX_META_SIZE).
     const ENTRY_OVERHEAD: u64 = 256;
     const SCAN_WINDOW: usize = 16 * 1024 * 1024;
@@ -65,12 +84,17 @@ impl NodeController {
                 if self.test_fail_forward_read.load(Ordering::Relaxed) {
                     return InternalResp::Error("forced forward read failure".into());
                 }
-                let Some((topic, partition, _)) = parse_wal_key(&wal_key) else {
+                let Some(parts) = parse_wal_key(&wal_key) else {
                     return InternalResp::Error("invalid wal_key".into());
                 };
-                match self.logical_wal(&wal_key).read(start_offset, max_bytes).await {
+                let tp = TopicPartition::new(&parts.topic, parts.partition);
+                match self.logical_wal(&wal_key)
+                    .read(start_offset, max_bytes)
+                    .await
+                {
                     Ok(entries) => {
-                        let high_watermark = self.partition_high_watermark(&topic, partition).await;
+                        let high_watermark =
+                            self.partition_high_watermark(tp.topic, tp.partition).await;
                         InternalResp::ReadResult {
                             data: entries,
                             high_watermark,
@@ -144,11 +168,12 @@ impl NodeController {
     }
 
     pub async fn route_and_append(&self, topic: &str, partition: u32, data: Vec<u8>) -> Result<()> {
+        let tp = TopicPartition::new(topic, partition);
         let (leader, generation) = self
             .metadata
             .get_partition_leader(topic, partition)
             .ok_or_else(|| anyhow!("unknown topic/partition"))?;
-        let key = wal_key(topic, partition, generation);
+        let key = tp.wal_key(generation);
         tracing::info!(
             "route_and_append topic={} partition={} leader={} gen={} key={}",
             topic,
@@ -171,23 +196,23 @@ impl NodeController {
                 .await
                 .ok_or_else(|| anyhow!("missing peer address for {}", leader))?;
             tracing::info!("forwarding to leader {} at {}", leader, addr);
-            let op = InternalOp::ForwardAppend { wal_key: key, data };
-            let payload = Bytes::from(bincode::serialize(&op)?);
-            let resp = self
-                .raft
-                .rpc_handler()
-                .request(
-                    addr,
-                    RequestPayload::Custom {
-                        operation: "Forward".into(),
-                        data: payload,
-                    },
-                    Self::forward_timeout(),
-                )
+                let op = InternalOp::ForwardAppend { wal_key: key, data };
+                let payload = Bytes::from(bincode::serialize(&op)?);
+                let resp = self
+                    .raft
+                    .rpc_handler()
+                    .request(
+                        addr,
+                        RequestPayload::Custom {
+                            operation: "Forward".into(),
+                            data: payload,
+                        },
+                        self.config.forward_timeout,
+                    )
                 .await?;
-            match resp.payload {
-                ResponsePayload::CustomResponse { data, .. } => {
-                    match bincode::deserialize::<InternalResp>(&data) {
+                match resp.payload {
+                    ResponsePayload::CustomResponse { data, .. } => {
+                        match bincode::deserialize::<InternalResp>(&data) {
                         Ok(InternalResp::Ok) => {}
                         Ok(InternalResp::Error(e)) => return Err(anyhow!(e)),
                         Ok(other) => {
@@ -211,6 +236,7 @@ impl NodeController {
         req_offset: u64,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let tp = TopicPartition::new(topic, partition);
         let state = self
             .metadata
             .get_partition_state(topic, partition)
@@ -218,12 +244,7 @@ impl NodeController {
 
         let mut history_end = 0u64;
         for seg in &state.history {
-            let key = wal_key(topic, partition, seg.generation);
-            let seg_len = if seg.stored_on_node == self.node_id {
-                self.logical_wal(&key).logical_len().await
-            } else {
-                seg.end_offset.saturating_sub(seg.start_offset)
-            };
+            let seg_len = self.segment_logical_len(tp, seg).await;
             let seg_end = seg.start_offset + seg_len;
             history_end = history_end.max(seg_end);
 
@@ -231,8 +252,7 @@ impl NodeController {
                 let local_offset = req_offset - seg.start_offset;
                 return self
                     .read_historical_segment(
-                        topic,
-                        partition,
+                        tp,
                         &state,
                         seg,
                         local_offset,
@@ -243,14 +263,13 @@ impl NodeController {
         }
 
         if req_offset < history_end {
-            let watermark = self.partition_high_watermark(topic, partition).await;
+            let watermark = self.partition_high_watermark(tp.topic, tp.partition).await;
             return Ok((Vec::new(), watermark));
         }
 
         let local_offset = req_offset - history_end;
         self.read_active_head(
-            topic,
-            partition,
+            tp,
             &state,
             local_offset,
             max_bytes,
@@ -284,147 +303,51 @@ impl NodeController {
 
     async fn read_active_head(
         &self,
-        topic: &str,
-        partition: u32,
+        tp: TopicPartition<'_>,
         state: &PartitionState,
         local_offset: u64,
         max_bytes: usize,
         head_start: u64,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let leader = state.leader_node;
-        let wal_key = wal_key(topic, partition, state.current_generation);
+        let wal_key = tp.wal_key(state.current_generation);
         tracing::info!(
             "route_and_read head topic={} partition={} leader={} gen={} key={} offset={}",
-            topic,
-            partition,
-            leader,
+            tp.topic,
+            tp.partition,
+            state.leader_node,
             state.current_generation,
             wal_key,
             local_offset
         );
 
-        if leader == self.node_id {
-            tracing::info!("reading head locally on node {}", self.node_id);
-            let logical = self.logical_wal(&wal_key);
-            let head_len = logical.logical_len().await;
-            if local_offset >= head_len {
-                let watermark = head_start + head_len;
-                tracing::info!(
-                    "head read past end: offset={} len={} watermark={}",
-                    local_offset,
-                    head_len,
-                    watermark
-                );
-                return Ok((Vec::new(), watermark));
-            }
-            let entries = logical.read(local_offset, max_bytes).await?;
-            let watermark = head_start + head_len;
-            return Ok((entries, watermark));
+        if state.leader_node == self.node_id {
+            return self
+                .read_local_logical(&wal_key, local_offset, max_bytes, head_start)
+                .await;
         }
 
-        let addr = self
-            .raft
-            .peer_addr_for(leader)
-            .await
-            .ok_or_else(|| anyhow!("missing peer address for {}", leader))?;
-        tracing::info!("forwarding read to leader {} at {}", leader, addr);
-        let op = InternalOp::ForwardRead {
-            wal_key: wal_key.clone(),
-            start_offset: local_offset,
+        self.forward_read_from(
+            state.leader_node,
+            &wal_key,
+            local_offset,
             max_bytes,
-        };
-        let payload = Bytes::from(bincode::serialize(&op)?);
-        let forwarded = timeout(
-            Self::forward_timeout(),
-            self.raft.rpc_handler().request(
-                addr,
-                RequestPayload::Custom {
-                    operation: "Forward".into(),
-                    data: payload,
-                },
-                Self::forward_timeout(),
-            ),
+            tp,
         )
-        .await;
-        let resp = match forwarded {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                warn!(
-                    "forward read to leader {} at {} failed: {}",
-                    leader, addr, e
-                );
-                let watermark = self.partition_high_watermark(topic, partition).await;
-                return Ok((Vec::new(), watermark));
-            }
-            Err(_) => {
-                warn!(
-                    "forward read to leader {} at {} timed out after {:?}",
-                    leader,
-                    addr,
-                    Self::forward_timeout()
-                );
-                let watermark = self.partition_high_watermark(topic, partition).await;
-                return Ok((Vec::new(), watermark));
-            }
-        };
-
-        match resp.payload {
-            ResponsePayload::CustomResponse { data, .. } => {
-                match bincode::deserialize::<InternalResp>(&data) {
-                    Ok(InternalResp::ReadResult {
-                        data,
-                        high_watermark,
-                    }) => Ok((data, high_watermark)),
-                    Ok(InternalResp::Error(e)) => {
-                        warn!(
-                            "forward read to leader {} at {} returned error: {}",
-                            leader, addr, e
-                        );
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
-                    }
-                    Ok(other) => {
-                        warn!("unexpected response {:?}", other);
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
-                    }
-                    Err(e) => {
-                        warn!("failed to decode forward read response: {}", e);
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
-                    }
-                }
-            }
-            other => {
-                warn!("unexpected response: {:?}", other);
-                Ok((
-                    Vec::new(),
-                    self.partition_high_watermark(topic, partition).await,
-                ))
-            }
-        }
+        .await
     }
 
     async fn read_historical_segment(
         &self,
-        topic: &str,
-        partition: u32,
-        _state: &PartitionState,
+        tp: TopicPartition<'_>,
         segment: &SegmentRecord,
         local_offset: u64,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let wal_key = wal_key(topic, partition, segment.generation);
+        let wal_key = tp.wal_key(segment.generation);
         tracing::info!(
             "route_and_read history topic={} partition={} gen={} node={} key={} offset={} end_offset={}",
-            topic,
-            partition,
+            tp.topic,
+            tp.partition,
             segment.generation,
             segment.stored_on_node,
             wal_key,
@@ -433,65 +356,72 @@ impl NodeController {
         );
 
         if segment.stored_on_node == self.node_id {
-            let logical = self.logical_wal(&wal_key);
-            let seg_len = logical.logical_len().await;
-            if local_offset >= seg_len {
-                let watermark = self.partition_high_watermark(topic, partition).await;
-                return Ok((Vec::new(), watermark));
-            }
-            let entries = logical.read(local_offset, max_bytes).await?;
-            tracing::info!(
-                "read_historical_segment local: key={} entries={}",
-                wal_key,
-                entries.len()
-            );
-            let watermark = self.partition_high_watermark(topic, partition).await;
-            return Ok((entries, watermark));
+            return self
+                .read_local_logical(&wal_key, local_offset, max_bytes, segment.start_offset)
+                .await;
         }
 
-        let addr = self
-            .raft
-            .peer_addr_for(segment.stored_on_node)
-            .await
-            .ok_or_else(|| anyhow!("missing peer address for {}", segment.stored_on_node))?;
+        self.forward_read_from(
+            segment.stored_on_node,
+            &wal_key,
+            local_offset,
+            max_bytes,
+            tp,
+        )
+        .await
+    }
+
+    async fn forward_read_from(
+        &self,
+        target: NodeId,
+        wal_key: &str,
+        start_offset: u64,
+        max_bytes: usize,
+        tp: TopicPartition<'_>,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let Some(addr) = self.raft.peer_addr_for(target).await else {
+            bail!("missing peer address for {}", target);
+        };
 
         let op = InternalOp::ForwardRead {
-            wal_key: wal_key.clone(),
-            start_offset: local_offset,
+            wal_key: wal_key.to_string(),
+            start_offset,
             max_bytes,
         };
         let payload = Bytes::from(bincode::serialize(&op)?);
         let forwarded = timeout(
-            Self::forward_timeout(),
+            self.config.forward_timeout,
             self.raft.rpc_handler().request(
                 addr,
                 RequestPayload::Custom {
                     operation: "Forward".into(),
                     data: payload,
                 },
-                Self::forward_timeout(),
+                self.config.forward_timeout,
             ),
         )
         .await;
+        let fallback_hw = self
+            .partition_high_watermark(tp.topic, tp.partition)
+            .await;
+
         let resp = match forwarded {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
                 warn!(
                     "forward read to node {} at {} failed: {}",
-                    segment.stored_on_node, addr, e
+                    target, addr, e
                 );
-                let watermark = self.partition_high_watermark(topic, partition).await;
-                return Ok((Vec::new(), watermark));
+                return Ok((Vec::new(), fallback_hw));
             }
             Err(_) => {
                 warn!(
                     "forward read to node {} at {} timed out after {:?}",
-                    segment.stored_on_node,
+                    target,
                     addr,
-                    Self::forward_timeout()
+                    self.config.forward_timeout
                 );
-                let watermark = self.partition_high_watermark(topic, partition).await;
-                return Ok((Vec::new(), watermark));
+                return Ok((Vec::new(), fallback_hw));
             }
         };
 
@@ -505,58 +435,73 @@ impl NodeController {
                     Ok(InternalResp::Error(e)) => {
                         warn!(
                             "forward read to node {} at {} returned error: {}",
-                            segment.stored_on_node, addr, e
+                            target, addr, e
                         );
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
+                        Ok((Vec::new(), fallback_hw))
                     }
                     Ok(other) => {
                         warn!("unexpected response {:?}", other);
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
+                        Ok((Vec::new(), fallback_hw))
                     }
                     Err(e) => {
                         warn!("failed to decode forward read response: {}", e);
-                        Ok((
-                            Vec::new(),
-                            self.partition_high_watermark(topic, partition).await,
-                        ))
+                        Ok((Vec::new(), fallback_hw))
                     }
                 }
             }
             other => {
                 warn!("unexpected response: {:?}", other);
-                Ok((
-                    Vec::new(),
-                    self.partition_high_watermark(topic, partition).await,
-                ))
+                Ok((Vec::new(), fallback_hw))
             }
         }
     }
 
+    async fn read_local_logical(
+        &self,
+        wal_key: &str,
+        local_offset: u64,
+        max_bytes: usize,
+        watermark_base: u64,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let logical = self.logical_wal(wal_key);
+        let len = logical.logical_len().await;
+        if local_offset >= len {
+            let watermark = watermark_base + len;
+            tracing::info!(
+                "read_local_logical past end: offset={} len={} watermark={}",
+                local_offset,
+                len,
+                watermark
+            );
+            return Ok((Vec::new(), watermark));
+        }
+        let entries = logical.read(local_offset, max_bytes).await?;
+        Ok((entries, watermark_base + len))
+    }
+
     pub async fn partition_high_watermark(&self, topic: &str, partition: u32) -> u64 {
+        let tp = TopicPartition::new(topic, partition);
         let Some(state) = self.metadata.get_partition_state(topic, partition) else {
             return 0;
         };
         let mut history_end = 0u64;
         for seg in &state.history {
-            let seg_len = if seg.stored_on_node == self.node_id {
-                self.logical_wal(&wal_key(topic, partition, seg.generation))
-                    .logical_len()
-                    .await
-            } else {
-                seg.end_offset.saturating_sub(seg.start_offset)
-            };
+            let seg_len = self.segment_logical_len(tp, seg).await;
             history_end = history_end.max(seg.start_offset + seg_len);
         }
 
-        let head_key = wal_key(topic, partition, state.current_generation);
+        let head_key = tp.wal_key(state.current_generation);
         let head_len = self.logical_wal(&head_key).logical_len().await;
         history_end + head_len
+    }
+
+    async fn segment_logical_len(&self, tp: TopicPartition<'_>, segment: &SegmentRecord) -> u64 {
+        if segment.stored_on_node == self.node_id {
+            let key = tp.wal_key(segment.generation);
+            self.logical_wal(&key).logical_len().await
+        } else {
+            segment.end_offset.saturating_sub(segment.start_offset)
+        }
     }
 
     fn logical_wal<'a>(&'a self, wal_key: &'a str) -> LogicalWal<'a> {
@@ -566,12 +511,12 @@ impl NodeController {
         }
     }
 
-    async fn tracked_len(&self, wal_key: &str) -> u64 {
+    pub(super) async fn tracked_len(&self, wal_key: &str) -> u64 {
         let guard = self.offsets.read().await;
         guard.get(wal_key).copied().unwrap_or(0)
     }
 
-    async fn set_tracked_len(&self, wal_key: &str, bytes: u64) {
+    pub(super) async fn set_tracked_len(&self, wal_key: &str, bytes: u64) {
         let mut guard = self.offsets.write().await;
         let entry = guard.entry(wal_key.to_string()).or_insert(0);
         *entry = bytes;
@@ -686,147 +631,4 @@ impl NodeController {
             Err(e) => InternalResp::Error(format!("Failed to add learner: {}", e)),
         }
     }
-}
-
-struct LogicalWal<'a> {
-    controller: &'a NodeController,
-    wal_key: &'a str,
-}
-
-impl<'a> LogicalWal<'a> {
-    async fn logical_len(&self) -> u64 {
-        let tracked = self.controller.tracked_len(self.wal_key).await;
-        match self.scan_logical_bytes().await {
-            Ok(scanned) => {
-                if scanned != tracked {
-                    self.controller
-                        .set_tracked_len(self.wal_key, scanned)
-                        .await;
-                }
-                scanned
-            }
-            Err(_) => tracked,
-        }
-    }
-
-    async fn read(&self, logical_offset: u64, max_bytes: usize) -> Result<Vec<Vec<u8>>> {
-        let (physical_offset, trim) = self.map_logical_to_physical_offset(logical_offset).await?;
-        let mut entries = self
-            .controller
-            .bucket
-            .read_by_key_from_offset(self.wal_key, physical_offset, max_bytes)
-            .await?;
-
-        if trim > 0 {
-            if let Some(first) = entries.first_mut() {
-                if trim >= first.data.len() {
-                    first.data.clear();
-                } else {
-                    first.data.drain(0..trim);
-                }
-            }
-        }
-
-        Ok(entries.into_iter().map(|e| e.data).collect())
-    }
-
-    async fn map_logical_to_physical_offset(
-        &self,
-        logical_offset: u64,
-    ) -> Result<(u64, usize)> {
-        if logical_offset == 0 {
-            return Ok((0, 0));
-        }
-
-        let total_physical = self
-            .controller
-            .bucket
-            .get_topic_size_blocking(self.wal_key);
-        let mut physical_cursor = 0u64;
-        let mut logical_cursor = 0u64;
-
-        while physical_cursor < total_physical {
-            let remaining = (total_physical - physical_cursor) as usize;
-            let max_bytes = remaining
-                .min(NodeController::SCAN_WINDOW)
-                .max(NodeController::ENTRY_OVERHEAD as usize + 1);
-            let entries = self
-                .controller
-                .bucket
-                .read_by_key_from_offset(self.wal_key, physical_cursor, max_bytes)
-                .await?;
-            if entries.is_empty() {
-                break;
-            }
-
-            for entry in entries {
-                let payload_len = entry.data.len() as u64;
-
-                if logical_offset < logical_cursor + payload_len {
-                    let trim = (logical_offset - logical_cursor) as usize;
-                    return Ok((physical_cursor, trim));
-                }
-
-                logical_cursor += payload_len;
-                physical_cursor += payload_len + NodeController::ENTRY_OVERHEAD;
-
-                if logical_offset == logical_cursor {
-                    return Ok((physical_cursor, 0));
-                }
-            }
-        }
-
-        Ok((physical_cursor, 0))
-    }
-
-    async fn scan_logical_bytes(&self) -> Result<u64> {
-        let total_physical = self
-            .controller
-            .bucket
-            .get_topic_size_blocking(self.wal_key);
-        let mut physical_cursor = 0u64;
-        let mut logical_total = 0u64;
-
-        while physical_cursor < total_physical {
-            let remaining = (total_physical - physical_cursor) as usize;
-            let max_bytes = remaining
-                .min(NodeController::SCAN_WINDOW)
-                .max(NodeController::ENTRY_OVERHEAD as usize + 1);
-            let entries = self
-                .controller
-                .bucket
-                .read_by_key_from_offset(self.wal_key, physical_cursor, max_bytes)
-                .await?;
-            if entries.is_empty() {
-                break;
-            }
-
-            for entry in entries {
-                logical_total += entry.data.len() as u64;
-                physical_cursor += entry.data.len() as u64 + NodeController::ENTRY_OVERHEAD;
-            }
-        }
-
-        Ok(logical_total)
-    }
-}
-
-pub fn wal_key(topic: &str, partition: u32, generation: u64) -> String {
-    format!("t_{}_p_{}_g_{}", topic, partition, generation)
-}
-
-fn parse_wal_key(key: &str) -> Option<(String, u32, u64)> {
-    if !key.starts_with("t_") {
-        return None;
-    }
-    let rest = &key[2..];
-    let p_idx = rest.rfind("_p_")?;
-    let g_idx = rest.rfind("_g_")?;
-    if p_idx >= g_idx {
-        return None;
-    }
-    let topic = &rest[..p_idx];
-    let partition = rest[p_idx + 3..g_idx].parse().ok()?;
-    let generation = rest[g_idx + 3..].parse().ok()?;
-    Some((topic.to_string(), partition, generation))
 }
