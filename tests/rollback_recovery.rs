@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -27,7 +27,6 @@ fn entry_offset(data_len: usize) -> usize {
 #[test]
 fn test_zeroed_header_stops_block_scanning() {
     let _guard = setup_test_env();
-    enable_fd_backend();
 
 
     {
@@ -52,14 +51,17 @@ fn test_zeroed_header_stops_block_scanning() {
 
 
     {
-        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
+        let mut wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
             .collect();
 
-        assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
+        wal_files.sort_by_key(|e| e.file_name());
 
+        // Pre-allocation might create a second file, so we just ensure we have at least one.
+        // The first one (oldest) is the active one we wrote to.
+        assert!(!wal_files.is_empty(), "Should have at least one WAL file");
 
         let offset_0 = 0;
         let offset_1 = entry_offset("entry_0".len());
@@ -124,7 +126,6 @@ fn test_zeroed_header_stops_block_scanning() {
 #[test]
 fn test_concurrent_rollback_cleanup() {
     let _guard = setup_test_env();
-    enable_fd_backend();
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -200,7 +201,6 @@ fn test_concurrent_rollback_cleanup() {
 #[test]
 fn test_rollback_with_block_spanning() {
     let _guard = setup_test_env();
-    enable_fd_backend();
 
     let wal = Arc::new(
         Walrus::with_consistency_and_schedule(
@@ -282,7 +282,6 @@ fn test_rollback_with_block_spanning() {
 #[test]
 fn test_recovery_preserves_data_before_zeroed_headers() {
     let _guard = setup_test_env();
-    enable_fd_backend();
 
 
     {
@@ -308,13 +307,14 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
 
 
     {
-        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
+        let mut wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
             .collect();
 
-        assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
+        wal_files.sort_by_key(|e| e.file_name());
+        assert!(!wal_files.is_empty(), "Should have at least one WAL file");
 
         let file_path = wal_files[0].path();
         let file = std::fs::OpenOptions::new()

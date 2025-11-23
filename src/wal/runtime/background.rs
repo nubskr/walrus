@@ -1,5 +1,5 @@
 use crate::wal::config::{FsyncSchedule, debug_print};
-use crate::wal::storage::{StorageImpl, open_storage_for_path};
+use crate::wal::storage::{Storage, open_storage_for_path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -12,8 +12,6 @@ use std::time::Duration;
 use super::DELETION_TX;
 
 #[cfg(target_os = "linux")]
-use crate::wal::config::USE_FD_BACKEND;
-#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
@@ -25,7 +23,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
     let (del_tx, del_rx) = mpsc::channel::<String>();
     let del_tx_arc = Arc::new(del_tx);
     let _ = DELETION_TX.set(del_tx_arc.clone());
-    let pool: HashMap<String, StorageImpl> = HashMap::new();
+    let pool: HashMap<String, Arc<Storage>> = HashMap::new();
     let tick = Arc::new(AtomicU64::new(0));
     let sleep_millis = match fsync_schedule {
         FsyncSchedule::Milliseconds(ms) => ms.max(1),
@@ -78,75 +76,65 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             // Phase 3: Flush operations
             #[cfg(target_os = "linux")]
             {
-                if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                    // FD backend: Use io_uring for batched fsync
-                    let mut fsync_batch = Vec::new();
+                // FD backend: Use io_uring for batched fsync
+                let mut fsync_batch = Vec::new();
 
-                    for path in unique.iter() {
-                        if let Some(storage) = pool.get(path) {
-                            if let Some(fd_backend) = storage.as_fd() {
-                                let raw_fd = fd_backend.file().as_raw_fd();
-                                fsync_batch.push((raw_fd, path.clone()));
+                for path in unique.iter() {
+                    if let Some(storage) = pool.get(path) {
+                        if let Some(fd_backend) = storage.as_fd() {
+                            let raw_fd = fd_backend.file().as_raw_fd();
+                            fsync_batch.push((raw_fd, path.clone()));
+                        }
+                    }
+                }
+
+                if !fsync_batch.is_empty() {
+                    debug_print!("[flush] batching {} fsync operations", fsync_batch.len());
+
+                    // Push all fsync operations to submission queue
+                    for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
+                        let fd = io_uring::types::Fd(*raw_fd);
+
+                        let fsync_op =
+                            io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
+
+                        unsafe {
+                            if ring.submission().push(&fsync_op).is_err() {
+                                // Submission queue full, submit current batch
+                                ring.submit().expect("Failed to submit fsync batch");
+                                ring.submission()
+                                    .push(&fsync_op)
+                                    .expect("Failed to push fsync op");
                             }
                         }
                     }
 
-                    if !fsync_batch.is_empty() {
-                        debug_print!("[flush] batching {} fsync operations", fsync_batch.len());
-
-                        // Push all fsync operations to submission queue
-                        for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
-                            let fd = io_uring::types::Fd(*raw_fd);
-
-                            let fsync_op =
-                                io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
-
-                            unsafe {
-                                if ring.submission().push(&fsync_op).is_err() {
-                                    // Submission queue full, submit current batch
-                                    ring.submit().expect("Failed to submit fsync batch");
-                                    ring.submission()
-                                        .push(&fsync_op)
-                                        .expect("Failed to push fsync op");
-                                }
-                            }
+                    // Single syscall to submit all fsync operations!
+                    match ring.submit_and_wait(fsync_batch.len()) {
+                        Ok(submitted) => {
+                            debug_print!(
+                                "[flush] submitted {} fsync ops in one syscall",
+                                submitted
+                            );
                         }
+                        Err(e) => {
+                            debug_print!("[flush] failed to submit fsync batch: {}", e);
+                        }
+                    }
 
-                        // Single syscall to submit all fsync operations!
-                        match ring.submit_and_wait(fsync_batch.len()) {
-                            Ok(submitted) => {
+                    // Process completions
+                    for _ in 0..fsync_batch.len() {
+                        if let Some(cqe) = ring.completion().next() {
+                            let idx = cqe.user_data() as usize;
+                            let result = cqe.result();
+
+                            if result < 0 {
+                                let (_fd, path) = &fsync_batch[idx];
                                 debug_print!(
-                                    "[flush] submitted {} fsync ops in one syscall",
-                                    submitted
+                                    "[flush] fsync error for {}: error code {}",
+                                    path,
+                                    result
                                 );
-                            }
-                            Err(e) => {
-                                debug_print!("[flush] failed to submit fsync batch: {}", e);
-                            }
-                        }
-
-                        // Process completions
-                        for _ in 0..fsync_batch.len() {
-                            if let Some(cqe) = ring.completion().next() {
-                                let idx = cqe.user_data() as usize;
-                                let result = cqe.result();
-
-                                if result < 0 {
-                                    let (_fd, path) = &fsync_batch[idx];
-                                    debug_print!(
-                                        "[flush] fsync error for {}: error code {}",
-                                        path,
-                                        result
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for path in unique.iter() {
-                        if let Some(storage) = pool.get_mut(path) {
-                            if let Err(e) = storage.flush() {
-                                debug_print!("[flush] flush error for {}: {}", path, e);
                             }
                         }
                     }
@@ -156,7 +144,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             #[cfg(not(target_os = "linux"))]
             {
                 for path in unique.iter() {
-                    if let Some(storage) = pool.get_mut(path) {
+                    if let Some(storage) = pool.get(path) {
                         if let Err(e) = storage.flush() {
                             debug_print!("[flush] flush error for {}: {}", path, e);
                         }
@@ -178,7 +166,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                     .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    let mut empty: HashMap<String, StorageImpl> = HashMap::new();
+                    let mut empty: HashMap<String, Arc<Storage>> = HashMap::new();
                     std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
 
                     // Perform batched deletions now that mmaps/fds are dropped

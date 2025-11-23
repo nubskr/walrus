@@ -69,7 +69,7 @@ when you pass `true`.
 ### Advanced Configuration
 
 ```rust
-use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule, enable_fd_backend};
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
 
 // Configure with custom consistency and fsync behavior
 let wal = Walrus::with_consistency_and_schedule(
@@ -85,7 +85,7 @@ wal.append_for_topic("events", b"event data")?;
 
 - **Read consistency**: `StrictlyAtOnce` persists every checkpoint; `AtLeastOnce { persist_every }` favours throughput and tolerates replays.
 - **Fsync schedule**: choose `SyncEach`, `Milliseconds(n)`, or `NoFsync` when constructing `Walrus` to balance durability vs latency.
-- **Storage backend**: FD backend (default) uses pread/pwrite syscalls and enables io_uring for batch operations on Linux; `disable_fd_backend()` switches to the mmap backend.
+- **Storage backend**: FD backend (default) uses pread/pwrite syscalls and enables io_uring for batch operations on Linux.
 - **Namespacing & data dir**: set `WALRUS_INSTANCE_KEY` or use the `_for_key` constructors to isolate workloads; `WALRUS_DATA_DIR` relocates the entire tree.
 - **Noise control**: `WALRUS_QUIET=1` mutes debug logging from internal helpers.
 

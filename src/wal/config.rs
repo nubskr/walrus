@@ -1,19 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-// Global flag to choose backend
-pub(crate) static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
-
-// Public function to enable FD backend
-pub fn enable_fd_backend() {
-    USE_FD_BACKEND.store(true, Ordering::Relaxed);
-}
-
-// Public function to disable FD backend (use mmap instead)
-pub fn disable_fd_backend() {
-    USE_FD_BACKEND.store(false, Ordering::Relaxed);
-}
 
 // Macro to conditionally print debug messages
 macro_rules! debug_print {
@@ -67,10 +54,12 @@ pub(crate) fn now_millis_str() -> String {
 }
 
 pub(crate) fn checksum64(data: &[u8]) -> u64 {
-    // FNV-1a 64-bit checksum
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    checksum64_update(data, FNV_OFFSET)
+}
+
+pub(crate) fn checksum64_update(data: &[u8], mut hash: u64) -> u64 {
     const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET;
     for &b in data {
         hash ^= b as u64;
         hash = hash.wrapping_mul(FNV_PRIME);

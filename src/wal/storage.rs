@@ -1,13 +1,15 @@
-use crate::wal::config::{FsyncSchedule, USE_FD_BACKEND};
-use memmap2::MmapMut;
+use crate::wal::config::FsyncSchedule;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::io::IoSlice;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 #[derive(Debug)]
 pub(crate) struct FdBackend {
@@ -38,6 +40,28 @@ impl FdBackend {
         let _ = self.file.write_at(data, offset as u64);
     }
 
+    pub(crate) fn write_vectored(&self, offset: usize, bufs: &[IoSlice]) {
+        #[cfg(unix)]
+        {
+            let fd = self.file.as_raw_fd();
+            // Convert IoSlice to libc::iovec (layout compatible)
+            let iovecs = bufs.as_ptr() as *const libc::iovec;
+            let iovcnt = bufs.len() as std::ffi::c_int;
+            unsafe {
+                libc::pwritev(fd, iovecs, iovcnt, offset as libc::off_t);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+             // Fallback for non-unix (if any)
+             let mut curr = offset;
+             for buf in bufs {
+                 self.write(curr, buf);
+                 curr += buf.len();
+             }
+        }
+    }
+
     pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
         use std::os::unix::fs::FileExt;
         // pread doesn't move the file cursor
@@ -57,61 +81,6 @@ impl FdBackend {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum StorageImpl {
-    Mmap(MmapMut),
-    Fd(FdBackend),
-}
-
-impl StorageImpl {
-    pub(crate) fn write(&self, offset: usize, data: &[u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset <= mmap.len());
-                debug_assert!(mmap.len() - offset >= data.len());
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut u8;
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-                }
-            }
-            StorageImpl::Fd(fd) => fd.write(offset, data),
-        }
-    }
-
-    pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset + dest.len() <= mmap.len());
-                let src = &mmap[offset..offset + dest.len()];
-                dest.copy_from_slice(src);
-            }
-            StorageImpl::Fd(fd) => fd.read(offset, dest),
-        }
-    }
-
-    pub(crate) fn flush(&self) -> std::io::Result<()> {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.flush(),
-            StorageImpl::Fd(fd) => fd.flush(),
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.len(),
-            StorageImpl::Fd(fd) => fd.len(),
-        }
-    }
-
-    pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
-        if let StorageImpl::Fd(fd) = self {
-            Some(fd)
-        } else {
-            None
-        }
-    }
-}
-
 static GLOBAL_FSYNC_SCHEDULE: OnceLock<FsyncSchedule> = OnceLock::new();
 
 fn should_use_o_sync() -> bool {
@@ -121,53 +90,45 @@ fn should_use_o_sync() -> bool {
         .unwrap_or(false)
 }
 
-fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
-    if USE_FD_BACKEND.load(Ordering::Relaxed) {
-        let use_o_sync = should_use_o_sync();
-        Ok(StorageImpl::Fd(FdBackend::new(path, use_o_sync)?))
-    } else {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        // SAFETY: `file` is opened read/write and lives for the duration of this
-        // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Ok(StorageImpl::Mmap(mmap))
-    }
-}
-
 #[derive(Debug)]
-pub(crate) struct SharedMmap {
-    storage: StorageImpl,
+pub(crate) struct Storage {
+    backend: FdBackend,
     last_touched_at: AtomicU64,
 }
 
-// SAFETY: `SharedMmap` provides interior mutability only via methods that
-// enforce bounds and perform atomic timestamp updates; the underlying
-// storage supports concurrent reads and explicit flushes.
-unsafe impl Sync for SharedMmap {}
-// SAFETY: The struct holds storage that is safe to move between threads;
-// timestamps are atomics, so sending is sound.
-unsafe impl Send for SharedMmap {}
+// SAFETY: `Storage` provides interior mutability only via methods that
+// enforce bounds (via backend) and perform atomic timestamp updates; the underlying
+// file supports concurrent reads/writes.
+unsafe impl Sync for Storage {}
+unsafe impl Send for Storage {}
 
-impl SharedMmap {
+impl Storage {
     pub(crate) fn new(path: &str) -> std::io::Result<Arc<Self>> {
-        let storage = create_storage_impl(path)?;
+        let use_o_sync = should_use_o_sync();
+        let backend = FdBackend::new(path, use_o_sync)?;
 
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             .as_millis() as u64;
         Ok(Arc::new(Self {
-            storage,
+            backend,
             last_touched_at: AtomicU64::new(now_ms),
         }))
     }
 
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
-        // Bounds check before raw copy to maintain memory safety
-        debug_assert!(offset <= self.storage.len());
-        debug_assert!(self.storage.len() - offset >= data.len());
+        self.backend.write(offset, data);
 
-        self.storage.write(offset, data);
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_millis() as u64;
+        self.last_touched_at.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn write_vectored(&self, offset: usize, bufs: &[IoSlice]) {
+        self.backend.write_vectored(offset, bufs);
 
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -177,28 +138,27 @@ impl SharedMmap {
     }
 
     pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
-        debug_assert!(offset + dest.len() <= self.storage.len());
-        self.storage.read(offset, dest);
+        self.backend.read(offset, dest);
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.storage.len()
+        self.backend.len()
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
-        self.storage.flush()
+        self.backend.flush()
     }
 
-    pub(crate) fn storage(&self) -> &StorageImpl {
-        &self.storage
+    pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
+        Some(&self.backend)
     }
 }
 
-pub(crate) struct SharedMmapKeeper {
-    data: HashMap<String, Arc<SharedMmap>>,
+pub(crate) struct StorageKeeper {
+    data: HashMap<String, Arc<Storage>>,
 }
 
-impl SharedMmapKeeper {
+impl StorageKeeper {
     fn new() -> Self {
         Self {
             data: HashMap::new(),
@@ -206,26 +166,26 @@ impl SharedMmapKeeper {
     }
 
     // Fast path: many readers concurrently
-    fn get_mmap_arc_read(path: &str) -> Option<Arc<SharedMmap>> {
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
+    fn get_storage_arc_read(path: &str) -> Option<Arc<Storage>> {
+        static STORAGE_KEEPER: OnceLock<RwLock<StorageKeeper>> = OnceLock::new();
+        let keeper_lock = STORAGE_KEEPER.get_or_init(|| RwLock::new(StorageKeeper::new()));
         let keeper = keeper_lock.read().ok()?;
         keeper.data.get(path).cloned()
     }
 
     // Read-mostly accessor that escalates to write lock only on miss
-    pub(crate) fn get_mmap_arc(path: &str) -> std::io::Result<Arc<SharedMmap>> {
-        if let Some(existing) = Self::get_mmap_arc_read(path) {
+    pub(crate) fn get_storage_arc(path: &str) -> std::io::Result<Arc<Storage>> {
+        if let Some(existing) = Self::get_storage_arc_read(path) {
             return Ok(existing);
         }
 
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
+        static STORAGE_KEEPER: OnceLock<RwLock<StorageKeeper>> = OnceLock::new();
+        let keeper_lock = STORAGE_KEEPER.get_or_init(|| RwLock::new(StorageKeeper::new()));
 
         // Double-check with a fresh read lock to avoid unnecessary write lock
         {
             let keeper = keeper_lock.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned")
+                std::io::Error::new(std::io::ErrorKind::Other, "storage keeper read lock poisoned")
             })?;
             if let Some(existing) = keeper.data.get(path) {
                 return Ok(existing.clone());
@@ -233,13 +193,13 @@ impl SharedMmapKeeper {
         }
 
         let mut keeper = keeper_lock.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned")
+            std::io::Error::new(std::io::ErrorKind::Other, "storage keeper write lock poisoned")
         })?;
         if let Some(existing) = keeper.data.get(path) {
             return Ok(existing.clone());
         }
 
-        let arc = SharedMmap::new(path)?;
+        let arc = Storage::new(path)?;
         keeper.data.insert(path.to_string(), arc.clone());
         Ok(arc)
     }
@@ -253,6 +213,6 @@ pub(crate) fn fsync_schedule() -> Option<FsyncSchedule> {
     GLOBAL_FSYNC_SCHEDULE.get().copied()
 }
 
-pub(crate) fn open_storage_for_path(path: &str) -> std::io::Result<StorageImpl> {
-    create_storage_impl(path)
+pub(crate) fn open_storage_for_path(path: &str) -> std::io::Result<Arc<Storage>> {
+    Storage::new(path)
 }

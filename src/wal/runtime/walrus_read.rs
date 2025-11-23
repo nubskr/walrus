@@ -9,8 +9,6 @@ use std::sync::{Arc, RwLock};
 use rkyv::{AlignedVec, Deserialize};
 
 #[cfg(target_os = "linux")]
-use crate::wal::config::USE_FD_BACKEND;
-#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 
 #[cfg(target_os = "linux")]
@@ -533,9 +531,9 @@ impl Walrus {
             drop(info_opt.take().unwrap());
         }
 
-        // 3) Read ranges via io_uring (FD backend) or mmap
+        // 3) Read ranges via io_uring (FD backend) or Storage read
         #[cfg(target_os = "linux")]
-        let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) {
+        let buffers = {
             // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
             let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
@@ -551,7 +549,7 @@ impl Walrus {
                 let mut buffer = vec![0u8; size];
                 let file_offset = read_plan.blk.offset + read_plan.start;
 
-                let fd = if let Some(fd_backend) = read_plan.blk.mmap.storage().as_fd() {
+                let fd = if let Some(fd_backend) = read_plan.blk.storage.as_fd() {
                     io_uring::types::Fd(fd_backend.file().as_raw_fd())
                 } else {
                     return Err(io::Error::new(
@@ -601,16 +599,6 @@ impl Walrus {
             }
 
             temp_buffers
-        } else {
-            plan.iter()
-                .map(|read_plan| {
-                    let size = (read_plan.end - read_plan.start) as usize;
-                    let mut buffer = vec![0u8; size];
-                    let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
-                    read_plan.blk.mmap.read(file_offset, &mut buffer);
-                    buffer
-                })
-                .collect()
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -620,7 +608,7 @@ impl Walrus {
                 let size = (read_plan.end - read_plan.start) as usize;
                 let mut buffer = vec![0u8; size];
                 let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
-                read_plan.blk.mmap.read(file_offset, &mut buffer);
+                read_plan.blk.storage.read(file_offset, &mut buffer);
                 buffer
             })
             .collect();

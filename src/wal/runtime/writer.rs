@@ -8,7 +8,7 @@ use crate::wal::config::{
     debug_print,
 };
 #[cfg(target_os = "linux")]
-use crate::wal::config::{USE_FD_BACKEND, checksum64};
+use crate::wal::config::checksum64;
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::convert::TryFrom;
@@ -80,7 +80,7 @@ impl Writer {
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
-            sealed.mmap.flush()?;
+            sealed.storage.flush()?;
             let _ = self.reader.append_block_to_chain(&self.col, sealed);
             debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
@@ -111,8 +111,8 @@ impl Writer {
         // Handle fsync based on schedule
         match self.fsync_schedule {
             FsyncSchedule::SyncEach => {
-                // Immediate mmap flush, skip background flusher
-                block.mmap.flush()?;
+                // Immediate storage flush, skip background flusher
+                block.storage.flush()?;
                 debug_print!(
                     "[writer] immediate fsync: col={}, block_id={}",
                     self.col,
@@ -234,7 +234,7 @@ impl Writer {
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
                 sealed.used = planning_offset;
-                sealed.mmap.flush()?;
+                sealed.storage.flush()?;
                 let _ = self.reader.append_block_to_chain(&self.col, sealed);
 
                 // Allocate new block
@@ -255,75 +255,75 @@ impl Writer {
             revert_info.allocated_block_ids.len() + 1
         );
 
-        // Phase 2 & 3: io_uring preparation and submission (FD backend only)
-        #[cfg(target_os = "linux")]
-        let total_bytes_usize = usize::try_from(total_bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "batch is too large to fit into addressable memory",
-            )
-        })?;
-
+        // Phase 2 & 3: io_uring preparation and submission (FD backend only, Linux only)
         #[cfg(target_os = "linux")]
         {
-            if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                return self.submit_batch_via_io_uring(
-                    &write_plan,
-                    batch,
-                    &mut revert_info,
-                    &mut *cur_offset,
-                    planning_offset,
-                    total_bytes_usize,
-                );
-            }
+            let total_bytes_usize = usize::try_from(total_bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "batch is too large to fit into addressable memory",
+                )
+            })?;
+
+            return self.submit_batch_via_io_uring(
+                &write_plan,
+                batch,
+                &mut revert_info,
+                &mut *cur_offset,
+                planning_offset,
+                total_bytes_usize,
+            );
         }
 
-        // Fallback: use regular block.write() in a loop (mmap backend or non-Linux builds)
-        for (blk, offset, data_idx) in write_plan.iter() {
-            let data = batch[*data_idx];
-            let next_block_start = blk.offset + blk.limit;
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Fallback: use regular block.write() in a loop (for non-Linux systems)
+            for (blk, offset, data_idx) in write_plan.iter() {
+                let data = batch[*data_idx];
+                let next_block_start = blk.offset + blk.limit;
 
-            if let Err(e) = blk.write(*offset, data, &self.col, next_block_start) {
-                // Clean up any partially written headers up to and including the failed index
-                for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
-                    let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
-                }
-
-                // Flush zeros and rollback
-                let mut fsynced = HashSet::new();
-                for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
-                    if fsynced.insert(w_blk.file_path.clone()) {
-                        let _ = w_blk.mmap.flush();
+                if let Err(e) = blk.write(*offset, data, &self.col, next_block_start) {
+                    // Clean up any partially written headers up to and including the failed index
+                    for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
+                        let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
                     }
+
+                    // Flush zeros and rollback
+                    let mut fsynced = HashSet::new();
+                    for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
+                        if fsynced.insert(w_blk.file_path.clone()) {
+                            let _ = w_blk.storage.flush();
+                        }
+                    }
+
+                    *cur_offset = revert_info.original_offset;
+                    for block_id in revert_info.allocated_block_ids {
+                        FileStateTracker::set_block_unlocked(block_id as usize);
+                    }
+                    return Err(e);
                 }
+            }
 
-                *cur_offset = revert_info.original_offset;
-                for block_id in revert_info.allocated_block_ids {
-                    FileStateTracker::set_block_unlocked(block_id as usize);
+            // Success - fsync touched files
+            let mut fsynced = HashSet::new();
+            for (blk, _, _) in write_plan.iter() {
+                if !fsynced.contains(&blk.file_path) {
+                    blk.storage.flush()?;
+                    fsynced.insert(blk.file_path.clone());
                 }
-                return Err(e);
             }
+
+            // NOW update the writer's offset to make data visible to readers
+            *cur_offset = planning_offset;
+
+            debug_print!(
+                "[batch] SUCCESS (vectored): wrote {} entries, {} bytes to topic={}",
+                batch.len(),
+                total_bytes,
+                self.col
+            );
+            Ok(())
         }
-
-        // Success - fsync touched files
-        let mut fsynced = HashSet::new();
-        for (blk, _, _) in write_plan.iter() {
-            if !fsynced.contains(&blk.file_path) {
-                blk.mmap.flush()?;
-                fsynced.insert(blk.file_path.clone());
-            }
-        }
-
-        // NOW update the writer's offset to make data visible to readers
-        *cur_offset = planning_offset;
-
-        debug_print!(
-            "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
-            batch.len(),
-            total_bytes,
-            self.col
-        );
-        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -376,7 +376,7 @@ impl Writer {
             let file_offset = blk.offset + offset;
 
             // Get raw FD
-            let fd = if let Some(fd_backend) = blk.mmap.storage().as_fd() {
+            let fd = if let Some(fd_backend) = blk.storage.as_fd() {
                 io_uring::types::Fd(fd_backend.file().as_raw_fd())
             } else {
                 // Rollback and fail
@@ -454,7 +454,7 @@ impl Writer {
                     let mut fsynced = HashSet::new();
                     for (blk, _, _) in write_plan.iter() {
                         if fsynced.insert(blk.file_path.clone()) {
-                            let _ = blk.mmap.flush();
+                            let _ = blk.storage.flush();
                         }
                     }
 
@@ -473,7 +473,7 @@ impl Writer {
                 let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if !fsynced.contains(&blk.file_path) {
-                        blk.mmap.flush()?;
+                        blk.storage.flush()?;
                         fsynced.insert(blk.file_path.clone());
                     }
                 }
@@ -499,7 +499,7 @@ impl Writer {
                 let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if fsynced.insert(blk.file_path.clone()) {
-                        let _ = blk.mmap.flush();
+                        let _ = blk.storage.flush();
                     }
                 }
 

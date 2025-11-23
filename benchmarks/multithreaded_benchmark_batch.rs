@@ -233,11 +233,9 @@ fn configure_storage_backend() {
     {
         match selection.as_deref() {
             Some("mmap") => {
-                walrus_rust::disable_fd_backend();
                 println!("Storage backend: mmap");
             }
             Some("fd") | Some("io_uring") | Some("uring") | Some("file") | None => {
-                walrus_rust::enable_fd_backend();
                 println!("Storage backend: fd");
             }
             Some(other) => {
@@ -245,7 +243,6 @@ fn configure_storage_backend() {
                     "Unknown storage backend '{}'; defaulting to fd (io_uring) backend.",
                     other
                 );
-                walrus_rust::enable_fd_backend();
             }
         }
     }
