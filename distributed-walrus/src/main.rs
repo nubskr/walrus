@@ -1,3 +1,5 @@
+// Binary wiring only: construct the bucket (Walrus IO), metadata (Raft state machine), controller
+// (routing), Kafka facade, monitor loop, and join/bootstrap helpers.
 mod bucket;
 mod config;
 mod controller;
@@ -102,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         test_fail_monitor: std::sync::atomic::AtomicBool::new(false),
         test_fail_dir_size: std::sync::atomic::AtomicBool::new(false),
         test_fail_gc: std::sync::atomic::AtomicBool::new(false),
+        config: controller::ControllerConfig::from_env(),
     });
 
     let controller_rpc = controller.clone();
@@ -139,132 +142,8 @@ async fn main() -> anyhow::Result<()> {
 
     raft.start().await?;
 
-    if node_config.node_id == 1 {
-        info!(
-            "Node 1: Campaigning for leadership (fresh_meta={})",
-            !has_existing_meta
-        );
-        raft.campaign().await?;
-        tokio::time::sleep(Duration::from_secs(20)).await;
-
-        if !has_existing_meta {
-            info!("--- Create topic via Raft ---");
-            let cmd = MetadataCmd::CreateTopic {
-                name: "logs".into(),
-                partitions: 2,
-                initial_leader: 1,
-            };
-
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                match raft.propose(bincode::serialize(&cmd)?).await {
-                    Ok(res) => {
-                        info!("CreateTopic result: {:?}", String::from_utf8_lossy(&res));
-                        break;
-                    }
-                    Err(e) => {
-                        error!(
-                            "CreateTopic failed (attempt {}): {}. Retrying in 2s...",
-                            attempts, e
-                        );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-
-            // Always rollover to self (1) initially since we don't know if peers joined yet
-            let next_leader = 1;
-            info!("--- Rollover partition to Node {} ---", next_leader);
-            let roll = MetadataCmd::RolloverPartition {
-                name: "logs".into(),
-                partition: 0,
-                new_leader: next_leader,
-                sealed_segment_size_bytes: 0,
-            };
-
-            loop {
-                match raft.propose(bincode::serialize(&roll)?).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        error!("Rollover failed: {}. Retrying...", e);
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-
-            // Allow time for state machine and sync leases
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            controller.sync_leases_now().await;
-            controller
-                .route_and_append("logs", 0, b"payload-from-node1".to_vec())
-                .await?;
-            info!("Append routed through controller");
-
-            let (reads, high_watermark) = controller.route_and_read("logs", 0, 0, 1024).await?;
-            info!("Read {} entries (hw={})", reads.len(), high_watermark);
-            for (i, data) in reads.iter().enumerate() {
-                info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
-            }
-        } else {
-            info!("Existing metadata detected; skipping topic bootstrap");
-        }
-    }
-
-    // Join logic
-    if let Some(join_target) = &node_config.join_addr {
-        info!("Joining cluster via {}", join_target);
-        let my_addr = format!("{}:{}", advertise_host, node_config.raft_port);
-        let op = InternalOp::JoinCluster {
-            node_id: node_config.node_id,
-            addr: my_addr,
-        };
-        let payload = bytes::Bytes::from(bincode::serialize(&op)?);
-        let target_sock: std::net::SocketAddr = join_target_resolved
-            .ok_or_else(|| anyhow::anyhow!("could not resolve join target {}", join_target))?;
-
-        let rpc = raft.rpc_handler();
-        let mut joined = false;
-        for i in 0..10 {
-            info!("Join attempt {}/10...", i + 1);
-            match rpc
-                .request(
-                    target_sock,
-                    RequestPayload::Custom {
-                        operation: "Forward".into(),
-                        data: payload.clone(),
-                    },
-                    Duration::from_secs(5),
-                )
-                .await
-            {
-                Ok(resp) => match resp.payload {
-                    ResponsePayload::CustomResponse { success, data } => {
-                        if success {
-                            info!("Successfully joined cluster");
-                            joined = true;
-                            break;
-                        } else {
-                            let err_msg = match bincode::deserialize::<InternalResp>(&data) {
-                                Ok(InternalResp::Error(e)) => e,
-                                _ => "unknown error".to_string(),
-                            };
-                            error!("Join failed: {}", err_msg);
-                        }
-                    }
-                    _ => error!("Unexpected response payload"),
-                },
-                Err(e) => {
-                    error!("Join attempt failed: {}, retrying...", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-        if !joined {
-            error!("Failed to join cluster after retries");
-        }
-    }
+    bootstrap_node_one(&controller, &raft, has_existing_meta).await?;
+    attempt_join(&raft, &node_config, &advertise_host, join_target_resolved).await?;
 
     controller.sync_leases_now().await;
     let sync_controller = controller.clone();
@@ -291,5 +170,150 @@ async fn main() -> anyhow::Result<()> {
     info!("Node {} ready; waiting for ctrl-c", node_config.node_id);
     tokio::signal::ctrl_c().await?;
 
+    Ok(())
+}
+
+async fn bootstrap_node_one(
+    controller: &Arc<NodeController>,
+    raft: &Arc<OctopiiNode>,
+    has_existing_meta: bool,
+) -> anyhow::Result<()> {
+    if controller.node_id != 1 {
+        return Ok(());
+    }
+
+    info!(
+        "Node 1: Campaigning for leadership (fresh_meta={})",
+        !has_existing_meta
+    );
+    raft.campaign().await?;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    if has_existing_meta {
+        info!("Existing metadata detected; skipping topic bootstrap");
+        return Ok(());
+    }
+
+    info!("--- Create topic via Raft ---");
+    let cmd = MetadataCmd::CreateTopic {
+        name: "logs".into(),
+        partitions: 2,
+        initial_leader: 1,
+    };
+
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match raft.propose(bincode::serialize(&cmd)?).await {
+            Ok(res) => {
+                info!("CreateTopic result: {:?}", String::from_utf8_lossy(&res));
+                break;
+            }
+            Err(e) => {
+                error!(
+                    "CreateTopic failed (attempt {}): {}. Retrying in 2s...",
+                    attempts, e
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    // Always rollover to self (1) initially since we don't know if peers joined yet
+    let roll = MetadataCmd::RolloverPartition {
+        name: "logs".into(),
+        partition: 0,
+        new_leader: 1,
+        sealed_segment_size_bytes: 0,
+    };
+
+    loop {
+        match raft.propose(bincode::serialize(&roll)?).await {
+            Ok(_) => break,
+            Err(e) => {
+                error!("Rollover failed: {}. Retrying...", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    // Allow time for state machine and sync leases
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    controller.sync_leases_now().await;
+    controller
+        .route_and_append("logs", 0, b"payload-from-node1".to_vec())
+        .await?;
+    info!("Append routed through controller");
+
+    let (reads, high_watermark) = controller.route_and_read("logs", 0, 0, 1024).await?;
+    info!("Read {} entries (hw={})", reads.len(), high_watermark);
+    for (i, data) in reads.iter().enumerate() {
+        info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
+    }
+
+    Ok(())
+}
+
+async fn attempt_join(
+    raft: &Arc<OctopiiNode>,
+    node_config: &NodeConfig,
+    advertise_host: &str,
+    join_target_resolved: Option<std::net::SocketAddr>,
+) -> anyhow::Result<()> {
+    let Some(join_target) = &node_config.join_addr else {
+        return Ok(());
+    };
+
+    info!("Joining cluster via {}", join_target);
+    let my_addr = format!("{}:{}", advertise_host, node_config.raft_port);
+    let op = InternalOp::JoinCluster {
+        node_id: node_config.node_id,
+        addr: my_addr,
+    };
+    let payload = bytes::Bytes::from(bincode::serialize(&op)?);
+    let target_sock: std::net::SocketAddr = join_target_resolved
+        .ok_or_else(|| anyhow::anyhow!("could not resolve join target {}", join_target))?;
+
+    let rpc = raft.rpc_handler();
+    let mut joined = false;
+    for i in 0..10 {
+        info!("Join attempt {}/10...", i + 1);
+        match rpc
+            .request(
+                target_sock,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: payload.clone(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(resp) => match resp.payload {
+                ResponsePayload::CustomResponse { success, data } => {
+                    if success {
+                        info!("Successfully joined cluster");
+                        joined = true;
+                        break;
+                    } else {
+                        let err_msg = match bincode::deserialize::<InternalResp>(&data) {
+                            Ok(InternalResp::Error(e)) => e,
+                            _ => "unknown error".to_string(),
+                        };
+                        error!("Join failed: {}", err_msg);
+                    }
+                }
+                _ => error!("Unexpected response payload"),
+            },
+            Err(e) => {
+                error!("Join attempt failed: {}, retrying...", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    if !joined {
+        error!("Failed to join cluster after retries");
+    }
     Ok(())
 }

@@ -1,3 +1,6 @@
+//! BucketService: thin Walrus wrapper that enforces leases (who may write), handles per-key
+//! mutexes for concurrent writers, and exposes read/append by partition id or raw wal key.
+
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -68,61 +71,20 @@ impl BucketService {
 
     /// Append bytes to the topic corresponding to the partition.
     pub async fn append(&self, pid: PartitionId, data: Vec<u8>) -> Result<()> {
-        let key = pid.to_wal_key();
-        {
-            let leases = self.active_leases.read().await;
-            if !leases.contains(&key) {
-                warn!("Write rejected for {} (missing lease)", key);
-                bail!("NotLeaderForPartition: {}", key);
-            }
-        }
-
-        let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || engine.batch_append_for_topic(&key, &[&data]))
-            .await??;
-
-        Ok(())
+        self.append_raw(&pid.to_wal_key(), data).await
     }
 
     /// Read up to `max_bytes` from the partition.
     pub async fn read(&self, pid: PartitionId, max_bytes: usize) -> Result<Vec<Entry>> {
-        let key = pid.to_wal_key();
-        let engine = self.engine.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false, None)
-        })
-        .await??;
-        Ok(entries)
+        self.read_raw(&pid.to_wal_key(), max_bytes, None).await
     }
 
     pub async fn append_by_key(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
-        {
-            let leases = self.active_leases.read().await;
-            if !leases.contains(wal_key) {
-                warn!(
-                    "append_by_key missing lease for {} (leases: {:?})",
-                    wal_key, leases
-                );
-                bail!("NotLeaderForPartition: {}", wal_key);
-            }
-        }
-        let lock = self.lock_for_key(wal_key).await;
-        let _guard = lock.lock().await;
-        let engine = self.engine.clone();
-        let key = wal_key.to_string();
-        tokio::task::spawn_blocking(move || engine.batch_append_for_topic(&key, &[&data]))
-            .await??;
-        Ok(())
+        self.append_raw(wal_key, data).await
     }
 
     pub async fn read_by_key(&self, wal_key: &str, max_bytes: usize) -> Result<Vec<Entry>> {
-        let engine = self.engine.clone();
-        let key = wal_key.to_string();
-        let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false, None)
-        })
-        .await??;
-        Ok(entries)
+        self.read_raw(wal_key, max_bytes, None).await
     }
 
     pub async fn read_by_key_from_offset(
@@ -131,16 +93,34 @@ impl BucketService {
         start_offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<Entry>> {
+        self.read_raw(wal_key, max_bytes, Some(start_offset)).await
+    }
+
+    async fn append_raw(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
+        let guard = BucketGuard::lock(self, wal_key).await?;
+        let engine = self.engine.clone();
+        let key = wal_key.to_string();
+        tokio::task::spawn_blocking(move || engine.batch_append_for_topic(&key, &[&data]))
+            .await??;
+        Ok(())
+    }
+
+    async fn read_raw(
+        &self,
+        wal_key: &str,
+        max_bytes: usize,
+        start_offset: Option<u64>,
+    ) -> Result<Vec<Entry>> {
         let engine = self.engine.clone();
         let key = wal_key.to_string();
 
         let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false, Some(start_offset))
+            engine.batch_read_for_topic(&key, max_bytes, false, start_offset)
         })
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
 
-        if entries.is_empty() {
+        if entries.is_empty() && start_offset.is_some() {
             tracing::warn!(
                 "bucket read returned empty for {} (size request {})",
                 wal_key,
@@ -184,6 +164,34 @@ impl BucketService {
 
     pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64 {
         self.engine.get_topic_size(wal_key)
+    }
+}
+
+struct BucketGuard<'a> {
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    _bucket: &'a BucketService,
+}
+
+impl<'a> BucketGuard<'a> {
+    async fn lock(bucket: &'a BucketService, wal_key: &str) -> Result<Self> {
+        bucket.ensure_lease(wal_key).await?;
+        let lock = bucket.lock_for_key(wal_key).await;
+        let guard = lock.lock_owned().await;
+        Ok(Self {
+            _lock: guard,
+            _bucket: bucket,
+        })
+    }
+}
+
+impl BucketService {
+    async fn ensure_lease(&self, wal_key: &str) -> Result<()> {
+        let leases = self.active_leases.read().await;
+        if !leases.contains(wal_key) {
+            warn!("write rejected for {} (leases: {:?})", wal_key, leases);
+            bail!("NotLeaderForPartition: {}", wal_key);
+        }
+        Ok(())
     }
 }
 
