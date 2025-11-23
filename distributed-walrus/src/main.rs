@@ -4,7 +4,6 @@ mod bucket;
 mod config;
 mod controller;
 mod fs_utils;
-mod kafka;
 mod metadata;
 mod monitor;
 mod rpc;
@@ -157,13 +156,14 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         sync_controller.run_lease_sync_loop().await;
     });
 
-    let kafka_controller = controller.clone();
-    let kafka_port = node_config.kafka_port;
-    tokio::spawn(async move {
-        if let Err(e) = kafka::server::run_server(kafka_port, kafka_controller).await {
-            error!("Kafka server exited: {e}");
-        }
-    });
+    // TODO: Spawn simple protocol server here
+    // let simple_controller = controller.clone();
+    // let simple_port = node_config.simple_port;
+    // tokio::spawn(async move {
+    //     if let Err(e) = simple::server::run_server(simple_port, simple_controller).await {
+    //         error!("Simple protocol server exited: {e}");
+    //     }
+    // });
 
     let monitor_controller = controller.clone();
     let monitor_config = node_config.clone();
@@ -245,16 +245,17 @@ async fn bootstrap_node_one(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     controller.sync_leases_now().await;
-    controller
-        .route_and_append("logs", 0, b"payload-from-node1".to_vec())
-        .await?;
-    info!("Append routed through controller");
+    // TODO: Re-enable once we have simple protocol
+    // controller
+    //     .route_and_append("logs", 0, b"payload-from-node1".to_vec())
+    //     .await?;
+    // info!("Append routed through controller");
 
-    let (reads, high_watermark) = controller.route_and_read("logs", 0, 0, 1024).await?;
-    info!("Read {} entries (hw={})", reads.len(), high_watermark);
-    for (i, data) in reads.iter().enumerate() {
-        info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
-    }
+    // let (reads, high_watermark) = controller.route_and_read("logs", 0, 0, 1024).await?;
+    // info!("Read {} entries (hw={})", reads.len(), high_watermark);
+    // for (i, data) in reads.iter().enumerate() {
+    //     info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
+    // }
 
     Ok(())
 }
