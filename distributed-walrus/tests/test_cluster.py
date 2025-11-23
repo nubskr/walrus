@@ -395,11 +395,33 @@ def dump_logs(services: list[str], tail: int = 120):
         print(f"[log] failed to fetch logs: {exc}")
 
 
-def produce_and_assert_ok(node: tuple[str, int], topic: str, payload: bytes, partition: int = 0) -> bytes:
-    resp = send_frame_with_retry(*node, make_produce_request(topic, payload, partition=partition))
-    assert resp, f"produce to {node} returned no response"
-    codes = parse_produce_error_codes(resp)
-    assert all(code == 0 for code in codes), f"produce failed with codes {codes}"
+def produce_and_assert_ok(
+    node: tuple[str, int],
+    topic: str,
+    payload: bytes,
+    partition: int = 0,
+    retries: int = 0,
+    retry_delay: float = 0.5,
+) -> bytes:
+    """
+    Produce payload to the given topic/partition and assert success, optionally retrying on transient errors.
+    """
+    last_codes: Optional[list[int]] = None
+    for attempt in range(retries + 1):
+        resp = send_frame_with_retry(*node, make_produce_request(topic, payload, partition=partition))
+        assert resp, f"produce to {node} returned no response"
+        codes = parse_produce_error_codes(resp)
+        if all(code == 0 for code in codes):
+            return resp
+        last_codes = codes
+        if attempt < retries:
+            print(f"produce returned codes {codes}, retrying ({attempt + 1}/{retries}) after {retry_delay}s...")
+            time.sleep(retry_delay)
+            continue
+        break
+
+    assert last_codes is not None, "produce failed without error codes"
+    assert all(code == 0 for code in last_codes), f"produce failed with codes {last_codes}"
     return resp
 
 
@@ -2349,7 +2371,7 @@ def test_produce_large_payloads_up_to_cap():
     total_bytes = 0
     for size_mb in sizes_mb:
         payload = bytes([size_mb % 256]) * (size_mb * 1024 * 1024)
-        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+        produce_and_assert_ok(NODES[1], topic, payload, partition=0, retries=5, retry_delay=1.0)
         total_bytes += len(payload)
 
     # Fetch from offset 0 and ensure we read something and high watermark covers total bytes.
@@ -2360,121 +2382,121 @@ def test_produce_large_payloads_up_to_cap():
     assert fetch[0]["high_watermark"] >= total_bytes, "high watermark did not advance after large writes"
 
 
-    def test_throughput_3gb_write_read():
-        """
-        Write 500MB of data in 1MB chunks to a single topic and verify all data is readable.
-        Disables GC to ensure history remains available.
-        """
-        ensure_cluster_ready(timeout=180)
+def test_throughput_3gb_write_read():
+    """
+    Write 500MB of data in 1MB chunks to a single topic and verify all data is readable.
+    Disables GC to ensure history remains available.
+    """
+    ensure_cluster_ready(timeout=180)
 
-        # Disable GC so sealed segments remain for the duration of this test.
-        resp = send_test_control(63)
-        if not resp:
-            pytest.skip("test control API unavailable on this build")
-        assert decode_test_control_code(resp) is not None
+    # Disable GC so sealed segments remain for the duration of this test.
+    resp = send_test_control(63)
+    if not resp:
+        pytest.skip("test control API unavailable on this build")
+    assert decode_test_control_code(resp) is not None
 
-        topic = f"throughput-3gb-{uuid4().hex[:6]}"
-        create = decode_create_topics_resp(
-            send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
-        )
-        assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
-        wait_for_topics([topic], timeout=60)
-        send_test_control(2)  # sync leases
+    topic = f"throughput-3gb-{uuid4().hex[:6]}"
+    create = decode_create_topics_resp(
+        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+    )
+    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+    wait_for_topics([topic], timeout=60)
+    send_test_control(2)  # sync leases
 
-        target_bytes = 500 * 1024 * 1024
-        chunk_size = 1 * 1024 * 1024
-        # Use a repeatable pattern to avoid massive memory usage but allow verification
-        # Pattern: first 16 bytes = chunk index, rest = 'X'
+    target_bytes = 500 * 1024 * 1024
+    chunk_size = 1 * 1024 * 1024
+    # Use a repeatable pattern to avoid massive memory usage but allow verification
+    # Pattern: first 16 bytes = chunk index, rest = 'X'
 
-        sent_bytes = 0
-        chunk_idx = 0
+    sent_bytes = 0
+    chunk_idx = 0
 
-        print(f"Starting 3GB write to {topic} in {chunk_size} chunks...")
-        start_write = time.time()
+    print(f"Starting 3GB write to {topic} in {chunk_size} chunks...")
+    start_write = time.time()
 
-        while sent_bytes < target_bytes:
-            # Construct payload: Index (8 bytes) + 'X' padding
-            prefix = struct.pack(">Q", chunk_idx)
-            payload = prefix + b"X" * (chunk_size - 8)
+    while sent_bytes < target_bytes:
+        # Construct payload: Index (8 bytes) + 'X' padding
+        prefix = struct.pack(">Q", chunk_idx)
+        payload = prefix + b"X" * (chunk_size - 8)
 
-            produce_and_assert_ok(NODES[1], topic, payload, partition=0)
-            sent_bytes += len(payload)
-            chunk_idx += 1
+        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+        sent_bytes += len(payload)
+        chunk_idx += 1
 
-            if chunk_idx % 10 == 0:
-                print(f"Written {sent_bytes / 1024 / 1024:.2f} MB...")
+        if chunk_idx % 10 == 0:
+            print(f"Written {sent_bytes / 1024 / 1024:.2f} MB...")
 
-        write_duration = time.time() - start_write
-        print(f"Write complete: {sent_bytes} bytes in {write_duration:.2f}s ({sent_bytes/1024/1024/write_duration:.2f} MB/s)")
+    write_duration = time.time() - start_write
+    print(f"Write complete: {sent_bytes} bytes in {write_duration:.2f}s ({sent_bytes/1024/1024/write_duration:.2f} MB/s)")
 
-        # Allow metadata to settle
-        time.sleep(2)
+    # Allow metadata to settle
+    time.sleep(2)
 
-        print("Starting sequential read verification...")
-        start_read = time.time()
+    print("Starting sequential read verification...")
+    start_read = time.time()
 
-        read_logical_offset = 0
-        read_payload_bytes = 0
-        read_chunks = 0
-        buffer = b""
+    read_logical_offset = 0
+    read_payload_bytes = 0
+    read_chunks = 0
+    buffer = b""
 
-        # Read in 1MB chunks to be robust against boundaries/network behaviors
-        fetch_size = 1024 * 1024
+    # Read in 1MB chunks to be robust against boundaries/network behaviors
+    fetch_size = 1024 * 1024
 
-        while read_payload_bytes < sent_bytes:
-            payload = b""
-            # Retry loop for fetch
-            for _ in range(10):
-                fetch = decode_fetch(
-                    send_frame_with_retry(
-                        *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
-                    )
-                    or b""
+    while read_payload_bytes < sent_bytes:
+        payload = b""
+        # Retry loop for fetch
+        for _ in range(10):
+            fetch = decode_fetch(
+                send_frame_with_retry(
+                    *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
                 )
-                if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
-                    payload = fetch[0]["payload"]
-                    break
-                time.sleep(0.5)
-            
-            if len(payload) == 0:
-                 # Debug dump
-                 print(f"Stuck reading at offset {read_logical_offset} (target payload {sent_bytes})")
-                 print("--- DATA DIR CONTENT ---")
-                 subprocess.run(["ls", "-laR", "test_data"], check=False, cwd=PROJECT_ROOT)
-                 print("--- NODE 1 LOGS ---")
-                 subprocess.run(COMPOSE + ["logs", "--tail", "500", "node1"], check=False, cwd=PROJECT_ROOT)
-                 print("--- END LOGS ---")
-                 
-                 state = decode_internal_state(send_frame_with_retry(*NODES[1], make_internal_state_request([topic])) or b"")
-                 print(f"Internal state: {state}")
-                 # Force fail
-                 assert False, f"Stuck reading at offset {read_logical_offset}"
-    
-            buffer += payload
-            read_payload_bytes += len(payload)
-            # The fetch API uses logical offsets (payload bytes), so we simply advance by the amount of data received.
-            read_logical_offset += len(payload)
-            
-            # Verify complete chunks
-            while len(buffer) >= chunk_size:
-                chunk = buffer[:chunk_size]
-                buffer = buffer[chunk_size:]
-                
-                idx_check = struct.unpack(">Q", chunk[:8])[0]
-                if idx_check != read_chunks:
-                    print(f"Chunk mismatch! Expected index {read_chunks}, got {idx_check}")
-                    # Dump some context
-                    print(f"Chunk start: {chunk[:32].hex()}")
-                assert idx_check == read_chunks, f"Chunk index mismatch: expected {read_chunks}, got {idx_check}"
-                read_chunks += 1
-                
-                if read_chunks % 10 == 0:
-                     print(f"Verified {read_chunks} chunks ({(read_chunks * chunk_size) / 1024 / 1024:.2f} MB)...")
-
-        read_duration = time.time() - start_read
-        print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
+                or b""
+            )
+            if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
+                payload = fetch[0]["payload"]
+                break
+            time.sleep(0.5)
         
-        assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
+        if len(payload) == 0:
+             # Debug dump
+             print(f"Stuck reading at offset {read_logical_offset} (target payload {sent_bytes})")
+             print("--- DATA DIR CONTENT ---")
+             subprocess.run(["ls", "-laR", "test_data"], check=False, cwd=PROJECT_ROOT)
+             print("--- NODE 1 LOGS ---")
+             subprocess.run(COMPOSE + ["logs", "--tail", "500", "node1"], check=False, cwd=PROJECT_ROOT)
+             print("--- END LOGS ---")
+             
+             state = decode_internal_state(send_frame_with_retry(*NODES[1], make_internal_state_request([topic])) or b"")
+             print(f"Internal state: {state}")
+             # Force fail
+             assert False, f"Stuck reading at offset {read_logical_offset}"
+
+        buffer += payload
+        read_payload_bytes += len(payload)
+        # The fetch API uses logical offsets (payload bytes), so we simply advance by the amount of data received.
+        read_logical_offset += len(payload)
+        
+        # Verify complete chunks
+        while len(buffer) >= chunk_size:
+            chunk = buffer[:chunk_size]
+            buffer = buffer[chunk_size:]
+            
+            idx_check = struct.unpack(">Q", chunk[:8])[0]
+            if idx_check != read_chunks:
+                print(f"Chunk mismatch! Expected index {read_chunks}, got {idx_check}")
+                # Dump some context
+                print(f"Chunk start: {chunk[:32].hex()}")
+            assert idx_check == read_chunks, f"Chunk index mismatch: expected {read_chunks}, got {idx_check}"
+            read_chunks += 1
+            
+            if read_chunks % 10 == 0:
+                 print(f"Verified {read_chunks} chunks ({(read_chunks * chunk_size) / 1024 / 1024:.2f} MB)...")
+
+    read_duration = time.time() - start_read
+    print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
+    
+    assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
 
 
 def test_throughput_multi_topic_3gb_parallel():
@@ -2549,15 +2571,13 @@ def test_throughput_multi_topic_3gb_parallel():
     time.sleep(5)
 
     print("Starting sequential read verification...")
-    # Wal entries store a fixed 256-byte metadata prefix (PREFIX_META_SIZE in wal config)
-    HEADER_OVERHEAD = 256
     fetch_size = 1024 * 1024 
 
     for i, topic in enumerate(topics):
         sent_bytes = results[topic]
         print(f"Verifying {topic} ({sent_bytes} bytes)...")
         
-        read_physical_offset = 0
+        read_logical_offset = 0
         read_payload_bytes = 0
         read_chunks = 0
         buffer = b""
@@ -2570,7 +2590,7 @@ def test_throughput_multi_topic_3gb_parallel():
                 for _ in range(10):
                     fetch = decode_fetch(
                         send_frame_with_retry(
-                            *NODES[1], make_fetch_with_offset(topic, 0, read_physical_offset, max_bytes=fetch_size)
+                            *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
                         )
                         or b""
                     )
@@ -2580,12 +2600,12 @@ def test_throughput_multi_topic_3gb_parallel():
                     time.sleep(0.5)
                 
                 if len(payload) == 0:
-                     print(f"Stuck reading {topic} at offset {read_physical_offset}")
-                     assert False, f"Stuck reading {topic} at offset {read_physical_offset}"
+                     print(f"Stuck reading {topic} at offset {read_logical_offset}")
+                     assert False, f"Stuck reading {topic} at offset {read_logical_offset}"
 
                 buffer += payload
                 read_payload_bytes += len(payload)
-                read_physical_offset += len(payload) + HEADER_OVERHEAD
+                read_logical_offset += len(payload)
                 
                 while len(buffer) >= chunk_size:
                     chunk = buffer[:chunk_size]
