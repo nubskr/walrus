@@ -114,16 +114,17 @@ impl Monitor {
                 .await;
             let logical_size = logical_watermark.saturating_sub(logical_head_start);
 
-            // Use the larger of disk vs. logical offsets to decide rollover and record size.
-            let size = disk_size.max(logical_size);
+            // Use disk size to decide WHEN to rollover (to bound disk usage),
+            // but report logical size to metadata (so offsets remain consistent).
+            let trigger_size = disk_size.max(logical_size);
 
-            if size <= self.limits.max_segment_size {
+            if trigger_size <= self.limits.max_segment_size {
                 continue;
             }
 
             info!(
-                "Segment {} size {} exceeds limit {}, proposing rollover",
-                wal, size, self.limits.max_segment_size,
+                "Segment {} disk_size {} (logical {}) exceeds limit {}, proposing rollover with sealed size {}",
+                wal, disk_size, logical_size, self.limits.max_segment_size, logical_size
             );
 
             let current_idx = nodes
@@ -151,7 +152,7 @@ impl Monitor {
                 name: topic.clone(),
                 partition,
                 new_leader: next_leader,
-                sealed_segment_size_bytes: size,
+                sealed_segment_size_bytes: logical_size,
             };
             let payload = bincode::serialize(&cmd)?;
             self.controller.raft.propose(payload).await?;

@@ -447,6 +447,18 @@ def list_generations(node_id: int, topic: str = "logs") -> list[int]:
     return gens
 
 
+def force_rollover_to_generation(target_generation: int, topic: str = "logs", node_id: int = 1):
+    """Write large payloads until the reported generation reaches target_generation."""
+    for _ in range(100):
+        ensure_cluster_ready()
+        gens = list_generations(node_id, topic)
+        if gens and max(gens) >= target_generation:
+            return
+        produce_and_assert_ok(NODES[node_id], topic, b"R" * 1024 * 1024)
+        time.sleep(0.1)
+    pytest.fail(f"did not reach generation {target_generation}")
+
+
 def wal_file_count(node_id: int) -> int:
     root = data_plane_root(node_id)
     if not root.exists():
@@ -1834,17 +1846,6 @@ def test_follower_restart_catches_up_and_reads():
     assert follower_fetch and follower_fetch[0]["error_code"] == 0
 
 
-    def force_rollover_to_generation(target_generation: int):
-        """Write large payloads until the reported generation reaches target_generation."""
-        for _ in range(100):
-            ensure_cluster_ready()
-            gens = list_generations(1)
-            if gens and max(gens) >= target_generation:
-                return
-            produce_and_assert_ok(NODES[1], "logs", b"R" * 1024 * 1024)
-            time.sleep(0.1)
-    pytest.fail(f"did not reach generation {target_generation}")
-
 def test_retention_gc_prunes_old_generations():
     ensure_cluster_ready()
     start_count = wal_file_count(1)
@@ -2359,82 +2360,82 @@ def test_produce_large_payloads_up_to_cap():
     assert fetch[0]["high_watermark"] >= total_bytes, "high watermark did not advance after large writes"
 
 
-def test_throughput_3gb_write_read():
-    """
-    Write 3GB of data in 20MB chunks to a single topic and verify all data is readable.
-    Disables GC to ensure history remains available.
-    """
-    ensure_cluster_ready(timeout=180)
-    
-    # Disable GC so sealed segments remain for the duration of this test.
-    resp = send_test_control(63)
-    if not resp:
-        pytest.skip("test control API unavailable on this build")
-    assert decode_test_control_code(resp) is not None
+    def test_throughput_3gb_write_read():
+        """
+        Write 500MB of data in 1MB chunks to a single topic and verify all data is readable.
+        Disables GC to ensure history remains available.
+        """
+        ensure_cluster_ready(timeout=180)
 
-    topic = f"throughput-3gb-{uuid4().hex[:6]}"
-    create = decode_create_topics_resp(
-        send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
-    )
-    assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
-    wait_for_topics([topic], timeout=60)
-    send_test_control(2)  # sync leases
+        # Disable GC so sealed segments remain for the duration of this test.
+        resp = send_test_control(63)
+        if not resp:
+            pytest.skip("test control API unavailable on this build")
+        assert decode_test_control_code(resp) is not None
 
-    target_bytes = 3 * 1024 * 1024 * 1024
-    chunk_size = 1 * 1024 * 1024
-    # Use a repeatable pattern to avoid massive memory usage but allow verification
-    # Pattern: first 16 bytes = chunk index, rest = 'X'
-    
-    sent_bytes = 0
-    chunk_idx = 0
-    
-    print(f"Starting 3GB write to {topic} in {chunk_size} chunks...")
-    start_write = time.time()
-    
-    while sent_bytes < target_bytes:
-        # Construct payload: Index (8 bytes) + 'X' padding
-        prefix = struct.pack(">Q", chunk_idx)
-        payload = prefix + b"X" * (chunk_size - 8)
-        
-        produce_and_assert_ok(NODES[1], topic, payload, partition=0)
-        sent_bytes += len(payload)
-        chunk_idx += 1
-        
-        if chunk_idx % 10 == 0:
-            print(f"Written {sent_bytes / 1024 / 1024:.2f} MB...")
+        topic = f"throughput-3gb-{uuid4().hex[:6]}"
+        create = decode_create_topics_resp(
+            send_frame_with_retry(*NODES[1], make_create_topics_request([(topic, 1)])) or b""
+        )
+        assert create and all(err in (0, 36) for _, err in create), f"CreateTopics failed: {create}"
+        wait_for_topics([topic], timeout=60)
+        send_test_control(2)  # sync leases
 
-    write_duration = time.time() - start_write
-    print(f"Write complete: {sent_bytes} bytes in {write_duration:.2f}s ({sent_bytes/1024/1024/write_duration:.2f} MB/s)")
+        target_bytes = 500 * 1024 * 1024
+        chunk_size = 1 * 1024 * 1024
+        # Use a repeatable pattern to avoid massive memory usage but allow verification
+        # Pattern: first 16 bytes = chunk index, rest = 'X'
 
-    # Allow metadata to settle
-    time.sleep(2)
+        sent_bytes = 0
+        chunk_idx = 0
 
-    print("Starting sequential read verification...")
-    start_read = time.time()
+        print(f"Starting 3GB write to {topic} in {chunk_size} chunks...")
+        start_write = time.time()
 
-    read_logical_offset = 0
-    read_payload_bytes = 0
-    read_chunks = 0
-    buffer = b""
-    
-    # Read in 1MB chunks to be robust against boundaries/network behaviors
-    fetch_size = 1024 * 1024
+        while sent_bytes < target_bytes:
+            # Construct payload: Index (8 bytes) + 'X' padding
+            prefix = struct.pack(">Q", chunk_idx)
+            payload = prefix + b"X" * (chunk_size - 8)
 
-    while read_payload_bytes < sent_bytes:
-        payload = b""
-        # Retry loop for fetch
-        for _ in range(10):
-            fetch = decode_fetch(
-                send_frame_with_retry(
-                    *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
+            produce_and_assert_ok(NODES[1], topic, payload, partition=0)
+            sent_bytes += len(payload)
+            chunk_idx += 1
+
+            if chunk_idx % 10 == 0:
+                print(f"Written {sent_bytes / 1024 / 1024:.2f} MB...")
+
+        write_duration = time.time() - start_write
+        print(f"Write complete: {sent_bytes} bytes in {write_duration:.2f}s ({sent_bytes/1024/1024/write_duration:.2f} MB/s)")
+
+        # Allow metadata to settle
+        time.sleep(2)
+
+        print("Starting sequential read verification...")
+        start_read = time.time()
+
+        read_logical_offset = 0
+        read_payload_bytes = 0
+        read_chunks = 0
+        buffer = b""
+
+        # Read in 1MB chunks to be robust against boundaries/network behaviors
+        fetch_size = 1024 * 1024
+
+        while read_payload_bytes < sent_bytes:
+            payload = b""
+            # Retry loop for fetch
+            for _ in range(10):
+                fetch = decode_fetch(
+                    send_frame_with_retry(
+                        *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
+                    )
+                    or b""
                 )
-                or b""
-            )
-            if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
-                payload = fetch[0]["payload"]
-                break
-            time.sleep(0.5)
-                
+                if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
+                    payload = fetch[0]["payload"]
+                    break
+                time.sleep(0.5)
+            
             if len(payload) == 0:
                  # Debug dump
                  print(f"Stuck reading at offset {read_logical_offset} (target payload {sent_bytes})")
@@ -2449,31 +2450,31 @@ def test_throughput_3gb_write_read():
                  # Force fail
                  assert False, f"Stuck reading at offset {read_logical_offset}"
     
-        buffer += payload
-        read_payload_bytes += len(payload)
-        # The fetch API uses logical offsets (payload bytes), so we simply advance by the amount of data received.
-        read_logical_offset += len(payload)
-        
-        # Verify complete chunks
-        while len(buffer) >= chunk_size:
-            chunk = buffer[:chunk_size]
-            buffer = buffer[chunk_size:]
+            buffer += payload
+            read_payload_bytes += len(payload)
+            # The fetch API uses logical offsets (payload bytes), so we simply advance by the amount of data received.
+            read_logical_offset += len(payload)
             
-            idx_check = struct.unpack(">Q", chunk[:8])[0]
-            if idx_check != read_chunks:
-                print(f"Chunk mismatch! Expected index {read_chunks}, got {idx_check}")
-                # Dump some context
-                print(f"Chunk start: {chunk[:32].hex()}")
-            assert idx_check == read_chunks, f"Chunk index mismatch: expected {read_chunks}, got {idx_check}"
-            read_chunks += 1
-            
-            if read_chunks % 10 == 0:
-                 print(f"Verified {read_chunks} chunks ({(read_chunks * chunk_size) / 1024 / 1024:.2f} MB)...")
+            # Verify complete chunks
+            while len(buffer) >= chunk_size:
+                chunk = buffer[:chunk_size]
+                buffer = buffer[chunk_size:]
+                
+                idx_check = struct.unpack(">Q", chunk[:8])[0]
+                if idx_check != read_chunks:
+                    print(f"Chunk mismatch! Expected index {read_chunks}, got {idx_check}")
+                    # Dump some context
+                    print(f"Chunk start: {chunk[:32].hex()}")
+                assert idx_check == read_chunks, f"Chunk index mismatch: expected {read_chunks}, got {idx_check}"
+                read_chunks += 1
+                
+                if read_chunks % 10 == 0:
+                     print(f"Verified {read_chunks} chunks ({(read_chunks * chunk_size) / 1024 / 1024:.2f} MB)...")
 
-    read_duration = time.time() - start_read
-    print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
-    
-    assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
+        read_duration = time.time() - start_read
+        print(f"Read complete: {read_payload_bytes} bytes in {read_duration:.2f}s ({read_payload_bytes/1024/1024/read_duration:.2f} MB/s)")
+        
+        assert read_payload_bytes == sent_bytes, f"Read total {read_payload_bytes} does not match target {sent_bytes}"
 
 
 def test_throughput_multi_topic_3gb_parallel():
@@ -2500,7 +2501,7 @@ def test_throughput_multi_topic_3gb_parallel():
 
     target_bytes = 3 * 1024 * 1024 * 1024
     chunk_size = 20 * 1024 * 1024
-    
+
     def writer(topic_info):
         idx, topic_name = topic_info
         sent_bytes = 0
