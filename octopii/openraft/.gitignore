@@ -1,0 +1,13 @@
+
+# Directory Ignores ##########################################################
+guide/book
+target
+vendor
+.idea
+tests/_log
+
+# File Ignores ###############################################################
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+.vscode
