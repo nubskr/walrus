@@ -97,7 +97,7 @@ impl BucketService {
     }
 
     async fn append_raw(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
-        let guard = BucketGuard::lock(self, wal_key).await?;
+        let _guard = BucketGuard::lock(self, wal_key).await?;
         let engine = self.engine.clone();
         let key = wal_key.to_string();
         tokio::task::spawn_blocking(move || engine.batch_append_for_topic(&key, &[&data]))

@@ -5,9 +5,9 @@ use anyhow::Result;
 use tokio::fs;
 use tracing::{error, info};
 
-//! Monitor: background loop that watches segment sizes (rollover) and retention (GC) using
-//! metadata for ownership and controller for watermarks. It never mutates data directly—only
-//! proposes metadata commands and deletes expired segment dirs.
+// Monitor: background loop that watches segment sizes (rollover) and retention (GC) using
+// metadata for ownership and controller for watermarks. It never mutates data directly—only
+// proposes metadata commands and deletes expired segment dirs.
 
 use crate::bucket::DATA_NAMESPACE;
 use crate::config::NodeConfig;
@@ -56,21 +56,22 @@ impl Monitor {
         let mut interval = tokio::time::interval(self.limits.check_interval);
         loop {
             interval.tick().await;
-            if self
-                .controller
-                .test_fail_monitor
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                error!("monitor in forced error mode");
-                continue;
-            }
-            if let Err(e) = self.check_rollovers().await {
-                error!("rollover check failed: {e}");
-            }
-            if let Err(e) = self.run_gc().await {
-                error!("gc check failed: {e}");
+            if let Err(e) = self.tick().await {
+                error!("monitor tick failed: {e}");
             }
         }
+    }
+
+    async fn tick(&self) -> Result<()> {
+        if self
+            .controller
+            .test_fail_monitor
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("monitor in forced error mode");
+        }
+        self.check_rollovers().await?;
+        self.run_gc().await
     }
 
     async fn check_rollovers(&self) -> Result<()> {
@@ -83,7 +84,6 @@ impl Monitor {
             return Ok(());
         }
 
-        let root = self.wal_root();
         let assignments = self
             .controller
             .metadata
@@ -109,23 +109,13 @@ impl Monitor {
             // Use the larger of disk vs. logical offsets to decide rollover and record size.
             let size = disk_size.max(logical_size);
 
-            tracing::info!(
-                "Monitor check: {} disk={} logical={} max={}",
-                wal,
-                disk_size,
-                logical_size,
-                self.limits.max_segment_size
-            );
-
             if size <= self.limits.max_segment_size {
                 continue;
             }
 
             info!(
                 "Segment {} size {} exceeds limit {}, proposing rollover",
-                wal,
-                size,
-                self.limits.max_segment_size,
+                wal, size, self.limits.max_segment_size,
             );
             let cmd = MetadataCmd::RolloverPartition {
                 name: topic.clone(),

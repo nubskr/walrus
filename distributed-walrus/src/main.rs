@@ -25,19 +25,25 @@ use tracing_subscriber::{fmt, EnvFilter};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let node_config = NodeConfig::parse();
-    // LogTracer::init().expect("Failed to set log tracer");
+    init_logging(&node_config)?;
+    start_node(node_config).await?;
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
 
+fn init_logging(node_config: &NodeConfig) -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder().with_env_filter(EnvFilter::from_default_env());
-
     if let Some(log_file_path) = &node_config.log_file {
         let file = std::fs::File::create(log_file_path)?;
         subscriber.with_writer(Arc::new(file)).init();
     } else {
         subscriber.init();
     }
+    Ok(())
+}
 
+async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     info!("Node {} booting", node_config.node_id);
-
     let data_path = node_config.data_wal_dir();
     std::fs::create_dir_all(&data_path)?;
     let bucket = Arc::new(BucketService::new(data_path).await?);
@@ -168,8 +174,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("Node {} ready; waiting for ctrl-c", node_config.node_id);
-    tokio::signal::ctrl_c().await?;
-
     Ok(())
 }
 

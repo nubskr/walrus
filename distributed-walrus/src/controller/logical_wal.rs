@@ -30,9 +30,7 @@ impl<'a> LogicalWal<'a> {
         match self.scan_logical_bytes().await {
             Ok(scanned) => {
                 if scanned != tracked {
-                    self.controller
-                        .set_tracked_len(self.wal_key, scanned)
-                        .await;
+                    self.controller.set_tracked_len(self.wal_key, scanned).await;
                 }
                 scanned
             }
@@ -61,18 +59,12 @@ impl<'a> LogicalWal<'a> {
         Ok(entries.into_iter().map(|e| e.data).collect())
     }
 
-    async fn map_logical_to_physical_offset(
-        &self,
-        logical_offset: u64,
-    ) -> Result<(u64, usize)> {
+    async fn map_logical_to_physical_offset(&self, logical_offset: u64) -> Result<(u64, usize)> {
         if logical_offset == 0 {
             return Ok((0, 0));
         }
 
-        let total_physical = self
-            .controller
-            .bucket
-            .get_topic_size_blocking(self.wal_key);
+        let total_physical = self.controller.bucket.get_topic_size_blocking(self.wal_key);
         let mut cursor = OffsetCursor::default();
 
         while cursor.physical < total_physical {
@@ -106,10 +98,7 @@ impl<'a> LogicalWal<'a> {
     }
 
     async fn scan_logical_bytes(&self) -> Result<u64> {
-        let total_physical = self
-            .controller
-            .bucket
-            .get_topic_size_blocking(self.wal_key);
+        let total_physical = self.controller.bucket.get_topic_size_blocking(self.wal_key);
         let mut cursor = OffsetCursor::default();
 
         while cursor.physical < total_physical {
