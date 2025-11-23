@@ -81,6 +81,13 @@ TESTS := \
 	test_soak_multi_client_produce_and_fetch_read_your_writes \
 	test_soak_long_running_mixed_load_survives
 
+# Convenience bundle of frequently-run tests
+FOCUSED_TESTS := \
+	test_follower_restart_catches_up_and_reads \
+	test_follower_fetch_survives_monitor_rollover_and_gc \
+	test_partition_one_produce_and_fetch \
+	test_fetch_respects_offsets_and_payloads_from_leader
+
 .PHONY: deps all-tests all-tests-one-by-one soak-test soak-test-batch soak-test-regular soak-tests soak-test-long soak-test-20m cluster-up cluster-down cluster-restart cluster-logs cluster-bootstrap $(TESTS)
 
 deps: $(VENV)/.deps-installed
@@ -103,6 +110,14 @@ all-tests: deps
 # Original behaviour: run each test separately (slower; many container restarts).
 all-tests-one-by-one: deps
 	@for t in $(TESTS); do \
+		echo "Running $$t"; \
+		$(MAKE) $$t || exit $$?; \
+	done
+
+# Run the focused set individually
+.PHONY: focused-tests
+focused-tests: deps
+	@for t in $(FOCUSED_TESTS); do \
 		echo "Running $$t"; \
 		$(MAKE) $$t || exit $$?; \
 	done
