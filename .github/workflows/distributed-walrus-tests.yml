@@ -15,11 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13.7"
-
       - name: Run distributed walrus tests one-by-one
         working-directory: distributed-walrus
         run: make all-tests-one-by-one
