@@ -68,10 +68,7 @@ impl NodeController {
                 let Some((topic, partition, _)) = parse_wal_key(&wal_key) else {
                     return InternalResp::Error("invalid wal_key".into());
                 };
-                match self
-                    .read_entries_from_logical_offset(&wal_key, start_offset, max_bytes)
-                    .await
-                {
+                match self.logical_wal(&wal_key).read(start_offset, max_bytes).await {
                     Ok(entries) => {
                         let high_watermark = self.partition_high_watermark(&topic, partition).await;
                         InternalResp::ReadResult {
@@ -219,149 +216,47 @@ impl NodeController {
             .get_partition_state(topic, partition)
             .ok_or_else(|| anyhow!("unknown topic/partition"))?;
 
-        // Snapshot the observed end offset (metadata vs. actual bytes) for each history segment on this node.
-        let mut history_actual_ends: Vec<u64> = Vec::with_capacity(state.history.len());
+        let mut history_end = 0u64;
         for seg in &state.history {
-            let end = if seg.stored_on_node == self.node_id {
-                let key = wal_key(topic, partition, seg.generation);
-                let actual = self.logical_bytes_for_key(&key).await?;
-                self.update_tracked_if_smaller(&key, actual).await;
-                seg.start_offset + actual
-            } else {
-                seg.end_offset
-            };
-            history_actual_ends.push(end);
-        }
-
-        // Check history segments
-        for (i, seg) in state.history.iter().enumerate() {
-            // Adjust the logical start of this segment if the previous segment (on this node) actually extended further.
-            let mut prev_actual_end: Option<u64> = None;
-            if i > 0 {
-                prev_actual_end = Some(history_actual_ends[i - 1]);
-            }
-
-            // Compute this segment's actual end if we have local bytes; otherwise fall back to metadata.
+            let key = wal_key(topic, partition, seg.generation);
             let seg_len = if seg.stored_on_node == self.node_id {
-                history_actual_ends[i].saturating_sub(seg.start_offset)
+                self.logical_wal(&key).logical_len().await
             } else {
                 seg.end_offset.saturating_sub(seg.start_offset)
             };
-            let actual_end = seg.start_offset + seg_len;
-            let corrected_start = seg.start_offset.max(prev_actual_end.unwrap_or(0));
+            let seg_end = seg.start_offset + seg_len;
+            history_end = history_end.max(seg_end);
 
-            // If the previous segment completely covers this one, skip it.
-            if corrected_start >= actual_end {
-                continue;
-            }
-
-            // If the previous segment actually extends into this one's metadata start, redirect before the normal range check.
-            if let Some(prev_end) = prev_actual_end {
-                if req_offset < prev_end && req_offset >= state.history[i - 1].start_offset {
-                    tracing::info!(
-                        "Gap Fix (History pre-range): req_offset={} < prev_actual_end={} (prev_gen={}, start={}, meta_end={})",
-                        req_offset,
-                        prev_end,
-                        state.history[i - 1].generation,
-                        state.history[i - 1].start_offset,
-                        state.history[i - 1].end_offset
-                    );
-                    let local_offset = req_offset - state.history[i - 1].start_offset;
-                    return self
-                        .read_historical_segment(
-                            topic,
-                            partition,
-                            &state,
-                            &state.history[i - 1],
-                            local_offset,
-                            max_bytes,
-                        )
-                        .await;
-                }
-            }
-
-            if req_offset >= corrected_start && req_offset < actual_end {
-                let local_offset = req_offset - corrected_start;
+            if req_offset >= seg.start_offset && req_offset < seg_end {
+                let local_offset = req_offset - seg.start_offset;
                 return self
-                    .read_historical_segment(topic, partition, &state, seg, local_offset, max_bytes)
+                    .read_historical_segment(
+                        topic,
+                        partition,
+                        &state,
+                        seg,
+                        local_offset,
+                        max_bytes,
+                    )
                     .await;
             }
         }
 
-        let head_meta_end = state.history.last().map(|s| s.end_offset).unwrap_or(0);
-        let last_actual_end = if let Some(last_seg) = state.history.last() {
-            if last_seg.stored_on_node == self.node_id {
-                let key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.logical_bytes_for_key(&key).await?;
-                self.update_tracked_if_smaller(&key, last_len).await;
-                let mut end = last_seg.start_offset + last_len;
-                if state.history.len() >= 2 {
-                    let prev = &state.history[state.history.len() - 2];
-                    let prev_key = wal_key(topic, partition, prev.generation);
-                    let prev_len = if prev.stored_on_node == self.node_id {
-                        let len = self.logical_bytes_for_key(&prev_key).await?;
-                        self.update_tracked_if_smaller(&prev_key, len).await;
-                        len
-                    } else {
-                        prev.end_offset.saturating_sub(prev.start_offset)
-                    };
-                    let prev_end = prev.start_offset + prev_len;
-                    if prev_end > end {
-                        end = prev_end;
-                    }
-                }
-                Some(end)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if req_offset >= head_meta_end {
-            // Gap Fix for Head
-            if let Some(last_seg) = state.history.last() {
-                if last_seg.stored_on_node == self.node_id {
-                    let actual_end = last_actual_end.unwrap_or_else(|| {
-                        last_seg.start_offset + (last_seg.end_offset - last_seg.start_offset)
-                    });
-
-                    if req_offset < actual_end {
-                        tracing::info!("Gap Fix (Head): req_offset={} falls in gap of last_gen={} (start={}, meta_end={}, actual_end={}). Redirecting.", 
-                            req_offset, last_seg.generation, last_seg.start_offset, last_seg.end_offset, actual_end);
-                        let local_offset = req_offset - last_seg.start_offset;
-                        return self
-                            .read_historical_segment(
-                                topic,
-                                partition,
-                                &state,
-                                last_seg,
-                                local_offset,
-                                max_bytes,
-                            )
-                            .await;
-                    } else {
-                        tracing::debug!(
-                            "Gap Fix (Head): req_offset={} NOT in last_gen={} (actual_end={}).",
-                            req_offset,
-                            last_seg.generation,
-                            actual_end
-                        );
-                    }
-                }
-            }
-
-            let adjusted_head_start = last_actual_end.unwrap_or(head_meta_end).max(head_meta_end);
-            let local_offset = req_offset - adjusted_head_start;
-            return self
-                .read_active_head(topic, partition, &state, local_offset, max_bytes)
-                .await;
+        if req_offset < history_end {
+            let watermark = self.partition_high_watermark(topic, partition).await;
+            return Ok((Vec::new(), watermark));
         }
 
-        Ok((
-            Vec::new(),
-            self.partition_high_watermark(topic, partition).await,
-        ))
+        let local_offset = req_offset - history_end;
+        self.read_active_head(
+            topic,
+            partition,
+            &state,
+            local_offset,
+            max_bytes,
+            history_end,
+        )
+        .await
     }
 
     pub async fn sync_leases_now(&self) {
@@ -394,6 +289,7 @@ impl NodeController {
         state: &PartitionState,
         local_offset: u64,
         max_bytes: usize,
+        head_start: u64,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
         let leader = state.leader_node;
         let wal_key = wal_key(topic, partition, state.current_generation);
@@ -409,10 +305,20 @@ impl NodeController {
 
         if leader == self.node_id {
             tracing::info!("reading head locally on node {}", self.node_id);
-            let entries = self
-                .read_entries_from_logical_offset(&wal_key, local_offset, max_bytes)
-                .await?;
-            let watermark = self.partition_high_watermark(topic, partition).await;
+            let logical = self.logical_wal(&wal_key);
+            let head_len = logical.logical_len().await;
+            if local_offset >= head_len {
+                let watermark = head_start + head_len;
+                tracing::info!(
+                    "head read past end: offset={} len={} watermark={}",
+                    local_offset,
+                    head_len,
+                    watermark
+                );
+                return Ok((Vec::new(), watermark));
+            }
+            let entries = logical.read(local_offset, max_bytes).await?;
+            let watermark = head_start + head_len;
             return Ok((entries, watermark));
         }
 
@@ -527,9 +433,13 @@ impl NodeController {
         );
 
         if segment.stored_on_node == self.node_id {
-            let entries = self
-                .read_entries_from_logical_offset(&wal_key, local_offset, max_bytes)
-                .await?;
+            let logical = self.logical_wal(&wal_key);
+            let seg_len = logical.logical_len().await;
+            if local_offset >= seg_len {
+                let watermark = self.partition_high_watermark(topic, partition).await;
+                return Ok((Vec::new(), watermark));
+            }
+            let entries = logical.read(local_offset, max_bytes).await?;
             tracing::info!(
                 "read_historical_segment local: key={} entries={}",
                 wal_key,
@@ -632,131 +542,39 @@ impl NodeController {
         let Some(state) = self.metadata.get_partition_state(topic, partition) else {
             return 0;
         };
-        let head_start_meta = state.history.last().map(|s| s.end_offset).unwrap_or(0);
-        let head_start = if let Some(last_seg) = state.history.last() {
-            if last_seg.stored_on_node == self.node_id {
-                let last_key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.logical_bytes_for_key(&last_key).await.unwrap_or(0);
-                self.update_tracked_if_smaller(&last_key, last_len).await;
-                let mut corrected_start = last_seg.start_offset;
-                let mut actual_end = last_seg.start_offset + last_len;
-                if state.history.len() >= 2 {
-                    let prev = &state.history[state.history.len() - 2];
-                    if prev.stored_on_node == self.node_id {
-                        let prev_key = wal_key(topic, partition, prev.generation);
-                        let prev_len =
-                            self.logical_bytes_for_key(&prev_key).await.unwrap_or(0);
-                        self.update_tracked_if_smaller(&prev_key, prev_len).await;
-                        let prev_end = prev.start_offset + prev_len;
-                        corrected_start = corrected_start.max(prev_end);
-                        actual_end = actual_end.max(prev_end);
-                    }
-                }
-
-                actual_end.max(head_start_meta)
+        let mut history_end = 0u64;
+        for seg in &state.history {
+            let seg_len = if seg.stored_on_node == self.node_id {
+                self.logical_wal(&wal_key(topic, partition, seg.generation))
+                    .logical_len()
+                    .await
             } else {
-                head_start_meta
-            }
-        } else {
-            head_start_meta
-        };
-        let key = wal_key(topic, partition, state.current_generation);
-        let active_bytes = self.active_bytes_for_key(&key).await;
-        head_start + active_bytes
+                seg.end_offset.saturating_sub(seg.start_offset)
+            };
+            history_end = history_end.max(seg.start_offset + seg_len);
+        }
+
+        let head_key = wal_key(topic, partition, state.current_generation);
+        let head_len = self.logical_wal(&head_key).logical_len().await;
+        history_end + head_len
     }
 
-    async fn map_logical_to_physical_offset(
-        &self,
-        wal_key: &str,
-        logical_offset: u64,
-    ) -> Result<(u64, usize)> {
-        if logical_offset == 0 {
-            return Ok((0, 0));
+    fn logical_wal<'a>(&'a self, wal_key: &'a str) -> LogicalWal<'a> {
+        LogicalWal {
+            controller: self,
+            wal_key,
         }
-
-        let total_physical = self.bucket.get_topic_size_blocking(wal_key);
-        let mut physical_cursor = 0u64;
-        let mut logical_cursor = 0u64;
-
-        while physical_cursor < total_physical {
-            let remaining = (total_physical - physical_cursor) as usize;
-            let max_bytes = remaining
-                .min(Self::SCAN_WINDOW)
-                .max(Self::ENTRY_OVERHEAD as usize + 1);
-            let entries = self
-                .bucket
-                .read_by_key_from_offset(wal_key, physical_cursor, max_bytes)
-                .await?;
-            if entries.is_empty() {
-                break;
-            }
-
-            for entry in entries {
-                let payload_len = entry.data.len() as u64;
-
-                if logical_offset < logical_cursor + payload_len {
-                    let trim = (logical_offset - logical_cursor) as usize;
-                    return Ok((physical_cursor, trim));
-                }
-
-                logical_cursor += payload_len;
-                physical_cursor += payload_len + Self::ENTRY_OVERHEAD;
-
-                if logical_offset == logical_cursor {
-                    return Ok((physical_cursor, 0));
-                }
-            }
-        }
-
-        Ok((physical_cursor, 0))
     }
 
-    async fn read_entries_from_logical_offset(
-        &self,
-        wal_key: &str,
-        logical_offset: u64,
-        max_bytes: usize,
-    ) -> Result<Vec<Vec<u8>>> {
-        let (physical_offset, trim) = self
-            .map_logical_to_physical_offset(wal_key, logical_offset)
-            .await?;
-
-        let mut entries = self
-            .bucket
-            .read_by_key_from_offset(wal_key, physical_offset, max_bytes)
-            .await?;
-
-        if trim > 0 {
-            if let Some(first) = entries.first_mut() {
-                if trim >= first.data.len() {
-                    first.data.clear();
-                } else {
-                    first.data.drain(0..trim);
-                }
-            }
-        }
-
-        Ok(entries.into_iter().map(|e| e.data).collect())
+    async fn tracked_len(&self, wal_key: &str) -> u64 {
+        let guard = self.offsets.read().await;
+        guard.get(wal_key).copied().unwrap_or(0)
     }
 
-    async fn active_bytes_for_key(&self, wal_key: &str) -> u64 {
-        let tracked = {
-            let guard = self.offsets.read().await;
-            guard.get(wal_key).copied().unwrap_or(0)
-        };
-        if tracked > 0 {
-            return tracked;
-        }
-
-        match self.logical_bytes_for_key(wal_key).await {
-            Ok(bytes) => {
-                if bytes > tracked {
-                    self.update_tracked_if_smaller(wal_key, bytes).await;
-                }
-                bytes
-            }
-            Err(_) => tracked,
-        }
+    async fn set_tracked_len(&self, wal_key: &str, bytes: u64) {
+        let mut guard = self.offsets.write().await;
+        let entry = guard.entry(wal_key.to_string()).or_insert(0);
+        *entry = bytes;
     }
 
     async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
@@ -764,41 +582,6 @@ impl NodeController {
         let entry = guard.entry(wal_key.to_string()).or_insert(0);
         *entry += bytes;
         *entry
-    }
-
-    async fn update_tracked_if_smaller(&self, wal_key: &str, bytes: u64) {
-        let mut guard = self.offsets.write().await;
-        let entry = guard.entry(wal_key.to_string()).or_insert(0);
-        if *entry < bytes {
-            *entry = bytes;
-        }
-    }
-
-    async fn logical_bytes_for_key(&self, wal_key: &str) -> Result<u64> {
-        let total_physical = self.bucket.get_topic_size_blocking(wal_key);
-        let mut physical_cursor = 0u64;
-        let mut logical_total = 0u64;
-
-        while physical_cursor < total_physical {
-            let remaining = (total_physical - physical_cursor) as usize;
-            let max_bytes = remaining
-                .min(Self::SCAN_WINDOW)
-                .max(Self::ENTRY_OVERHEAD as usize + 1);
-            let entries = self
-                .bucket
-                .read_by_key_from_offset(wal_key, physical_cursor, max_bytes)
-                .await?;
-            if entries.is_empty() {
-                break;
-            }
-
-            for entry in entries {
-                logical_total += entry.data.len() as u64;
-                physical_cursor += entry.data.len() as u64 + Self::ENTRY_OVERHEAD;
-            }
-        }
-
-        Ok(logical_total)
     }
 
     async fn append_with_retry(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
@@ -902,6 +685,129 @@ impl NodeController {
             }
             Err(e) => InternalResp::Error(format!("Failed to add learner: {}", e)),
         }
+    }
+}
+
+struct LogicalWal<'a> {
+    controller: &'a NodeController,
+    wal_key: &'a str,
+}
+
+impl<'a> LogicalWal<'a> {
+    async fn logical_len(&self) -> u64 {
+        let tracked = self.controller.tracked_len(self.wal_key).await;
+        match self.scan_logical_bytes().await {
+            Ok(scanned) => {
+                if scanned != tracked {
+                    self.controller
+                        .set_tracked_len(self.wal_key, scanned)
+                        .await;
+                }
+                scanned
+            }
+            Err(_) => tracked,
+        }
+    }
+
+    async fn read(&self, logical_offset: u64, max_bytes: usize) -> Result<Vec<Vec<u8>>> {
+        let (physical_offset, trim) = self.map_logical_to_physical_offset(logical_offset).await?;
+        let mut entries = self
+            .controller
+            .bucket
+            .read_by_key_from_offset(self.wal_key, physical_offset, max_bytes)
+            .await?;
+
+        if trim > 0 {
+            if let Some(first) = entries.first_mut() {
+                if trim >= first.data.len() {
+                    first.data.clear();
+                } else {
+                    first.data.drain(0..trim);
+                }
+            }
+        }
+
+        Ok(entries.into_iter().map(|e| e.data).collect())
+    }
+
+    async fn map_logical_to_physical_offset(
+        &self,
+        logical_offset: u64,
+    ) -> Result<(u64, usize)> {
+        if logical_offset == 0 {
+            return Ok((0, 0));
+        }
+
+        let total_physical = self
+            .controller
+            .bucket
+            .get_topic_size_blocking(self.wal_key);
+        let mut physical_cursor = 0u64;
+        let mut logical_cursor = 0u64;
+
+        while physical_cursor < total_physical {
+            let remaining = (total_physical - physical_cursor) as usize;
+            let max_bytes = remaining
+                .min(NodeController::SCAN_WINDOW)
+                .max(NodeController::ENTRY_OVERHEAD as usize + 1);
+            let entries = self
+                .controller
+                .bucket
+                .read_by_key_from_offset(self.wal_key, physical_cursor, max_bytes)
+                .await?;
+            if entries.is_empty() {
+                break;
+            }
+
+            for entry in entries {
+                let payload_len = entry.data.len() as u64;
+
+                if logical_offset < logical_cursor + payload_len {
+                    let trim = (logical_offset - logical_cursor) as usize;
+                    return Ok((physical_cursor, trim));
+                }
+
+                logical_cursor += payload_len;
+                physical_cursor += payload_len + NodeController::ENTRY_OVERHEAD;
+
+                if logical_offset == logical_cursor {
+                    return Ok((physical_cursor, 0));
+                }
+            }
+        }
+
+        Ok((physical_cursor, 0))
+    }
+
+    async fn scan_logical_bytes(&self) -> Result<u64> {
+        let total_physical = self
+            .controller
+            .bucket
+            .get_topic_size_blocking(self.wal_key);
+        let mut physical_cursor = 0u64;
+        let mut logical_total = 0u64;
+
+        while physical_cursor < total_physical {
+            let remaining = (total_physical - physical_cursor) as usize;
+            let max_bytes = remaining
+                .min(NodeController::SCAN_WINDOW)
+                .max(NodeController::ENTRY_OVERHEAD as usize + 1);
+            let entries = self
+                .controller
+                .bucket
+                .read_by_key_from_offset(self.wal_key, physical_cursor, max_bytes)
+                .await?;
+            if entries.is_empty() {
+                break;
+            }
+
+            for entry in entries {
+                logical_total += entry.data.len() as u64;
+                physical_cursor += entry.data.len() as u64 + NodeController::ENTRY_OVERHEAD;
+            }
+        }
+
+        Ok(logical_total)
     }
 }
 
