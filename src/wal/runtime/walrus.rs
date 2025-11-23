@@ -9,11 +9,11 @@ use std::fs;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
-use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::WalIndex;
 use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
 use super::background::start_background_workers;
 use super::reader::Reader;
+use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::writer::Writer;
 use rkyv::Deserialize;
 
@@ -96,7 +96,7 @@ impl Walrus {
             read_consistency: mode,
             fsync_schedule,
             paths,
-             topic_clean_tracker,
+            topic_clean_tracker,
         };
         instance.startup_chore()?;
         Ok(instance)
@@ -114,6 +114,42 @@ impl Walrus {
         self.topic_clean_tracker.topic_is_clean(topic)
     }
 
+    pub fn get_topic_size(&self, topic: &str) -> u64 {
+        // 1. Get sealed size from reader
+        let sealed_size: u64 = if let Some(info_arc) = self
+            .reader
+            .data
+            .read()
+            .ok()
+            .and_then(|m| m.get(topic).cloned())
+        {
+            if let Ok(info) = info_arc.read() {
+                info.chain.iter().map(|b| b.used).sum()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // 2. Get active size from writer
+        let active_size: u64 =
+            if let Some(writer) = self.writers.read().ok().and_then(|m| m.get(topic).cloned()) {
+                if let Ok((_, offset)) = writer.snapshot_block() {
+                    offset
+                } else {
+                    debug_print!("[size_debug] writer snapshot failed for {}", topic);
+                    0
+                }
+            } else {
+                debug_print!("[size_debug] writer not found for {}", topic);
+                0
+            };
+
+        // debug_print!("[size_debug] {} sealed={} active={}", topic, sealed_size, active_size);
+        sealed_size + active_size
+    }
+
     #[cfg(test)]
     pub(crate) fn force_flush_clean_markers_for_test(&self) -> std::io::Result<()> {
         self.topic_clean_tracker.force_flush_for_test()
@@ -128,6 +164,8 @@ impl Walrus {
         } {
             return Ok(writer);
         }
+
+        debug_print!("[writer_debug] creating new writer for {}", col_name);
 
         let mut map = self.writers.write().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
@@ -215,7 +253,9 @@ impl Walrus {
                 mmap.read(block_offset as usize, &mut meta_buf);
                 let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                    break;
+                    block_offset += DEFAULT_BLOCK_SIZE;
+                    next_block_id += 1;
+                    continue;
                 }
                 let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
                 aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
@@ -320,6 +360,11 @@ impl Walrus {
         for f in seen_files.into_iter() {
             flush_check(f);
         }
+
+        unsafe {
+            self.allocator.fast_forward(next_block_id as u64);
+        }
+
         Ok(())
     }
 }
@@ -401,6 +446,87 @@ mod tests {
             assert!(wal.topic_is_clean("beta"));
         }
 
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn test_batch_read_scanning() {
+        let key = unique_key();
+        // Ensure we use mmap backend for this test to match the "fix" environment
+        crate::wal::config::disable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+
+        // 1. Write a sequence of entries
+        let count = 100;
+        for i in 0..count {
+            let payload = format!("entry-{}", i);
+            wal.append_for_topic("scan_col", payload.as_bytes())
+                .unwrap();
+        }
+
+        // 2. Read them back sequentially without checkpointing (cursor stays at 0)
+        // This simulates the `bucket.rs` behavior of reading from offset X by
+        // reading everything from 0 and skipping X bytes.
+        let mut offset = 0;
+        let mut total_read_entries = 0;
+
+        loop {
+            // Read a batch from the *current cursor* (which is 0 because checkpoint=false)
+            // We ask for enough bytes to cover our offset + some data
+            let entries = wal
+                .batch_read_for_topic("scan_col", offset + 1024, false, None)
+                .unwrap();
+            if entries.is_empty() {
+                break;
+            }
+
+            // Simulate "skipping" bytes to find the entry at `offset`
+            let mut current_pos = 0;
+            let mut found_new = false;
+
+            for entry in entries {
+                let len = entry.data.len();
+                if current_pos >= offset {
+                    // This is a new entry we haven't "processed" yet
+                    // Verify content
+                    let payload = String::from_utf8(entry.data.clone()).unwrap();
+                    let expected = format!("entry-{}", total_read_entries);
+                    assert_eq!(
+                        payload, expected,
+                        "Data mismatch at entry index {}",
+                        total_read_entries
+                    );
+
+                    total_read_entries += 1;
+                    offset += len; // Advance our logical offset
+                    found_new = true;
+                    // In a real scenario we might stop here or consume more,
+                    // but for this test let's read one-by-one to stress the loop
+                    break;
+                }
+                current_pos += len;
+            }
+
+            if !found_new && total_read_entries < count {
+                // If we didn't find new data but expect more, it means batch size wasn't large enough
+                // or we are stuck. For this test, we increased batch size above so we should find it.
+                // If we reach here, it might be an infinite loop.
+                if total_read_entries == count {
+                    break;
+                }
+                panic!(
+                    "Stuck at offset {} with {} entries read",
+                    offset, total_read_entries
+                );
+            }
+
+            if total_read_entries == count {
+                break;
+            }
+        }
+
+        assert_eq!(total_read_entries, count);
         cleanup_key(&key);
     }
 }

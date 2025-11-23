@@ -6,3 +6,9 @@
 digest.txt
 *.csv
 changes.md
+!distributed-walrus/tests/*.py
+!distributed-walrus/tests/**/*.py
+distributed-walrus/tests/__pycache__/
+distributed-walrus/target/
+distributed-walrus/.venv/
+distributed-walrus/test_data/

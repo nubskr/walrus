@@ -591,7 +591,7 @@ fn multithreaded_read_benchmark() {
             let mut local_read_errors = 0u64;
             // Read phase - consume all written data and continue reading
             while read_start_time.elapsed() < read_duration {
-                match wal_clone.batch_read_for_topic(&topic, READ_BATCH_MAX_BYTES, true) {
+                match wal_clone.batch_read_for_topic(&topic, READ_BATCH_MAX_BYTES, true, None) {
                     Ok(batch) => {
                         if batch.is_empty() {
                             continue;

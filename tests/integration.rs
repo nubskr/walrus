@@ -732,8 +732,6 @@ fn exactly_once_delivery_guarantee() {
 
     drop(wal);
 
-
-
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();

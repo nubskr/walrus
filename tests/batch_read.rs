@@ -14,10 +14,6 @@ fn cleanup_test_env() {
     let _ = std::fs::remove_dir_all(current_wal_dir());
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_spans_multiple_blocks() {
     let _guard = setup_test_env();
@@ -29,16 +25,13 @@ fn test_batch_read_spans_multiple_blocks() {
     )
     .unwrap();
 
-
-
     for i in 0..3 {
         let data = vec![i as u8; 8 * 1024 * 1024];
         wal.append_for_topic("span_blocks", &data).unwrap();
     }
 
-
     let entries = wal
-        .batch_read_for_topic("span_blocks", 30 * 1024 * 1024, true)
+        .batch_read_for_topic("span_blocks", 30 * 1024 * 1024, true, None)
         .unwrap();
     assert_eq!(
         entries.len(),
@@ -51,8 +44,9 @@ fn test_batch_read_spans_multiple_blocks() {
         assert_eq!(entry.data[0], i as u8, "Entry {} has wrong pattern", i);
     }
 
-
-    let remaining = wal.batch_read_for_topic("span_blocks", 1000, true).unwrap();
+    let remaining = wal
+        .batch_read_for_topic("span_blocks", 1000, true, None)
+        .unwrap();
     assert!(remaining.is_empty(), "Should have no remaining entries");
 
     cleanup_test_env();
@@ -69,16 +63,16 @@ fn test_batch_read_stops_mid_block() {
     )
     .unwrap();
 
-
     for i in 0..100 {
         let data = format!("entry_{:04}", i);
         wal.append_for_topic("mid_block", data.as_bytes()).unwrap();
     }
 
-
     let mut total_read = 0;
     for chunk_num in 0..10 {
-        let chunk = wal.batch_read_for_topic("mid_block", 100, true).unwrap();
+        let chunk = wal
+            .batch_read_for_topic("mid_block", 100, true, None)
+            .unwrap();
         assert!(!chunk.is_empty(), "Chunk {} should not be empty", chunk_num);
 
         for (i, entry) in chunk.iter().enumerate() {
@@ -99,10 +93,6 @@ fn test_batch_read_stops_mid_block() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_crosses_sealed_to_tail() {
     let _guard = setup_test_env();
@@ -114,10 +104,8 @@ fn test_batch_read_crosses_sealed_to_tail() {
     )
     .unwrap();
 
-
     let large = vec![0xAA; 9 * 1024 * 1024];
     wal.append_for_topic("tail_boundary", &large).unwrap();
-
 
     for i in 0..10 {
         let data = format!("tail_entry_{}", i);
@@ -125,9 +113,8 @@ fn test_batch_read_crosses_sealed_to_tail() {
             .unwrap();
     }
 
-
     let all = wal
-        .batch_read_for_topic("tail_boundary", 20 * 1024 * 1024, true)
+        .batch_read_for_topic("tail_boundary", 20 * 1024 * 1024, true, None)
         .unwrap();
     assert_eq!(all.len(), 11, "Should read sealed block + tail entries");
     assert_eq!(all[0].data.len(), 9 * 1024 * 1024);
@@ -152,19 +139,20 @@ fn test_batch_read_tail_only() {
     )
     .unwrap();
 
-
     for i in 0..20 {
         let data = format!("tail_only_{}", i);
         wal.append_for_topic("tail_only", data.as_bytes()).unwrap();
     }
 
-
-    let batch1 = wal.batch_read_for_topic("tail_only", 200, true).unwrap();
+    let batch1 = wal
+        .batch_read_for_topic("tail_only", 200, true, None)
+        .unwrap();
     assert!(!batch1.is_empty(), "Should read from tail");
 
-    let batch2 = wal.batch_read_for_topic("tail_only", 200, true).unwrap();
+    let batch2 = wal
+        .batch_read_for_topic("tail_only", 200, true, None)
+        .unwrap();
     assert!(!batch2.is_empty(), "Should continue reading from tail");
-
 
     for entry in &batch2 {
         for prev_entry in &batch1 {
@@ -178,10 +166,6 @@ fn test_batch_read_tail_only() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_respects_entry_cap() {
     let _guard = setup_test_env();
@@ -194,7 +178,6 @@ fn test_batch_read_respects_entry_cap() {
     .unwrap();
 
     const LIMIT: usize = 2000;
-
 
     let batch_one_storage: Vec<Vec<u8>> = (0..LIMIT)
         .map(|i| format!("entry_{:04}", i).into_bytes())
@@ -211,9 +194,8 @@ fn test_batch_read_respects_entry_cap() {
     wal.batch_append_for_topic("entry_cap", &batch_two)
         .expect("batch append 2 should succeed");
 
-
     let first_read = wal
-        .batch_read_for_topic("entry_cap", usize::MAX, true)
+        .batch_read_for_topic("entry_cap", usize::MAX, true, None)
         .expect("batch read should succeed");
     assert_eq!(
         first_read.len(),
@@ -231,9 +213,8 @@ fn test_batch_read_respects_entry_cap() {
         "last batch entry mismatch"
     );
 
-
     let second_read = wal
-        .batch_read_for_topic("entry_cap", usize::MAX, true)
+        .batch_read_for_topic("entry_cap", usize::MAX, true, None)
         .expect("second batch read should succeed");
     assert_eq!(
         second_read.len(),
@@ -251,9 +232,8 @@ fn test_batch_read_respects_entry_cap() {
         "last entry of second batch mismatch"
     );
 
-
     let third_read = wal
-        .batch_read_for_topic("entry_cap", usize::MAX, true)
+        .batch_read_for_topic("entry_cap", usize::MAX, true, None)
         .expect("third batch read should succeed");
     assert!(
         third_read.is_empty(),
@@ -278,37 +258,30 @@ fn test_batch_read_without_checkpoint() {
     let refs: Vec<&[u8]> = entries.iter().map(|v| v.as_slice()).collect();
     wal.batch_append_for_topic("peek_batch", &refs).unwrap();
 
-
     let first = wal
-        .batch_read_for_topic("peek_batch", usize::MAX, false)
+        .batch_read_for_topic("peek_batch", usize::MAX, false, None)
         .unwrap();
     assert_eq!(first.len(), 3);
     assert_eq!(first[0].data, b"item_0");
 
     let again = wal
-        .batch_read_for_topic("peek_batch", usize::MAX, false)
+        .batch_read_for_topic("peek_batch", usize::MAX, false, None)
         .unwrap();
     assert_eq!(again.len(), 3);
     assert_eq!(again[0].data, b"item_0");
 
-
     let committed = wal
-        .batch_read_for_topic("peek_batch", usize::MAX, true)
+        .batch_read_for_topic("peek_batch", usize::MAX, true, None)
         .unwrap();
     assert_eq!(committed.len(), 3);
 
-
     let empty = wal
-        .batch_read_for_topic("peek_batch", usize::MAX, true)
+        .batch_read_for_topic("peek_batch", usize::MAX, true, None)
         .unwrap();
     assert!(empty.is_empty());
 
     cleanup_test_env();
 }
-
-
-
-
 
 #[test]
 fn test_batch_read_during_concurrent_writes() {
@@ -325,7 +298,6 @@ fn test_batch_read_during_concurrent_writes() {
 
     let barrier = Arc::new(Barrier::new(3));
 
-
     let wal1 = wal.clone();
     let barrier1 = barrier.clone();
     let writer1 = thread::spawn(move || {
@@ -336,7 +308,6 @@ fn test_batch_read_during_concurrent_writes() {
             thread::sleep(std::time::Duration::from_micros(100));
         }
     });
-
 
     let wal2 = wal.clone();
     let barrier2 = barrier.clone();
@@ -349,7 +320,6 @@ fn test_batch_read_during_concurrent_writes() {
         }
     });
 
-
     let wal3 = wal.clone();
     let barrier3 = barrier.clone();
     let reader = thread::spawn(move || {
@@ -360,9 +330,8 @@ fn test_batch_read_during_concurrent_writes() {
         let mut seen = std::collections::HashSet::new();
 
         for _ in 0..50 {
-            if let Ok(batch) = wal3.batch_read_for_topic("chaos", 1024 * 1024, true) {
+            if let Ok(batch) = wal3.batch_read_for_topic("chaos", 1024 * 1024, true, None) {
                 for entry in batch {
-
                     assert!(seen.insert(entry.data.clone()), "Duplicate read detected!");
                     total_read += 1;
                 }
@@ -376,7 +345,6 @@ fn test_batch_read_during_concurrent_writes() {
     writer1.join().unwrap();
     writer2.join().unwrap();
     let read_count = reader.join().unwrap();
-
 
     assert!(
         read_count > 0,
@@ -399,7 +367,6 @@ fn test_concurrent_batch_reads_same_topic() {
         .unwrap(),
     );
 
-
     test_println!("Writing 500 entries for concurrent reads test...");
     for i in 0..500 {
         let data = format!("entry_{:05}", i);
@@ -407,7 +374,6 @@ fn test_concurrent_batch_reads_same_topic() {
             .unwrap();
     }
     test_println!("Finished writing entries");
-
 
     let barrier = Arc::new(Barrier::new(5));
     let mut handles = vec![];
@@ -423,7 +389,7 @@ fn test_concurrent_batch_reads_same_topic() {
             let mut total_read = 0;
             let mut batch_count = 0;
             loop {
-                match wal_clone.batch_read_for_topic("concurrent_reads", 500, true) {
+                match wal_clone.batch_read_for_topic("concurrent_reads", 500, true, None) {
                     Ok(batch) if batch.is_empty() => {
                         test_println!("Reader {} got empty batch, stopping", reader_id);
                         break;
@@ -465,7 +431,6 @@ fn test_concurrent_batch_reads_same_topic() {
     test_println!("Concurrent reads results: {:?}", results);
     test_println!("Total entries read: {}", total);
 
-
     assert_eq!(
         total, 500,
         "Concurrent readers should read all entries exactly once"
@@ -473,10 +438,6 @@ fn test_concurrent_batch_reads_same_topic() {
 
     cleanup_test_env();
 }
-
-
-
-
 
 #[test]
 fn test_batch_read_mixed_entry_sizes() {
@@ -489,7 +450,6 @@ fn test_batch_read_mixed_entry_sizes() {
     )
     .unwrap();
 
-
     let sizes = vec![
         10, 1000, 50, 10000, 100, 500000, 20, 2000000, 30, 100000, 5, 50000, 15, 1000000, 25,
         300000, 40, 150000, 8, 75000,
@@ -500,13 +460,12 @@ fn test_batch_read_mixed_entry_sizes() {
         wal.append_for_topic("mixed_sizes", &data).unwrap();
     }
 
-
     let mut total_entries = 0;
     let mut _total_bytes = 0;
 
     loop {
         let batch = wal
-            .batch_read_for_topic("mixed_sizes", 600000, true)
+            .batch_read_for_topic("mixed_sizes", 600000, true, None)
             .unwrap();
         if batch.is_empty() {
             break;
@@ -538,17 +497,12 @@ fn test_batch_read_mixed_entry_sizes() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_recovery_mid_read() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
     test_println!("Starting recovery test...");
-
 
     let read_before_crash = {
         test_println!("Phase 1: Writing and partially reading data");
@@ -558,18 +512,18 @@ fn test_batch_read_recovery_mid_read() {
         )
         .unwrap();
 
-
         for i in 0..50 {
             let data = format!("recovery_{:04}", i);
             wal.append_for_topic("recovery", data.as_bytes()).unwrap();
         }
         test_println!("Written 50 entries");
 
-
         let mut read_so_far = 0;
         let mut batch_count = 0;
         while read_so_far < 20 {
-            let batch = wal.batch_read_for_topic("recovery", 300, true).unwrap();
+            let batch = wal
+                .batch_read_for_topic("recovery", 300, true, None)
+                .unwrap();
             test_println!(
                 "Batch {}: read {} entries, total so far: {}",
                 batch_count,
@@ -586,14 +540,10 @@ fn test_batch_read_recovery_mid_read() {
         }
         test_println!("Phase 1 complete: read {} entries", read_so_far);
 
-
         read_so_far
     };
 
-
-
     thread::sleep(Duration::from_millis(50));
-
 
     {
         test_println!("Phase 2: Recovering and continuing read");
@@ -603,10 +553,10 @@ fn test_batch_read_recovery_mid_read() {
         )
         .unwrap();
 
-
-        let remaining = wal.batch_read_for_topic("recovery", 10000, true).unwrap();
+        let remaining = wal
+            .batch_read_for_topic("recovery", 10000, true, None)
+            .unwrap();
         test_println!("Recovery read: got {} entries", remaining.len());
-
 
         let expected_remaining = 50 - read_before_crash;
         assert_eq!(
@@ -616,7 +566,6 @@ fn test_batch_read_recovery_mid_read() {
             expected_remaining,
             remaining.len()
         );
-
 
         for (i, entry) in remaining.iter().enumerate() {
             let expected = format!("recovery_{:04}", read_before_crash + i);
@@ -650,7 +599,6 @@ fn test_batch_read_at_least_once_duplicates() {
 
     test_println!("Starting AtLeastOnce duplicates test...");
 
-
     {
         test_println!("Phase 1: Writing and reading with AtLeastOnce");
         let wal = Walrus::with_consistency_and_schedule(
@@ -659,7 +607,6 @@ fn test_batch_read_at_least_once_duplicates() {
         )
         .unwrap();
 
-
         for i in 0..25 {
             let data = format!("alo_{:04}", i);
             wal.append_for_topic("at_least_once", data.as_bytes())
@@ -667,12 +614,11 @@ fn test_batch_read_at_least_once_duplicates() {
         }
         test_println!("Written 25 entries");
 
-
         let mut count = 0;
         let mut batch_num = 0;
         while count < 8 {
             let batch = wal
-                .batch_read_for_topic("at_least_once", 200, true)
+                .batch_read_for_topic("at_least_once", 200, true, None)
                 .unwrap();
             test_println!(
                 "Phase 1 Batch {}: read {} entries, total: {}",
@@ -689,14 +635,9 @@ fn test_batch_read_at_least_once_duplicates() {
             }
         }
         test_println!("Phase 1 complete: read {} entries", count);
-
-
     }
 
-
-
     thread::sleep(Duration::from_millis(50));
-
 
     {
         test_println!("Phase 2: Recovering with AtLeastOnce (expecting duplicates)");
@@ -710,7 +651,7 @@ fn test_batch_read_at_least_once_duplicates() {
         let mut batch_num = 0;
         loop {
             let batch = wal
-                .batch_read_for_topic("at_least_once", 1000, true)
+                .batch_read_for_topic("at_least_once", 1000, true, None)
                 .unwrap();
             if batch.is_empty() {
                 test_println!("Phase 2: Got empty batch, stopping");
@@ -720,7 +661,6 @@ fn test_batch_read_at_least_once_duplicates() {
             all_entries.extend(batch);
             batch_num += 1;
 
-
             if batch_num > 50 {
                 test_println!("WARNING: Too many batches, breaking to prevent infinite loop");
                 break;
@@ -729,13 +669,11 @@ fn test_batch_read_at_least_once_duplicates() {
 
         test_println!("Phase 2 complete: read {} total entries", all_entries.len());
 
-
         assert!(
             all_entries.len() >= 25,
             "Should read at least all original entries, got {}",
             all_entries.len()
         );
-
 
         test_println!("First 5 entries:");
         for (i, entry) in all_entries.iter().take(5).enumerate() {
@@ -747,7 +685,6 @@ fn test_batch_read_at_least_once_duplicates() {
         for (i, entry) in all_entries.iter().skip(start).enumerate() {
             test_println!("  {}: {}", start + i, String::from_utf8_lossy(&entry.data));
         }
-
 
         let last = &all_entries[all_entries.len() - 1];
         let expected_last = b"alo_0024";
@@ -763,15 +700,10 @@ fn test_batch_read_at_least_once_duplicates() {
     test_println!("AtLeastOnce duplicates test completed successfully");
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_with_zeroed_headers() {
     let _guard = setup_test_env();
     enable_fd_backend();
-
 
     {
         let wal = Walrus::with_consistency_and_schedule(
@@ -787,11 +719,8 @@ fn test_batch_read_with_zeroed_headers() {
 
         drop(wal);
 
-
-
         thread::sleep(Duration::from_millis(50));
     }
-
 
     {
         use std::os::unix::fs::FileExt;
@@ -809,15 +738,12 @@ fn test_batch_read_with_zeroed_headers() {
                 .open(&file_path)
                 .unwrap();
 
-
-
-            let approx_offset = 10 * (64 + 12);
+            let approx_offset = 10 * (256 + 12);
             let zeros = vec![0u8; 64 * 6];
             file.write_at(&zeros, approx_offset as u64).unwrap();
             file.sync_all().unwrap();
         }
     }
-
 
     {
         let wal = Walrus::with_consistency_and_schedule(
@@ -828,13 +754,14 @@ fn test_batch_read_with_zeroed_headers() {
 
         let mut all_entries = Vec::new();
         loop {
-            let batch = wal.batch_read_for_topic("zeroed", 10000, true).unwrap();
+            let batch = wal
+                .batch_read_for_topic("zeroed", 10000, true, None)
+                .unwrap();
             if batch.is_empty() {
                 break;
             }
             all_entries.extend(batch);
         }
-
 
         assert!(
             all_entries.len() < 20,
@@ -850,10 +777,6 @@ fn test_batch_read_with_zeroed_headers() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_interleaved_single_and_batch_reads() {
     let _guard = setup_test_env();
@@ -865,7 +788,6 @@ fn test_interleaved_single_and_batch_reads() {
     )
     .unwrap();
 
-
     for i in 0..100 {
         let data = format!("interleaved_{:04}", i);
         wal.append_for_topic("interleaved", data.as_bytes())
@@ -874,11 +796,11 @@ fn test_interleaved_single_and_batch_reads() {
 
     let mut next_expected = 0;
 
-
     for round in 0..10 {
         if round % 2 == 0 {
-
-            let batch = wal.batch_read_for_topic("interleaved", 150, true).unwrap();
+            let batch = wal
+                .batch_read_for_topic("interleaved", 150, true, None)
+                .unwrap();
             for entry in batch {
                 let expected = format!("interleaved_{:04}", next_expected);
                 assert_eq!(
@@ -890,7 +812,6 @@ fn test_interleaved_single_and_batch_reads() {
                 next_expected += 1;
             }
         } else {
-
             for _ in 0..5 {
                 if let Some(entry) = wal.read_next("interleaved", true).unwrap() {
                     let expected = format!("interleaved_{:04}", next_expected);
@@ -908,9 +829,10 @@ fn test_interleaved_single_and_batch_reads() {
         }
     }
 
-
     while next_expected < 100 {
-        let batch = wal.batch_read_for_topic("interleaved", 150, true).unwrap();
+        let batch = wal
+            .batch_read_for_topic("interleaved", 150, true, None)
+            .unwrap();
         if batch.is_empty() {
             if let Some(entry) = wal.read_next("interleaved", true).unwrap() {
                 let expected = format!("interleaved_{:04}", next_expected);
@@ -946,10 +868,6 @@ fn test_interleaved_single_and_batch_reads() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_batch_read_during_batch_writes() {
     let _guard = setup_test_env();
@@ -964,7 +882,6 @@ fn test_batch_read_during_batch_writes() {
     );
 
     let barrier = Arc::new(Barrier::new(4));
-
 
     let mut writers = vec![];
     for writer_id in 0..3 {
@@ -988,7 +905,6 @@ fn test_batch_read_during_batch_writes() {
         writers.push(handle);
     }
 
-
     let wal_clone = wal.clone();
     let barrier_clone = barrier.clone();
     let reader = thread::spawn(move || {
@@ -999,7 +915,7 @@ fn test_batch_read_during_batch_writes() {
         let mut seen = std::collections::HashSet::new();
 
         for _ in 0..100 {
-            if let Ok(batch) = wal_clone.batch_read_for_topic("batch_chaos", 2048, true) {
+            if let Ok(batch) = wal_clone.batch_read_for_topic("batch_chaos", 2048, true, None) {
                 for entry in batch {
                     assert!(seen.insert(entry.data.clone()), "Duplicate batch read!");
                     total_read += 1;
@@ -1016,7 +932,6 @@ fn test_batch_read_during_batch_writes() {
     }
     let read_count = reader.join().unwrap();
 
-
     assert!(
         read_count > 0,
         "Should have read some entries during concurrent batch writes"
@@ -1024,10 +939,6 @@ fn test_batch_read_during_batch_writes() {
 
     cleanup_test_env();
 }
-
-
-
-
 
 #[test]
 fn test_batch_read_exact_budget_boundary() {
@@ -1040,38 +951,41 @@ fn test_batch_read_exact_budget_boundary() {
     )
     .unwrap();
 
-
     for i in 0..20 {
         let data = vec![i as u8; 100];
         wal.append_for_topic("exact_budget", &data).unwrap();
     }
 
-
-    let batch1 = wal.batch_read_for_topic("exact_budget", 300, true).unwrap();
+    let batch1 = wal
+        .batch_read_for_topic("exact_budget", 300, true, None)
+        .unwrap();
     assert_eq!(
         batch1.len(),
         3,
         "Should read exactly 3 entries with 300-byte budget"
     );
 
-
-    let batch2 = wal.batch_read_for_topic("exact_budget", 500, true).unwrap();
+    let batch2 = wal
+        .batch_read_for_topic("exact_budget", 500, true, None)
+        .unwrap();
     assert_eq!(
         batch2.len(),
         5,
         "Should read exactly 5 entries with 500-byte budget"
     );
 
-
-    let batch3 = wal.batch_read_for_topic("exact_budget", 1, true).unwrap();
+    let batch3 = wal
+        .batch_read_for_topic("exact_budget", 1, true, None)
+        .unwrap();
     assert_eq!(
         batch3.len(),
         1,
         "Should return a single entry even if it exceeds the budget"
     );
 
-
-    let batch4 = wal.batch_read_for_topic("exact_budget", 350, true).unwrap();
+    let batch4 = wal
+        .batch_read_for_topic("exact_budget", 350, true, None)
+        .unwrap();
     assert_eq!(
         batch4.len(),
         3,
@@ -1081,13 +995,12 @@ fn test_batch_read_exact_budget_boundary() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_rapid_fire_batch_reads() {
     let _guard = setup_test_env();
+    unsafe {
+        std::env::remove_var("WALRUS_QUIET");
+    }
     enable_fd_backend();
 
     let wal = Walrus::with_consistency_and_schedule(
@@ -1096,7 +1009,6 @@ fn test_rapid_fire_batch_reads() {
     )
     .unwrap();
 
-
     test_println!("Writing 1000 entries for rapid fire test...");
     for i in 0..1000 {
         let data = format!("{:06}", i);
@@ -1104,12 +1016,13 @@ fn test_rapid_fire_batch_reads() {
     }
     test_println!("Finished writing entries");
 
-
     let mut total_read = 0;
     let mut iterations = 0;
 
     loop {
-        let batch = wal.batch_read_for_topic("rapid_fire", 64, true).unwrap();
+        let batch = wal
+            .batch_read_for_topic("rapid_fire", 64, true, None)
+            .unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1142,10 +1055,6 @@ fn test_rapid_fire_batch_reads() {
     cleanup_test_env();
 }
 
-
-
-
-
 #[test]
 fn test_simple_deadlock_repro() {
     let _guard = setup_test_env();
@@ -1163,14 +1072,12 @@ fn test_simple_deadlock_repro() {
 
     let barrier = Arc::new(Barrier::new(3));
 
-
     let wal1 = wal.clone();
     let barrier1 = barrier.clone();
     let writer = thread::spawn(move || {
         barrier1.wait();
         test_println!("Writer starting...");
         for i in 0..10 {
-
             let data = vec![i as u8; 1024 * 1024];
             match wal1.append_for_topic("deadlock_test", &data) {
                 Ok(_) => test_println!("Writer: wrote entry {}", i),
@@ -1180,14 +1087,13 @@ fn test_simple_deadlock_repro() {
         test_println!("Writer finished");
     });
 
-
     let wal2 = wal.clone();
     let barrier2 = barrier.clone();
     let reader1 = thread::spawn(move || {
         barrier2.wait();
         test_println!("Reader 1 starting...");
         for i in 0..20 {
-            match wal2.batch_read_for_topic("deadlock_test", 512 * 1024, true) {
+            match wal2.batch_read_for_topic("deadlock_test", 512 * 1024, true, None) {
                 Ok(batch) => test_println!("Reader 1: batch {} read {} entries", i, batch.len()),
                 Err(e) => test_println!("Reader 1: batch {} error: {:?}", i, e),
             }
@@ -1195,7 +1101,6 @@ fn test_simple_deadlock_repro() {
         }
         test_println!("Reader 1 finished");
     });
-
 
     let wal3 = wal.clone();
     let barrier3 = barrier.clone();
@@ -1212,7 +1117,6 @@ fn test_simple_deadlock_repro() {
         }
         test_println!("Reader 2 finished");
     });
-
 
     let timeout = std::time::Duration::from_secs(30);
 
@@ -1254,7 +1158,6 @@ fn test_full_chaos_all_operations() {
 
     test_println!("Starting chaos test with 8 threads...");
 
-
     for writer_id in 0..2 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1271,7 +1174,6 @@ fn test_full_chaos_all_operations() {
             test_println!("Single writer {} finished", writer_id);
         }));
     }
-
 
     for writer_id in 2..4 {
         let wal_clone = wal.clone();
@@ -1290,7 +1192,6 @@ fn test_full_chaos_all_operations() {
             test_println!("Batch writer {} finished", writer_id);
         }));
     }
-
 
     for reader_id in 4..6 {
         let wal_clone = wal.clone();
@@ -1316,7 +1217,6 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-
     for reader_id in 6..8 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
@@ -1326,7 +1226,7 @@ fn test_full_chaos_all_operations() {
             test_println!("Batch reader {} starting", reader_id);
             let mut count = 0;
             for _ in 0..50 {
-                if let Ok(batch) = wal_clone.batch_read_for_topic("chaos_all", 1024, true) {
+                if let Ok(batch) = wal_clone.batch_read_for_topic("chaos_all", 1024, true, None) {
                     count += batch.len();
                 } else {
                     thread::sleep(std::time::Duration::from_micros(100));
@@ -1337,10 +1237,8 @@ fn test_full_chaos_all_operations() {
         }));
     }
 
-
     let mut total_written = 0;
     let mut total_read = 0;
-
 
     for handle in writer_handles {
         handle.join().unwrap();
@@ -1348,15 +1246,12 @@ fn test_full_chaos_all_operations() {
     total_written += 50 * 2;
     total_written += 10 * 10 * 2;
 
-
     for handle in reader_handles {
         let (_, count) = handle.join().unwrap();
         total_read += count;
     }
 
     test_println!("Chaos test: wrote {}, read {}", total_written, total_read);
-
-
 
     assert!(total_read > 0, "Readers should have read some entries");
 

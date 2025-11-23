@@ -1,7 +1,10 @@
 use crate::wal::config::{PREFIX_META_SIZE, checksum64, debug_print};
 use crate::wal::storage::SharedMmap;
-use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::Deserialize as _;
+use rkyv_derive::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
+
+use bytecheck::CheckBytes;
 
 #[derive(Clone, Debug)]
 pub struct Entry {

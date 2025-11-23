@@ -26,7 +26,6 @@ fn test_strictly_at_once_consistency() {
 
     drop(wal);
 
-
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -37,7 +36,6 @@ fn test_strictly_at_once_consistency() {
 #[test]
 fn test_at_least_once_consistency() {
     let _env = setup_env();
-
 
     let _wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 }
@@ -64,7 +62,6 @@ fn test_fsync_schedule_sync_each() {
     )
     .unwrap();
 
-
     wal.append_for_topic("sync_each_test", b"msg1").unwrap();
     wal.append_for_topic("sync_each_test", b"msg2").unwrap();
     wal.append_for_topic("sync_each_test", b"msg3").unwrap();
@@ -77,7 +74,6 @@ fn test_fsync_schedule_sync_each() {
 
     let entry3 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry3.data, b"msg3");
-
 
     assert!(wal.read_next("sync_each_test", true).unwrap().is_none());
 }
@@ -118,7 +114,6 @@ fn test_crash_recovery_strictly_at_once() {
         assert_eq!(entry2.data, b"recovery_msg_2");
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -158,7 +153,6 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry2.data, b"at_least_once_msg_2");
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -174,7 +168,6 @@ fn test_crash_recovery_at_least_once() {
         let entry3 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry3.data, b"at_least_once_msg_3");
     }
-
 
     thread::sleep(Duration::from_millis(50));
 
@@ -202,7 +195,6 @@ fn test_multiple_topics_different_consistency_behavior() {
     assert_eq!(wal.read_next("topic_b", true).unwrap().unwrap().data, b"b1");
 
     drop(wal);
-
 
     thread::sleep(Duration::from_millis(50));
 
@@ -282,7 +274,6 @@ fn test_persist_every_zero_clamping() {
     assert_eq!(entry1.data, b"msg1");
 
     drop(wal);
-
 
     thread::sleep(Duration::from_millis(50));
 
@@ -582,7 +573,6 @@ fn key_based_instances_recover_independently() {
         wal.append_for_topic("tx", b"b").unwrap();
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
@@ -590,7 +580,6 @@ fn key_based_instances_recover_independently() {
             .unwrap();
         wal.append_for_topic("events", b"x").unwrap();
     }
-
 
     thread::sleep(Duration::from_millis(50));
 

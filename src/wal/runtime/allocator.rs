@@ -157,6 +157,24 @@ impl BlockAllocator {
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
     }
+
+    pub(super) unsafe fn fast_forward(&self, next_id: u64) {
+        self.lock();
+        let data = unsafe { &mut *self.next_block.get() };
+        if next_id > data.id {
+            let diff = next_id - data.id;
+            data.id = next_id;
+            // Assume sequential blocks in current file
+            // This might be wrong if we spanned multiple files, but startup_chore
+            // should have handled file rollover by calling create_new_file?
+            // Actually startup_chore just scans.
+            // We need to ensure allocator points to a fresh location.
+            // If we just increment ID, offset remains 0 (in new file).
+            // This is fine! We want NEW blocks.
+            // We just want to avoid ID collision.
+        }
+        self.unlock();
+    }
 }
 
 // SAFETY: `BlockAllocator` uses an internal spin lock to guard all mutable

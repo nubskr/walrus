@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 use rand::Rng;
-use rocksdb::{Options, WriteOptions, DB};
+use rocksdb::{DB, Options, WriteOptions};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -174,16 +174,17 @@ fn parse_duration_string(duration_str: &str) -> Option<Duration> {
             .ok()
             .map(|hours| Duration::from_secs(hours * 3600))
     } else {
-        duration_str
-            .parse::<u64>()
-            .ok()
-            .map(Duration::from_secs)
+        duration_str.parse::<u64>().ok().map(Duration::from_secs)
     }
 }
 
 fn print_usage() {
-    println!("Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> cargo test rocksdb_multithreaded_benchmark_writes");
-    println!("   or: cargo test rocksdb_multithreaded_benchmark_writes -- --fsync <schedule> --duration <duration>");
+    println!(
+        "Usage: WALRUS_FSYNC=<schedule> WALRUS_DURATION=<duration> cargo test rocksdb_multithreaded_benchmark_writes"
+    );
+    println!(
+        "   or: cargo test rocksdb_multithreaded_benchmark_writes -- --fsync <schedule> --duration <duration>"
+    );
     println!();
     println!("Fsync Schedule Options:");
     println!("  sync-each    Sync WAL on every write (most durable)");
@@ -200,9 +201,15 @@ fn print_usage() {
     println!("  Default: 2m (120 seconds)");
     println!();
     println!("Examples:");
-    println!("  WALRUS_FSYNC=sync-each WALRUS_DURATION=30s cargo test rocksdb_multithreaded_benchmark_writes");
-    println!("  WALRUS_FSYNC=no-fsync WALRUS_DURATION=1m cargo test rocksdb_multithreaded_benchmark_writes");
-    println!("  WALRUS_FSYNC=500ms WALRUS_DURATION=5m cargo test rocksdb_multithreaded_benchmark_writes");
+    println!(
+        "  WALRUS_FSYNC=sync-each WALRUS_DURATION=30s cargo test rocksdb_multithreaded_benchmark_writes"
+    );
+    println!(
+        "  WALRUS_FSYNC=no-fsync WALRUS_DURATION=1m cargo test rocksdb_multithreaded_benchmark_writes"
+    );
+    println!(
+        "  WALRUS_FSYNC=500ms WALRUS_DURATION=5m cargo test rocksdb_multithreaded_benchmark_writes"
+    );
     println!("  cargo test rocksdb_multithreaded_benchmark_writes -- --fsync async --duration 1m");
 }
 
@@ -229,7 +236,6 @@ fn rocksdb_multithreaded_benchmark() {
     let write_duration = parse_duration();
 
     #[cfg(target_os = "linux")]
-
     let mut options = Options::default();
     options.create_if_missing(true);
     options.set_wal_dir(&wal_path);
@@ -255,9 +261,7 @@ fn rocksdb_multithreaded_benchmark() {
     let start_barrier = Arc::new(Barrier::new(num_threads + 1));
     let write_end_barrier = Arc::new(Barrier::new(num_threads + 1));
 
-    let topics: Vec<String> = (0..num_threads)
-        .map(|i| format!("topic_{}", i))
-        .collect();
+    let topics: Vec<String> = (0..num_threads).map(|i| format!("topic_{}", i)).collect();
 
     println!("=== Multi-threaded RocksDB WAL Benchmark ===");
     println!(
@@ -448,14 +452,10 @@ fn rocksdb_multithreaded_benchmark() {
                             local_writes += 1;
                             local_write_bytes += data.len() as u64;
                             total_writes_clone.fetch_add(1, Ordering::Relaxed);
-                            total_write_bytes_clone
-                                .fetch_add(data.len() as u64, Ordering::Relaxed);
+                            total_write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
                         }
                         Err(err) => {
-                            eprintln!(
-                                "Thread {} put error: {} (topic {})",
-                                thread_id, err, topic
-                            );
+                            eprintln!("Thread {} put error: {} (topic {})", thread_id, err, topic);
                             local_errors += 1;
                         }
                     }
