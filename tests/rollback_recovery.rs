@@ -5,8 +5,8 @@ use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 use walrus_rust::wal::PREFIX_META_SIZE;
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -16,20 +16,14 @@ fn cleanup_test_env() {
     let _ = std::fs::remove_dir_all(current_wal_dir());
 }
 
-
 fn entry_offset(data_len: usize) -> usize {
     PREFIX_META_SIZE + data_len
 }
-
-
-
-
 
 #[test]
 fn test_zeroed_header_stops_block_scanning() {
     let _guard = setup_test_env();
     enable_fd_backend();
-
 
     {
         let wal = Walrus::with_consistency_and_schedule(
@@ -38,7 +32,6 @@ fn test_zeroed_header_stops_block_scanning() {
         )
         .unwrap();
 
-
         for i in 0..5 {
             let data = format!("entry_{}", i);
             wal.append_for_topic("zero_test", data.as_bytes()).unwrap();
@@ -46,11 +39,8 @@ fn test_zeroed_header_stops_block_scanning() {
 
         drop(wal);
 
-
-
         thread::sleep(Duration::from_millis(50));
     }
-
 
     {
         let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
@@ -60,7 +50,6 @@ fn test_zeroed_header_stops_block_scanning() {
             .collect();
 
         assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
-
 
         let offset_0 = 0;
         let offset_1 = entry_offset("entry_0".len());
@@ -72,13 +61,11 @@ fn test_zeroed_header_stops_block_scanning() {
             .open(&file_path)
             .unwrap();
 
-
         let zeros = vec![0u8; PREFIX_META_SIZE];
         file.write_at(&zeros, offset_2 as u64)
             .expect("Failed to zero header");
         file.sync_all().unwrap();
     }
-
 
     {
         let wal = Walrus::with_consistency_and_schedule(
@@ -86,7 +73,6 @@ fn test_zeroed_header_stops_block_scanning() {
             FsyncSchedule::NoFsync,
         )
         .unwrap();
-
 
         let e0 = wal
             .read_next("zero_test", true)
@@ -100,13 +86,11 @@ fn test_zeroed_header_stops_block_scanning() {
             .expect("Should read entry_1");
         assert_eq!(e1.data, b"entry_1", "Second entry should be entry_1");
 
-
         let e2 = wal.read_next("zero_test", true).unwrap();
         assert!(
             e2.is_none(),
             "Should not read entry_2 or beyond (zeroed header stops scan)"
         );
-
 
         wal.append_for_topic("zero_test", b"new_entry").unwrap();
         let new = wal
@@ -135,7 +119,6 @@ fn test_concurrent_rollback_cleanup() {
         .unwrap(),
     );
 
-
     let num_threads = 5;
     let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = vec![];
@@ -145,7 +128,6 @@ fn test_concurrent_rollback_cleanup() {
         let barrier_clone = barrier.clone();
 
         let handle = thread::spawn(move || {
-
             let data = vec![i as u8; 512 * 1024];
             let entries: Vec<&[u8]> = vec![data.as_slice(); 3];
 
@@ -177,7 +159,6 @@ fn test_concurrent_rollback_cleanup() {
         num_threads - 1,
         "All other batches should roll back"
     );
-
 
     let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
@@ -211,10 +192,8 @@ fn test_rollback_with_block_spanning() {
         .unwrap(),
     );
 
-
     let large_data = vec![0xAA; 8 * 1024 * 1024];
     wal.append_for_topic("spanning_test", &large_data).unwrap();
-
 
     let entry = wal
         .read_next("spanning_test", true)
@@ -229,7 +208,6 @@ fn test_rollback_with_block_spanning() {
         entry.data[0], 0xAA,
         "Initial entry should have 0xAA pattern"
     );
-
 
     let num_threads = 3;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -266,7 +244,6 @@ fn test_rollback_with_block_spanning() {
 
     assert_eq!(successes, 1, "Exactly one multi-block batch should succeed");
 
-
     let winner = winner_pattern.expect("Should have one winner");
     let mut count = 0;
     while let Some(entry) = wal.read_next("spanning_test", true).unwrap() {
@@ -285,7 +262,6 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
     let _guard = setup_test_env();
     enable_fd_backend();
 
-
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -302,11 +278,8 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
 
         drop(wal);
 
-
-
         thread::sleep(Duration::from_millis(50));
     }
-
 
     {
         let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
@@ -323,7 +296,6 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
             .open(&file_path)
             .expect("Failed to open WAL file");
 
-
         let offset_large = entry_offset("small_1".len());
 
         let zeros = vec![0u8; PREFIX_META_SIZE];
@@ -332,7 +304,6 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         file.sync_all().unwrap();
     }
 
-
     {
         let wal = Walrus::with_consistency_and_schedule(
             ReadConsistency::StrictlyAtOnce,
@@ -340,20 +311,17 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
         )
         .unwrap();
 
-
         let e1 = wal
             .read_next("preserve_test", true)
             .unwrap()
             .expect("Should read small_1");
         assert_eq!(e1.data, b"small_1", "First entry should be small_1");
 
-
         let e2 = wal.read_next("preserve_test", true).unwrap();
         assert!(
             e2.is_none(),
             "Should not read past zeroed header (preserves data before, blocks garbage after)"
         );
-
 
         wal.append_for_topic("preserve_test", b"new_after_recovery")
             .unwrap();

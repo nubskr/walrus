@@ -322,14 +322,6 @@ fn e2e_recovery_and_persistence_marathon() {
     test_println!("  Remaining entries read: {}", total_read);
     test_println!("  Validation errors: {}", validation_errors);
 
-
-
-
-
-
-
-
-
     assert_eq!(
         validation_errors, 0,
         "Data integrity validation failed: {} errors",

@@ -2,7 +2,7 @@ use super::allocator::BlockStateTracker;
 use super::reader::ColReaderInfo;
 use super::{ReadConsistency, Walrus};
 use crate::wal::block::{Block, Entry, Metadata};
-use crate::wal::config::{checksum64, debug_print, MAX_BATCH_ENTRIES, PREFIX_META_SIZE};
+use crate::wal::config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print};
 use std::io;
 use std::sync::{Arc, RwLock};
 
@@ -379,10 +379,7 @@ impl Walrus {
 
         info!(
             "batch_read_for_topic: col_name={}, max_bytes={}, checkpoint={}, start_offset={:?}",
-            col_name,
-            max_bytes,
-            checkpoint,
-            start_offset
+            col_name, max_bytes, checkpoint, start_offset
         );
 
         // Pre-snapshot active writer state to avoid lock-order inversion later
@@ -391,7 +388,7 @@ impl Walrus {
                 .writers
                 .read()
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "writers read lock poisoned"))?;
-            
+
             match map.get(col_name).cloned() {
                 Some(w) => match w.snapshot_block() {
                     Ok(snapshot) => Some(snapshot),
@@ -403,59 +400,68 @@ impl Walrus {
 
         // 1) Prepare state (Chain + Position)
         let held_arc: Option<Arc<RwLock<ColReaderInfo>>>;
-        
-        let (chain, mut cur_idx, mut cur_off, tail_block_id, tail_offset, mut info_guard, mut initial_trim, mut first_end_hint) = if let Some(req_offset) = start_offset {
+
+        let (
+            chain,
+            mut cur_idx,
+            mut cur_off,
+            tail_block_id,
+            tail_offset,
+            mut info_guard,
+            mut initial_trim,
+            mut first_end_hint,
+        ) = if let Some(req_offset) = start_offset {
             held_arc = None;
             // --- Stateless Read (Offset Provided) ---
             let map = self.reader.data.read().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
             })?;
-            
-                        let chain = if let Some(arc) = map.get(col_name) {
-            
-                            let guard = arc.read().map_err(|_| {
-            
-                                 io::Error::new(io::ErrorKind::Other, "col info read lock poisoned")
-            
-                            })?;
-            
-                            info!("batch_read_for_topic: (stateless) initial chain len: {}", guard.chain.len());
-            
-                            guard.chain.clone()
-            
-                        } else {
-            
-                            Vec::new()
-            
-                        };
-            
-            
-            
-                        // Find block containing offset
-            
-                        let mut c_idx = 0;
-            
-                        let mut rem = req_offset;
-            
-                        let mut found = false;
-            
-                        
-            
-                        info!("batch_read_for_topic: (stateless) searching for block with req_offset={}, initial rem={}", req_offset, rem);
-            
-            
-            
+
+            let chain = if let Some(arc) = map.get(col_name) {
+                let guard = arc.read().map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "col info read lock poisoned")
+                })?;
+
+                info!(
+                    "batch_read_for_topic: (stateless) initial chain len: {}",
+                    guard.chain.len()
+                );
+
+                guard.chain.clone()
+            } else {
+                Vec::new()
+            };
+
+            // Find block containing offset
+
+            let mut c_idx = 0;
+
+            let mut rem = req_offset;
+
+            let mut found = false;
+
+            info!(
+                "batch_read_for_topic: (stateless) searching for block with req_offset={}, initial rem={}",
+                req_offset, rem
+            );
+
             for (i, b) in chain.iter().enumerate() {
-                info!("batch_read_for_topic: (stateless) iterating block {} (id={}), used={}, rem={}", i, b.id, b.used, rem);
+                info!(
+                    "batch_read_for_topic: (stateless) iterating block {} (id={}), used={}, rem={}",
+                    i, b.id, b.used, rem
+                );
                 if rem < b.used {
                     c_idx = i;
                     found = true;
-                    info!("batch_read_for_topic: (stateless) found block {} (id={}), rem={}", c_idx, b.id, rem);
+                    info!(
+                        "batch_read_for_topic: (stateless) found block {} (id={}), rem={}",
+                        c_idx, b.id, rem
+                    );
                     break;
                 }
                 rem -= b.used;
             }
-            
+
             let mut c_off = 0;
             let mut trim = 0;
             let mut hint = 0; // Initialize hint here
@@ -466,24 +472,36 @@ impl Walrus {
                 let mut scan_pos = 0;
                 // Use mmap for fast scanning if possible
                 let mut meta_buf = [0u8; PREFIX_META_SIZE];
-                
-                info!("batch_read_for_topic: (stateless) scanning block {} (id={}) for entry boundary, blk.used={}, rem={}", c_idx, blk.id, blk.used, rem);
+
+                info!(
+                    "batch_read_for_topic: (stateless) scanning block {} (id={}) for entry boundary, blk.used={}, rem={}",
+                    c_idx, blk.id, blk.used, rem
+                );
 
                 while scan_pos < blk.used {
-                    info!("batch_read_for_topic: (stateless) scan_pos={}, rem={}", scan_pos, rem);
+                    info!(
+                        "batch_read_for_topic: (stateless) scan_pos={}, rem={}",
+                        scan_pos, rem
+                    );
                     if scan_pos + (PREFIX_META_SIZE as u64) > blk.used {
-                        info!("batch_read_for_topic: (stateless) breaking scan_pos+PREFIX_META_SIZE > blk.used");
+                        info!(
+                            "batch_read_for_topic: (stateless) breaking scan_pos+PREFIX_META_SIZE > blk.used"
+                        );
                         break; // Should not happen in sealed block
                     }
-                    
+
                     // Read header
-                    blk.mmap.read((blk.offset + scan_pos) as usize, &mut meta_buf);
+                    blk.mmap
+                        .read((blk.offset + scan_pos) as usize, &mut meta_buf);
                     let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
-                     if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                        info!("batch_read_for_topic: (stateless) breaking meta_len invalid: {}", meta_len);
+                    if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+                        info!(
+                            "batch_read_for_topic: (stateless) breaking meta_len invalid: {}",
+                            meta_len
+                        );
                         break; // Corrupt/Zeroed
                     }
-                    
+
                     // Decode metadata to get read_size
                     let mut aligned = AlignedVec::with_capacity(meta_len);
                     aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
@@ -491,24 +509,32 @@ impl Walrus {
                     let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
                         Ok(m) => m,
                         Err(_) => {
-                            info!("batch_read_for_topic: (stateless) breaking meta deserialize error");
+                            info!(
+                                "batch_read_for_topic: (stateless) breaking meta deserialize error"
+                            );
                             break;
-                        },
+                        }
                     };
                     let data_size = meta.read_size;
-                    
+
                     let entry_total = (PREFIX_META_SIZE + data_size) as u64;
                     let entry_end = scan_pos + entry_total;
-                    
-                    info!("batch_read_for_topic: (stateless) scanned entry: meta_len={}, data_size={}, entry_total={}, entry_end={}", meta_len, data_size, entry_total, entry_end);
+
+                    info!(
+                        "batch_read_for_topic: (stateless) scanned entry: meta_len={}, data_size={}, entry_total={}, entry_end={}",
+                        meta_len, data_size, entry_total, entry_end
+                    );
 
                     // Special handling for start_offset = 0 to skip small initial entries (likely internal metadata)
                     if rem == 0 && data_size < 128 {
-                        info!("batch_read_for_topic: (stateless) skipping small initial entry (rem=0, data_size={})", data_size);
+                        info!(
+                            "batch_read_for_topic: (stateless) skipping small initial entry (rem=0, data_size={})",
+                            data_size
+                        );
                         scan_pos = entry_end;
                         continue;
                     }
-                    
+
                     if entry_end > rem {
                         // Found the entry containing 'rem'
                         c_off = scan_pos;
@@ -516,27 +542,39 @@ impl Walrus {
                         let payload_start = scan_pos + (PREFIX_META_SIZE as u64);
                         if rem > payload_start {
                             trim = (rem - payload_start) as usize;
-                            info!("batch_read_for_topic: (stateless) found entry containing rem: c_off={}, trim={}", c_off, trim);
+                            info!(
+                                "batch_read_for_topic: (stateless) found entry containing rem: c_off={}, trim={}",
+                                c_off, trim
+                            );
                         } else {
-                            info!("batch_read_for_topic: (stateless) found entry containing rem (no trim): c_off={}", c_off);
+                            info!(
+                                "batch_read_for_topic: (stateless) found entry containing rem (no trim): c_off={}",
+                                c_off
+                            );
                         }
                         break;
                     }
-                    
+
                     scan_pos = entry_end;
                 }
-                
-                // If loop finished without finding (shouldn't happen if rem < used), 
+
+                // If loop finished without finding (shouldn't happen if rem < used),
                 // we default to c_off=scan_pos (end of valid data)
                 if scan_pos >= blk.used {
-                    c_off = blk.used; 
-                    info!("batch_read_for_topic: (stateless) scan loop finished, c_off={}", c_off);
+                    c_off = blk.used;
+                    info!(
+                        "batch_read_for_topic: (stateless) scan loop finished, c_off={}",
+                        c_off
+                    );
                 }
             } else {
                 c_idx = chain.len();
                 c_off = 0;
                 // rem is now offset into tail (writer)
-                info!("batch_read_for_topic: (stateless) block not found, setting c_idx={}, c_off={}", c_idx, c_off);
+                info!(
+                    "batch_read_for_topic: (stateless) block not found, setting c_idx={}, c_off={}",
+                    c_idx, c_off
+                );
             }
 
             (chain, c_idx, c_off, 0, rem, None, trim, hint)
@@ -567,11 +605,11 @@ impl Walrus {
                     })
                     .clone()
             };
-            
+
             held_arc = Some(info_arc);
-            let mut info = held_arc.as_ref().unwrap()
-                .write()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+            let mut info = held_arc.as_ref().unwrap().write().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
+            })?;
 
             // Hydrate from index if needed
             let mut persisted_tail_for_fold: Option<(u64, u64)> = None;
@@ -638,74 +676,87 @@ impl Walrus {
             let block = chain[cur_idx].clone();
             if cur_off >= block.used {
                 if info_guard.is_some() {
-                     BlockStateTracker::set_checkpointed_true(block.id as usize);
+                    BlockStateTracker::set_checkpointed_true(block.id as usize);
                 }
                 cur_idx += 1;
                 cur_off = 0;
                 // When advancing to a new block, the first_end_hint from a previous block is no longer relevant.
                 // Reset it to 0 to ensure the peek logic can run for the new block.
-                first_end_hint = 0; 
+                first_end_hint = 0;
                 continue;
             }
 
             let mut want = (max_bytes - planned_bytes) as u64;
 
-            if planned_bytes == 0 { // This is the start of planning a new batch read
+            if planned_bytes == 0 {
+                // This is the start of planning a new batch read
                 let mut should_peek = true;
-                
+
                 // If a start_offset was provided AND we're still processing the initial 'trimming' part
                 if start_offset.is_some() && first_end_hint > cur_off {
                     want = want.max(first_end_hint - cur_off);
-                    should_peek = false; 
+                    should_peek = false;
                 }
 
                 if should_peek && cur_off + (PREFIX_META_SIZE as u64) <= block.used {
-                     let mut meta_buf = [0u8; PREFIX_META_SIZE];
-                     block.mmap.read((block.offset + cur_off) as usize, &mut meta_buf);
-                     let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
-                     if meta_len > 0 && meta_len <= PREFIX_META_SIZE - 2 {
-                         let mut aligned_peek_meta = AlignedVec::with_capacity(meta_len);
-                         aligned_peek_meta.extend_from_slice(&meta_buf[2..2+meta_len]);
-                         let archived_peek_meta = unsafe { rkyv::archived_root::<Metadata>(&aligned_peek_meta[..]) };
-                         let meta_res: Result<Metadata, _> = archived_peek_meta.deserialize(&mut rkyv::Infallible);
-                         match meta_res {
-                             Ok(meta) => {
-                                 let size1 = meta.read_size;
-                                 let required1 = (PREFIX_META_SIZE + size1) as u64;
-                                 
-                                 // --- DOUBLE PEEK START ---
-                                 let mut final_required = required1;
-                                 
-                                 if size1 < 128 {
-                                     let offset2 = cur_off + required1;
-                                     if offset2 + (PREFIX_META_SIZE as u64) <= block.used {
-                                         let mut meta_buf2 = [0u8; PREFIX_META_SIZE];
-                                         block.mmap.read((block.offset + offset2) as usize, &mut meta_buf2);
-                                         let meta_len2 = (meta_buf2[0] as usize) | ((meta_buf2[1] as usize) << 8);
-                                         if meta_len2 > 0 && meta_len2 <= PREFIX_META_SIZE - 2 {
-                                             let mut aligned2 = AlignedVec::with_capacity(meta_len2);
-                                             aligned2.extend_from_slice(&meta_buf2[2..2+meta_len2]);
-                                             let archived2 = unsafe { rkyv::archived_root::<Metadata>(&aligned2[..]) };
-                                             let meta2_res: Result<Metadata, _> = archived2.deserialize(&mut rkyv::Infallible);
-                                             if let Ok(meta2) = meta2_res {
-                                                 let size2 = meta2.read_size;
-                                                 let required2 = (PREFIX_META_SIZE + size2) as u64;
-                                                 final_required = required1 + required2;
-                                             }
-                                         }
-                                     }
-                                 }
-                                 // --- DOUBLE PEEK END ---
+                    let mut meta_buf = [0u8; PREFIX_META_SIZE];
+                    block
+                        .mmap
+                        .read((block.offset + cur_off) as usize, &mut meta_buf);
+                    let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
+                    if meta_len > 0 && meta_len <= PREFIX_META_SIZE - 2 {
+                        let mut aligned_peek_meta = AlignedVec::with_capacity(meta_len);
+                        aligned_peek_meta.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                        let archived_peek_meta =
+                            unsafe { rkyv::archived_root::<Metadata>(&aligned_peek_meta[..]) };
+                        let meta_res: Result<Metadata, _> =
+                            archived_peek_meta.deserialize(&mut rkyv::Infallible);
+                        match meta_res {
+                            Ok(meta) => {
+                                let size1 = meta.read_size;
+                                let required1 = (PREFIX_META_SIZE + size1) as u64;
 
-                                 if final_required > want {
-                                     want = final_required;
-                                 }
-                             },
-                             Err(_) => {
-                                 // ignore error, fallback to want
-                             }
-                         }
-                     }
+                                // --- DOUBLE PEEK START ---
+                                let mut final_required = required1;
+
+                                if size1 < 128 {
+                                    let offset2 = cur_off + required1;
+                                    if offset2 + (PREFIX_META_SIZE as u64) <= block.used {
+                                        let mut meta_buf2 = [0u8; PREFIX_META_SIZE];
+                                        block.mmap.read(
+                                            (block.offset + offset2) as usize,
+                                            &mut meta_buf2,
+                                        );
+                                        let meta_len2 = (meta_buf2[0] as usize)
+                                            | ((meta_buf2[1] as usize) << 8);
+                                        if meta_len2 > 0 && meta_len2 <= PREFIX_META_SIZE - 2 {
+                                            let mut aligned2 = AlignedVec::with_capacity(meta_len2);
+                                            aligned2
+                                                .extend_from_slice(&meta_buf2[2..2 + meta_len2]);
+                                            let archived2 = unsafe {
+                                                rkyv::archived_root::<Metadata>(&aligned2[..])
+                                            };
+                                            let meta2_res: Result<Metadata, _> =
+                                                archived2.deserialize(&mut rkyv::Infallible);
+                                            if let Ok(meta2) = meta2_res {
+                                                let size2 = meta2.read_size;
+                                                let required2 = (PREFIX_META_SIZE + size2) as u64;
+                                                final_required = required1 + required2;
+                                            }
+                                        }
+                                    }
+                                }
+                                // --- DOUBLE PEEK END ---
+
+                                if final_required > want {
+                                    want = final_required;
+                                }
+                            }
+                            Err(_) => {
+                                // ignore error, fallback to want
+                            }
+                        }
+                    }
                 }
             }
 
@@ -735,45 +786,52 @@ impl Walrus {
                 } else {
                     0
                 };
-                
+
                 // Scan writer block if start_offset provided (to align to entry)
                 if start_offset.is_some() {
                     let mut scan_pos = 0;
                     let mut meta_buf = [0u8; PREFIX_META_SIZE];
                     let rem = tail_start;
                     let mut found_start = 0;
-                    
+
                     while scan_pos < written {
-                         if scan_pos + (PREFIX_META_SIZE as u64) > written { break; }
-                         active_block.mmap.read((active_block.offset + scan_pos) as usize, &mut meta_buf);
-                         let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
-                         if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 { break; }
-                         
-                         let mut aligned = AlignedVec::with_capacity(meta_len);
-                         aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
-                         let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-                         let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
+                        if scan_pos + (PREFIX_META_SIZE as u64) > written {
+                            break;
+                        }
+                        active_block
+                            .mmap
+                            .read((active_block.offset + scan_pos) as usize, &mut meta_buf);
+                        let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
+                        if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+                            break;
+                        }
+
+                        let mut aligned = AlignedVec::with_capacity(meta_len);
+                        aligned.extend_from_slice(&meta_buf[2..2 + meta_len]);
+                        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+                        let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
                             Ok(m) => m,
                             Err(_) => break,
-                         };
-                         let data_size = meta.read_size;
-                         let entry_total = (PREFIX_META_SIZE + data_size) as u64;
-                         let entry_end = scan_pos + entry_total;
+                        };
+                        let data_size = meta.read_size;
+                        let entry_total = (PREFIX_META_SIZE + data_size) as u64;
+                        let entry_end = scan_pos + entry_total;
 
-                         // Special handling for start_offset = 0 to skip small initial entries (likely internal metadata)
-                         if rem == 0 && data_size < 128 {
-                             scan_pos = entry_end;
-                             continue;
-                         }
-                         
-                         if entry_end > rem {
-                             found_start = scan_pos;
-                             if rem > scan_pos + (PREFIX_META_SIZE as u64) {
-                                 initial_trim = (rem - (scan_pos + (PREFIX_META_SIZE as u64))) as usize;
-                             }
-                             break;
-                         }
-                         scan_pos = entry_end;
+                        // Special handling for start_offset = 0 to skip small initial entries (likely internal metadata)
+                        if rem == 0 && data_size < 128 {
+                            scan_pos = entry_end;
+                            continue;
+                        }
+
+                        if entry_end > rem {
+                            found_start = scan_pos;
+                            if rem > scan_pos + (PREFIX_META_SIZE as u64) {
+                                initial_trim =
+                                    (rem - (scan_pos + (PREFIX_META_SIZE as u64))) as usize;
+                            }
+                            break;
+                        }
+                        scan_pos = entry_end;
                     }
                     tail_start = found_start;
                 }
@@ -799,8 +857,8 @@ impl Walrus {
         let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce);
         // Manage the guard explicitly to satisfy the borrow checker
         if !hold_lock_during_io && info_guard.is_some() {
-             // Release lock for AtLeastOnce before IO
-             drop(info_guard.take().unwrap());
+            // Release lock for AtLeastOnce before IO
+            drop(info_guard.take().unwrap());
         }
 
         // 3) Read ranges via io_uring (FD backend) or mmap
@@ -872,8 +930,7 @@ impl Walrus {
                                 io::ErrorKind::UnexpectedEof,
                                 format!(
                                     "short read: got {} bytes, expected {}",
-                                    got,
-                                    expected_sizes[plan_idx]
+                                    got, expected_sizes[plan_idx]
                                 ),
                             ));
                         }
@@ -959,13 +1016,13 @@ impl Walrus {
                 let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
                     Ok(m) => m,
                     Err(_) => {
-                         break; // Parse error - stop
-                    },
+                        break; // Parse error - stop
+                    }
                 };
 
                 let data_size = meta.read_size;
                 let entry_consumed = PREFIX_META_SIZE + data_size;
-                
+
                 // Check if we have enough buffer space for the data
                 if buf_offset + entry_consumed > buffer.len() {
                     break; // Incomplete entry
@@ -1011,13 +1068,14 @@ impl Walrus {
                         let mut c_idx_bytes = [0u8; 8];
                         c_idx_bytes.copy_from_slice(&final_data[1..9]);
                         let c_idx = u64::from_be_bytes(c_idx_bytes); // Big-endian
-                        info!("batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}", t_idx, c_idx);
+                        info!(
+                            "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
+                            t_idx, c_idx
+                        );
                     }
-                    entries.push(Entry {
-                        data: final_data,
-                    });
+                    entries.push(Entry { data: final_data });
                 }
-                
+
                 total_data_bytes = next_total;
                 entries_parsed += 1;
 
@@ -1039,90 +1097,90 @@ impl Walrus {
 
         // 5) Commit progress (optional)
         if entries_parsed > 0 {
-                enum PersistTarget {
-                    Tail { blk_id: u64, off: u64 },
-                    Sealed { idx: u64, off: u64 },
-                    None,
-                }
-                let mut target = PersistTarget::None;
-                
-                let mut update_state = |info: &mut ColReaderInfo| {
-                        if checkpoint {
-                            let mut should_persist_disk = true;
+            enum PersistTarget {
+                Tail { blk_id: u64, off: u64 },
+                Sealed { idx: u64, off: u64 },
+                None,
+            }
+            let mut target = PersistTarget::None;
 
-                            if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
-                                let every = persist_every.max(1);
-                                let total = info.reads_since_persist.saturating_add(entries_parsed);
-                                if total >= every {
-                                    info.reads_since_persist = 0;
-                                    // For batch reads, we deliberately delay persistence to disk to ensure
-                                    // "at least once" semantics (replayability) are preserved even if
-                                    // batches are large, satisfying existing tests.
-                                    // Memory state is updated, so rapid_fire loop works.
-                                    should_persist_disk = false;
-                                } else {
-                                    info.reads_since_persist = total;
-                                    should_persist_disk = false;
-                                }
-                            }
+            let mut update_state = |info: &mut ColReaderInfo| {
+                if checkpoint {
+                    let mut should_persist_disk = true;
 
-                            if saw_tail {
-                                info.cur_block_idx = chain_len_at_plan;
-                                info.cur_block_offset = 0;
-                                info.tail_block_id = final_tail_block_id;
-                                info.tail_offset = final_tail_offset;
-                                if should_persist_disk {
-                                    target = PersistTarget::Tail {
-                                        blk_id: final_tail_block_id,
-                                        off: final_tail_offset,
-                                    };
-                                }
-                            } else {
-                                info.cur_block_idx = final_block_idx;
-                                info.cur_block_offset = final_block_offset;
-                                if should_persist_disk {
-                                    target = PersistTarget::Sealed {
-                                        idx: final_block_idx as u64,
-                                        off: final_block_offset,
-                                    };
-                                }
-                            }
+                    if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
+                        let every = persist_every.max(1);
+                        let total = info.reads_since_persist.saturating_add(entries_parsed);
+                        if total >= every {
+                            info.reads_since_persist = 0;
+                            // For batch reads, we deliberately delay persistence to disk to ensure
+                            // "at least once" semantics (replayability) are preserved even if
+                            // batches are large, satisfying existing tests.
+                            // Memory state is updated, so rapid_fire loop works.
+                            should_persist_disk = false;
+                        } else {
+                            info.reads_since_persist = total;
+                            should_persist_disk = false;
                         }
-                };
+                    }
 
-                if hold_lock_during_io {
-                    if let Some(mut info) = info_guard {
+                    if saw_tail {
+                        info.cur_block_idx = chain_len_at_plan;
+                        info.cur_block_offset = 0;
+                        info.tail_block_id = final_tail_block_id;
+                        info.tail_offset = final_tail_offset;
+                        if should_persist_disk {
+                            target = PersistTarget::Tail {
+                                blk_id: final_tail_block_id,
+                                off: final_tail_offset,
+                            };
+                        }
+                    } else {
+                        info.cur_block_idx = final_block_idx;
+                        info.cur_block_offset = final_block_offset;
+                        if should_persist_disk {
+                            target = PersistTarget::Sealed {
+                                idx: final_block_idx as u64,
+                                off: final_block_offset,
+                            };
+                        }
+                    }
+                }
+            };
+
+            if hold_lock_during_io {
+                if let Some(mut info) = info_guard {
+                    update_state(&mut info);
+                }
+            } else {
+                // Reacquire
+                let arc = {
+                    let map = self.reader.data.read().unwrap();
+                    map.get(col_name).cloned()
+                };
+                if let Some(arc) = arc {
+                    if let Ok(mut info) = arc.write() {
                         update_state(&mut info);
                     }
-                } else {
-                    // Reacquire
-                    let arc = {
-                         let map = self.reader.data.read().unwrap();
-                         map.get(col_name).cloned()
-                    };
-                    if let Some(arc) = arc {
-                        if let Ok(mut info) = arc.write() {
-                             update_state(&mut info);
-                        }
-                    }
                 }
+            }
 
-                // Commit to index
-                if checkpoint {
-                    match target {
-                        PersistTarget::Tail { blk_id, off } => {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
-                            }
+            // Commit to index
+            if checkpoint {
+                match target {
+                    PersistTarget::Tail { blk_id, off } => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
                         }
-                        PersistTarget::Sealed { idx, off } => {
-                            if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                let _ = idx_guard.set(col_name.to_string(), idx, off);
-                            }
-                        }
-                        PersistTarget::None => {}
                     }
+                    PersistTarget::Sealed { idx, off } => {
+                        if let Ok(mut idx_guard) = self.read_offset_index.write() {
+                            let _ = idx_guard.set(col_name.to_string(), idx, off);
+                        }
+                    }
+                    PersistTarget::None => {}
                 }
+            }
         }
 
         Ok(entries)

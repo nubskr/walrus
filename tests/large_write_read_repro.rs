@@ -1,7 +1,7 @@
-use walrus_rust::Walrus;
-use std::sync::Arc;
 use std::fs;
+use std::sync::Arc;
 use std::time::Instant;
+use walrus_rust::Walrus;
 
 #[test]
 fn test_throughput_3gb_write_read_local() {
@@ -15,7 +15,7 @@ fn test_throughput_3gb_write_read_local() {
     unsafe {
         std::env::set_var("WALRUS_DATA_DIR", dir.to_str().unwrap());
     }
-    
+
     let wal = Arc::new(Walrus::new().unwrap());
     let col = "throughput_topic";
 
@@ -41,14 +41,16 @@ fn test_throughput_3gb_write_read_local() {
     println!("Starting sequential read verification...");
     let mut read_offset = 0;
     let read_chunk_size = 1024 * 1024; // 1MB read buffer (simulating client)
-    
+
     // We just need to ensure we can make progress past the first few blocks
     // checking the first 500MB is sufficient to prove the fix
-    let check_limit = 500 * 1024 * 1024; 
+    let check_limit = 500 * 1024 * 1024;
 
     while read_offset < check_limit {
-        let result = wal.batch_read_for_topic(col, read_chunk_size, false, Some(read_offset as u64)).unwrap();
-        
+        let result = wal
+            .batch_read_for_topic(col, read_chunk_size, false, Some(read_offset as u64))
+            .unwrap();
+
         if result.is_empty() {
             panic!("Stuck! Read returned 0 entries at offset {}", read_offset);
         }
@@ -56,12 +58,15 @@ fn test_throughput_3gb_write_read_local() {
         for entry in result {
             read_offset += entry.data.len();
         }
-        
+
         if read_offset % (100 * 1024 * 1024) == 0 {
-             println!("Read {} MB...", read_offset / 1024 / 1024);
+            println!("Read {} MB...", read_offset / 1024 / 1024);
         }
     }
 
-    println!("Success! Read passed {} MB mark without getting stuck.", check_limit / 1024 / 1024);
+    println!(
+        "Success! Read passed {} MB mark without getting stuck.",
+        check_limit / 1024 / 1024
+    );
     let _ = fs::remove_dir_all(&dir);
 }
