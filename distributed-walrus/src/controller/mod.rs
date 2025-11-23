@@ -14,13 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-mod fetch;
 mod internal;
-mod logical_wal;
-mod produce;
 mod topics;
 mod types;
-use logical_wal::LogicalWal;
 pub use types::{parse_wal_key, wal_key, TopicPartition, WalKeyParts};
 
 #[derive(Clone, Copy)]
@@ -65,7 +61,10 @@ impl NodeController {
                 wal_key,
                 start_offset,
                 max_bytes,
-            } => self.forward_read(&wal_key, start_offset, max_bytes).await,
+            } => {
+                // TODO: Implement with new simple protocol
+                InternalResp::Error("ForwardRead not implemented yet".to_string())
+            }
             InternalOp::JoinCluster { node_id, addr } => {
                 self.handle_join_cluster(node_id, addr).await
             }
@@ -105,16 +104,16 @@ impl NodeController {
         }
     }
 
-    pub async fn route_and_read(
-        &self,
-        topic: &str,
-        partition: u32,
-        req_offset: u64,
-        max_bytes: usize,
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
-        self.handle_fetch(topic, partition, req_offset, max_bytes)
-            .await
-    }
+    // TODO: Implement with new simple protocol
+    // pub async fn route_and_read(
+    //     &self,
+    //     topic: &str,
+    //     partition: u32,
+    //     req_offset: u64,
+    //     max_bytes: usize,
+    // ) -> Result<(Vec<Vec<u8>>, u64)> {
+    //     unimplemented!("route_and_read removed with Kafka protocol")
+    // }
 
     pub async fn sync_leases_now(&self) {
         let expected: HashSet<String> = self
@@ -139,59 +138,11 @@ impl NodeController {
         }
     }
 
-    async fn read_local_logical(
-        &self,
-        wal_key: &str,
-        local_offset: u64,
-        max_bytes: usize,
-        watermark_base: u64,
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let logical = self.logical_wal(wal_key);
-        let len = logical.logical_len().await;
-        if local_offset >= len {
-            let watermark = watermark_base + len;
-            tracing::info!(
-                "read_local_logical past end: offset={} len={} watermark={}",
-                local_offset,
-                len,
-                watermark
-            );
-            return Ok((Vec::new(), watermark));
-        }
-        let entries = logical.read(local_offset, max_bytes).await?;
-        Ok((entries, watermark_base + len))
-    }
+    // TODO: All logical_wal methods removed - will be replaced with message-based reading
 
-    pub async fn partition_high_watermark(&self, topic: &str, partition: u32) -> u64 {
-        let tp = TopicPartition::new(topic, partition);
-        let Some(state) = self.metadata.get_partition_state(topic, partition) else {
-            return 0;
-        };
-        let mut history_end = 0u64;
-        for seg in &state.history {
-            let seg_len = self.segment_logical_len(tp, seg).await;
-            history_end = history_end.max(seg.start_offset + seg_len);
-        }
-
-        let head_key = tp.wal_key(state.current_generation);
-        let head_len = self.logical_wal(&head_key).logical_len().await;
-        history_end + head_len
-    }
-
-    async fn segment_logical_len(&self, tp: TopicPartition<'_>, segment: &SegmentRecord) -> u64 {
-        if segment.stored_on_node == self.node_id {
-            let key = tp.wal_key(segment.generation);
-            self.logical_wal(&key).logical_len().await
-        } else {
-            segment.end_offset.saturating_sub(segment.start_offset)
-        }
-    }
-
-    fn logical_wal<'a>(&'a self, wal_key: &'a str) -> LogicalWal<'a> {
-        LogicalWal {
-            controller: self,
-            wal_key,
-        }
+    pub async fn partition_high_watermark(&self, _topic: &str, _partition: u32) -> u64 {
+        // TODO: Implement with message-based counting
+        0
     }
 
     pub(super) async fn tracked_len(&self, wal_key: &str) -> u64 {
