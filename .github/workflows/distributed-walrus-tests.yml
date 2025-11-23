@@ -1,0 +1,25 @@
+name: Distributed Walrus Tests (One-by-One)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  distributed-walrus-tests:
+    runs-on: self-hosted
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run distributed walrus tests one-by-one
+        working-directory: distributed-walrus
+        run: make all-tests-one-by-one
