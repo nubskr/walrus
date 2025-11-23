@@ -37,13 +37,14 @@ impl NodeController {
 
     // Each WAL entry reserves a fixed prefix (matches wal::config::PREFIX_META_SIZE).
     const ENTRY_OVERHEAD: u64 = 256;
+    const SCAN_WINDOW: usize = 16 * 1024 * 1024;
 
     pub async fn handle_rpc(&self, op: InternalOp) -> InternalResp {
         tracing::info!("handle_rpc: processing op {:?}", op);
         match op {
             InternalOp::ForwardAppend { wal_key, data } => {
                 self.sync_leases_now().await;
-                let data_len = data.len() as u64 + Self::ENTRY_OVERHEAD;
+                let data_len = data.len() as u64;
                 match self.append_with_retry(&wal_key, data).await {
                     Ok(_) => {
                         tracing::info!("handle_rpc: append success for {}", wal_key);
@@ -163,7 +164,7 @@ impl NodeController {
             tracing::info!("writing locally on node {}", self.node_id);
             // Ensure local bucket has the latest leases from metadata before appending.
             self.sync_leases_now().await;
-            let bytes = data.len() as u64 + Self::ENTRY_OVERHEAD;
+            let bytes = data.len() as u64;
             self.append_with_retry(&key, data).await?;
             self.record_append(&key, bytes).await;
         } else {
@@ -223,7 +224,7 @@ impl NodeController {
         for seg in &state.history {
             let end = if seg.stored_on_node == self.node_id {
                 let key = wal_key(topic, partition, seg.generation);
-                let actual = self.bucket.get_topic_size_blocking(&key);
+                let actual = self.logical_bytes_for_key(&key).await?;
                 self.update_tracked_if_smaller(&key, actual).await;
                 seg.start_offset + actual
             } else {
@@ -291,14 +292,14 @@ impl NodeController {
         let last_actual_end = if let Some(last_seg) = state.history.last() {
             if last_seg.stored_on_node == self.node_id {
                 let key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.bucket.get_topic_size_blocking(&key);
+                let last_len = self.logical_bytes_for_key(&key).await?;
                 self.update_tracked_if_smaller(&key, last_len).await;
                 let mut end = last_seg.start_offset + last_len;
                 if state.history.len() >= 2 {
                     let prev = &state.history[state.history.len() - 2];
                     let prev_key = wal_key(topic, partition, prev.generation);
                     let prev_len = if prev.stored_on_node == self.node_id {
-                        let len = self.bucket.get_topic_size_blocking(&prev_key);
+                        let len = self.logical_bytes_for_key(&prev_key).await?;
                         self.update_tracked_if_smaller(&prev_key, len).await;
                         len
                     } else {
@@ -635,7 +636,7 @@ impl NodeController {
         let head_start = if let Some(last_seg) = state.history.last() {
             if last_seg.stored_on_node == self.node_id {
                 let last_key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.bucket.get_topic_size_blocking(&last_key);
+                let last_len = self.logical_bytes_for_key(&last_key).await.unwrap_or(0);
                 self.update_tracked_if_smaller(&last_key, last_len).await;
                 let mut corrected_start = last_seg.start_offset;
                 let mut actual_end = last_seg.start_offset + last_len;
@@ -643,7 +644,8 @@ impl NodeController {
                     let prev = &state.history[state.history.len() - 2];
                     if prev.stored_on_node == self.node_id {
                         let prev_key = wal_key(topic, partition, prev.generation);
-                        let prev_len = self.bucket.get_topic_size_blocking(&prev_key);
+                        let prev_len =
+                            self.logical_bytes_for_key(&prev_key).await.unwrap_or(0);
                         self.update_tracked_if_smaller(&prev_key, prev_len).await;
                         let prev_end = prev.start_offset + prev_len;
                         corrected_start = corrected_start.max(prev_end);
@@ -676,13 +678,10 @@ impl NodeController {
         let mut physical_cursor = 0u64;
         let mut logical_cursor = 0u64;
 
-        // Cap per-read window to avoid loading huge logs at once while still progressing.
-        const SCAN_WINDOW: usize = 16 * 1024 * 1024;
-
         while physical_cursor < total_physical {
             let remaining = (total_physical - physical_cursor) as usize;
             let max_bytes = remaining
-                .min(SCAN_WINDOW)
+                .min(Self::SCAN_WINDOW)
                 .max(Self::ENTRY_OVERHEAD as usize + 1);
             let entries = self
                 .bucket
@@ -745,13 +744,19 @@ impl NodeController {
             let guard = self.offsets.read().await;
             guard.get(wal_key).copied().unwrap_or(0)
         };
-        // Trust the WAL engine as the source of truth; the tracked map can drift if rollovers race with writes.
-        let actual = self.bucket.get_topic_size_blocking(wal_key);
-        let best = actual.max(tracked);
-        if actual > tracked {
-            self.update_tracked_if_smaller(wal_key, actual).await;
+        if tracked > 0 {
+            return tracked;
         }
-        best
+
+        match self.logical_bytes_for_key(wal_key).await {
+            Ok(bytes) => {
+                if bytes > tracked {
+                    self.update_tracked_if_smaller(wal_key, bytes).await;
+                }
+                bytes
+            }
+            Err(_) => tracked,
+        }
     }
 
     async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
@@ -767,6 +772,33 @@ impl NodeController {
         if *entry < bytes {
             *entry = bytes;
         }
+    }
+
+    async fn logical_bytes_for_key(&self, wal_key: &str) -> Result<u64> {
+        let total_physical = self.bucket.get_topic_size_blocking(wal_key);
+        let mut physical_cursor = 0u64;
+        let mut logical_total = 0u64;
+
+        while physical_cursor < total_physical {
+            let remaining = (total_physical - physical_cursor) as usize;
+            let max_bytes = remaining
+                .min(Self::SCAN_WINDOW)
+                .max(Self::ENTRY_OVERHEAD as usize + 1);
+            let entries = self
+                .bucket
+                .read_by_key_from_offset(wal_key, physical_cursor, max_bytes)
+                .await?;
+            if entries.is_empty() {
+                break;
+            }
+
+            for entry in entries {
+                logical_total += entry.data.len() as u64;
+                physical_cursor += entry.data.len() as u64 + Self::ENTRY_OVERHEAD;
+            }
+        }
+
+        Ok(logical_total)
     }
 
     async fn append_with_retry(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {

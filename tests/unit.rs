@@ -101,7 +101,6 @@ fn persists_read_offsets_across_restart() {
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"a");
 
-
     thread::sleep(Duration::from_millis(50));
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t", true).unwrap().unwrap().data, b"b");
@@ -166,21 +165,17 @@ fn read_next_without_checkpoint_does_not_advance() {
     wal.append_for_topic("peek_topic", b"first").unwrap();
     wal.append_for_topic("peek_topic", b"second").unwrap();
 
-
     let first = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first.data, b"first");
 
-
     let first_again = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first_again.data, b"first");
-
 
     let committed_first = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(committed_first.data, b"first");
 
     let second = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(second.data, b"second");
-
 
     assert!(wal.read_next("peek_topic", true).unwrap().is_none());
 }

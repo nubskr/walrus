@@ -1,6 +1,6 @@
-use walrus_rust::Walrus;
-use std::sync::Arc;
 use std::fs;
+use std::sync::Arc;
+use walrus_rust::Walrus;
 
 #[test]
 fn test_repro_stuck_read_with_small_initial_entry() {
@@ -14,7 +14,7 @@ fn test_repro_stuck_read_with_small_initial_entry() {
     unsafe {
         std::env::set_var("WALRUS_DATA_DIR", dir.to_str().unwrap());
     }
-    
+
     let wal = Arc::new(Walrus::new().unwrap());
     let col = "repro_topic";
 
@@ -33,7 +33,7 @@ fn test_repro_stuck_read_with_small_initial_entry() {
 
     // 3. Write another small entry.
     // This won't fit in block 102 (limit expanded to ~30MB? No, standard blocks are 10MB, but large blocks are sized).
-    // Wait, large blocks are "handout(sized)". 
+    // Wait, large blocks are "handout(sized)".
     // If I write another entry, will it go into 102 or force 102 to seal?
     // Let's write enough to force a seal if necessary, or just write something.
     wal.append_for_topic(col, &small_data).unwrap();
@@ -45,8 +45,10 @@ fn test_repro_stuck_read_with_small_initial_entry() {
 
     println!("--- Starting Read Request ---");
     // 3. Request 1MB.
-    let max_bytes = 1024 * 1024; 
-    let result = wal.batch_read_for_topic(col, max_bytes, false, Some(0)).unwrap();
+    let max_bytes = 1024 * 1024;
+    let result = wal
+        .batch_read_for_topic(col, max_bytes, false, Some(0))
+        .unwrap();
 
     println!("Read {} entries", result.len());
     for (i, entry) in result.iter().enumerate() {
@@ -57,7 +59,10 @@ fn test_repro_stuck_read_with_small_initial_entry() {
 
     // We expect to see the large entry (20MB).
     // The first small entry might be skipped.
-    assert!(result.len() >= 1, "Should have read at least the large entry");
+    assert!(
+        result.len() >= 1,
+        "Should have read at least the large entry"
+    );
     // Find the large entry
     let found_large = result.iter().any(|e| e.data.len() == large_size);
     assert!(found_large, "Failed to read the 20MB entry! Stuck?");
