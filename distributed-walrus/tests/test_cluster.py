@@ -2531,11 +2531,11 @@ def test_throughput_multi_topic_3gb_parallel():
         # Payload pattern: TopicIndex (1 byte) + ChunkIndex (8 bytes) + Padding
         prefix_fmt = ">BQ"
         prefix_len = struct.calcsize(prefix_fmt)
-        
+
         while sent_bytes < target_bytes:
             prefix = struct.pack(prefix_fmt, idx, chunk_count)
             payload = prefix + b"X" * (chunk_size - prefix_len)
-            
+
             # Retry produce internally to avoid failing the whole test on a transient hiccup
             success = False
             for _ in range(5):
@@ -2548,7 +2548,9 @@ def test_throughput_multi_topic_3gb_parallel():
 
             sent_bytes += len(payload)
             chunk_count += 1
-            
+            # Avoid overwhelming docker; give the cluster a brief breather between large writes.
+            time.sleep(0.05)
+
             if chunk_count % 20 == 0:
                 print(f"[{topic_name}] Written {sent_bytes / 1024 / 1024:.2f} MB...")
         return sent_bytes
@@ -2568,7 +2570,7 @@ def test_throughput_multi_topic_3gb_parallel():
     print(f"Parallel write complete: {total_written / 1024 / 1024:.2f} MB in {write_duration:.2f}s")
 
     # Allow metadata to settle
-    time.sleep(5)
+    time.sleep(15)
 
     print("Starting sequential read verification...")
     fetch_size = 1024 * 1024 
@@ -2587,21 +2589,24 @@ def test_throughput_multi_topic_3gb_parallel():
         try:
             while read_payload_bytes < sent_bytes:
                 payload = b""
-                for _ in range(10):
+                high_watermark = 0
+                for attempt in range(30):
                     fetch = decode_fetch(
                         send_frame_with_retry(
                             *NODES[1], make_fetch_with_offset(topic, 0, read_logical_offset, max_bytes=fetch_size)
                         )
                         or b""
                     )
-                    if fetch and fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
-                        payload = fetch[0]["payload"]
-                        break
-                    time.sleep(0.5)
-                
+                    if fetch and len(fetch) > 0:
+                        high_watermark = fetch[0]["high_watermark"]
+                        if fetch[0]["error_code"] == 0 and len(fetch[0]["payload"]) > 0:
+                            payload = fetch[0]["payload"]
+                            break
+                    time.sleep(1.0)
+
                 if len(payload) == 0:
-                     print(f"Stuck reading {topic} at offset {read_logical_offset}")
-                     assert False, f"Stuck reading {topic} at offset {read_logical_offset}"
+                     print(f"Stuck reading {topic} at offset {read_logical_offset} (hw={high_watermark})")
+                     assert False, f"Stuck reading {topic} at offset {read_logical_offset} (hw={high_watermark})"
 
                 buffer += payload
                 read_payload_bytes += len(payload)
