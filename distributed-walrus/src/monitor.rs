@@ -84,6 +84,14 @@ impl Monitor {
             return Ok(());
         }
 
+        let metrics = self.controller.raft.raft_metrics();
+        let membership = metrics.membership_config.membership();
+        let mut voters = std::collections::BTreeSet::new();
+        for config in membership.get_joint_config() {
+            voters.extend(config.iter());
+        }
+        let nodes: Vec<u64> = voters.into_iter().copied().collect();
+
         let assignments = self
             .controller
             .metadata
@@ -117,10 +125,32 @@ impl Monitor {
                 "Segment {} size {} exceeds limit {}, proposing rollover",
                 wal, size, self.limits.max_segment_size,
             );
+
+            let current_idx = nodes
+                .iter()
+                .position(|&id| id == self.controller.node_id)
+                .unwrap_or(0);
+            
+            let next_leader = if nodes.is_empty() {
+                self.controller.node_id
+            } else {
+                nodes[(current_idx + 1) % nodes.len()]
+            };
+
+            tracing::info!(
+                "Rollover for {} p{}: voters={:?}, current={} idx={}, next_leader={}",
+                topic,
+                partition,
+                nodes,
+                self.controller.node_id,
+                current_idx,
+                next_leader
+            );
+
             let cmd = MetadataCmd::RolloverPartition {
                 name: topic.clone(),
                 partition,
-                new_leader: self.controller.node_id,
+                new_leader: next_leader,
                 sealed_segment_size_bytes: size,
             };
             let payload = bincode::serialize(&cmd)?;

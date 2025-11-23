@@ -279,28 +279,33 @@ impl NodeController {
                 let raft_clone = self.raft.clone();
                 let node_id_clone = node_id;
                 tokio::spawn(async move {
-                    for _ in 0..20 {
+                    for i in 0..120 {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         match raft_clone.is_learner_caught_up(node_id_clone).await {
                             Ok(true) => {
                                 tracing::info!("Node {} caught up, promoting...", node_id_clone);
-                                if let Err(e) = raft_clone.promote_learner(node_id_clone).await {
-                                    tracing::error!(
-                                        "Failed to promote node {}: {}",
-                                        node_id_clone,
-                                        e
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "Node {}: Promoted learner {}",
-                                        raft_clone.id(),
-                                        node_id_clone
-                                    );
+                                match raft_clone.promote_learner(node_id_clone).await {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            "Node {}: Promoted learner {}",
+                                            raft_clone.id(),
+                                            node_id_clone
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to promote node {}: {}. Retrying...",
+                                            node_id_clone,
+                                            e
+                                        );
+                                    }
                                 }
-                                return;
                             }
                             Ok(false) => {
-                                tracing::debug!("Node {} not caught up yet", node_id_clone);
+                                if i % 10 == 0 {
+                                    tracing::debug!("Node {} not caught up yet (attempt {}/120)", node_id_clone, i);
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("Error checking learner status: {}", e);
