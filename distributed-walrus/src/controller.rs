@@ -221,52 +221,70 @@ impl NodeController {
             .get_partition_state(topic, partition)
             .ok_or_else(|| anyhow!("unknown topic/partition"))?;
 
+        // Snapshot the observed end offset (metadata vs. actual bytes) for each history segment on this node.
+        let mut history_actual_ends: Vec<u64> = Vec::with_capacity(state.history.len());
+        for seg in &state.history {
+            let end = if seg.stored_on_node == self.node_id {
+                let key = wal_key(topic, partition, seg.generation);
+                let actual = self.bucket.get_topic_size_blocking(&key);
+                self.update_tracked_if_smaller(&key, actual).await;
+                seg.start_offset + actual
+            } else {
+                seg.end_offset
+            };
+            history_actual_ends.push(end);
+        }
+
         // Check history segments
         for (i, seg) in state.history.iter().enumerate() {
             // Adjust the logical start of this segment if the previous segment (on this node) actually extended further.
-            let mut corrected_start = seg.start_offset;
             let mut prev_actual_end: Option<u64> = None;
             if i > 0 {
-                let prev = &state.history[i - 1];
-                if prev.stored_on_node == self.node_id {
-                    let prev_key = wal_key(topic, partition, prev.generation);
-                    let prev_len = self.active_bytes_for_key(&prev_key).await;
-                    let end = prev.start_offset + prev_len;
-                    prev_actual_end = Some(end);
-                    if end > corrected_start {
-                        corrected_start = end;
-                    }
-                }
+                prev_actual_end = Some(history_actual_ends[i - 1]);
             }
 
             // Compute this segment's actual end if we have local bytes; otherwise fall back to metadata.
-            let mut actual_end = seg.end_offset;
-            if seg.stored_on_node == self.node_id {
-                let seg_key = wal_key(topic, partition, seg.generation);
-                let seg_len = self.active_bytes_for_key(&seg_key).await;
-                actual_end = corrected_start + seg_len;
+            let seg_len = if seg.stored_on_node == self.node_id {
+                history_actual_ends[i].saturating_sub(seg.start_offset)
+            } else {
+                seg.end_offset.saturating_sub(seg.start_offset)
+            };
+            let actual_end = seg.start_offset + seg_len;
+            let corrected_start = seg
+                .start_offset
+                .max(prev_actual_end.unwrap_or(0));
+
+            // If the previous segment completely covers this one, skip it.
+            if corrected_start >= actual_end {
+                continue;
+            }
+
+            // If the previous segment actually extends into this one's metadata start, redirect before the normal range check.
+            if let Some(prev_end) = prev_actual_end {
+                if req_offset < prev_end && req_offset >= state.history[i - 1].start_offset {
+                    tracing::info!(
+                        "Gap Fix (History pre-range): req_offset={} < prev_actual_end={} (prev_gen={}, start={}, meta_end={})",
+                        req_offset,
+                        prev_end,
+                        state.history[i - 1].generation,
+                        state.history[i - 1].start_offset,
+                        state.history[i - 1].end_offset
+                    );
+                    let local_offset = req_offset - state.history[i - 1].start_offset;
+                    return self
+                        .read_historical_segment(
+                            topic,
+                            partition,
+                            &state,
+                            &state.history[i - 1],
+                            local_offset,
+                            max_bytes,
+                        )
+                        .await;
+                }
             }
 
             if req_offset >= corrected_start && req_offset < actual_end {
-                // Gap Fix: Check if the *previous* segment actually contains this offset
-                if let Some(prev_end) = prev_actual_end {
-                    if req_offset < prev_end {
-                        tracing::info!("Gap Fix (History): req_offset={} falls in gap of prev_gen={} (start={}, meta_end={}, actual_end={}). Redirecting.", 
-                            req_offset, state.history[i - 1].generation, state.history[i - 1].start_offset, state.history[i - 1].end_offset, prev_end);
-                        let local_offset = req_offset - state.history[i - 1].start_offset;
-                        return self
-                            .read_historical_segment(
-                                topic,
-                                partition,
-                                &state,
-                                &state.history[i - 1],
-                                local_offset,
-                                max_bytes,
-                            )
-                            .await;
-                    }
-                }
-
                 let local_offset = req_offset - corrected_start;
                 return self
                     .read_historical_segment(topic, partition, &state, seg, local_offset, max_bytes)
@@ -276,24 +294,27 @@ impl NodeController {
 
         let head_meta_end = state.history.last().map(|s| s.end_offset).unwrap_or(0);
         let last_actual_end = if let Some(last_seg) = state.history.last() {
-            // If the previous segment (on this node) actually extended further, treat that as the true start.
-            let mut corrected_start = last_seg.start_offset;
-            if state.history.len() >= 2 {
-                let prev = &state.history[state.history.len() - 2];
-                if prev.stored_on_node == self.node_id {
+            if last_seg.stored_on_node == self.node_id {
+                let key = wal_key(topic, partition, last_seg.generation);
+                let last_len = self.bucket.get_topic_size_blocking(&key);
+                self.update_tracked_if_smaller(&key, last_len).await;
+                let mut end = last_seg.start_offset + last_len;
+                if state.history.len() >= 2 {
+                    let prev = &state.history[state.history.len() - 2];
                     let prev_key = wal_key(topic, partition, prev.generation);
-                    let prev_len = self.active_bytes_for_key(&prev_key).await;
+                    let prev_len = if prev.stored_on_node == self.node_id {
+                        let len = self.bucket.get_topic_size_blocking(&prev_key);
+                        self.update_tracked_if_smaller(&prev_key, len).await;
+                        len
+                    } else {
+                        prev.end_offset.saturating_sub(prev.start_offset)
+                    };
                     let prev_end = prev.start_offset + prev_len;
-                    if prev_end > corrected_start {
-                        corrected_start = prev_end;
+                    if prev_end > end {
+                        end = prev_end;
                     }
                 }
-            }
-
-            if last_seg.stored_on_node == self.node_id {
-                let last_key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.active_bytes_for_key(&last_key).await;
-                Some(corrected_start + last_len)
+                Some(end)
             } else {
                 None
             }
@@ -587,21 +608,22 @@ impl NodeController {
         let head_start = if let Some(last_seg) = state.history.last() {
             if last_seg.stored_on_node == self.node_id {
                 let last_key = wal_key(topic, partition, last_seg.generation);
-                let last_len = self.active_bytes_for_key(&last_key).await;
+                let last_len = self.bucket.get_topic_size_blocking(&last_key);
+                self.update_tracked_if_smaller(&last_key, last_len).await;
                 let mut corrected_start = last_seg.start_offset;
+                let mut actual_end = last_seg.start_offset + last_len;
                 if state.history.len() >= 2 {
                     let prev = &state.history[state.history.len() - 2];
                     if prev.stored_on_node == self.node_id {
                         let prev_key = wal_key(topic, partition, prev.generation);
-                        let prev_len = self.active_bytes_for_key(&prev_key).await;
+                        let prev_len = self.bucket.get_topic_size_blocking(&prev_key);
+                        self.update_tracked_if_smaller(&prev_key, prev_len).await;
                         let prev_end = prev.start_offset + prev_len;
-                        if prev_end > corrected_start {
-                            corrected_start = prev_end;
-                        }
+                        corrected_start = corrected_start.max(prev_end);
+                        actual_end = actual_end.max(prev_end);
                     }
                 }
 
-                let actual_end = corrected_start + last_len;
                 actual_end.max(head_start_meta)
             } else {
                 head_start_meta
@@ -621,11 +643,11 @@ impl NodeController {
         };
         // Trust the WAL engine as the source of truth; the tracked map can drift if rollovers race with writes.
         let actual = self.bucket.get_topic_size_blocking(wal_key);
-        if actual > 0 {
-            actual
-        } else {
-            tracked
+        let best = actual.max(tracked);
+        if actual > tracked {
+            self.update_tracked_if_smaller(wal_key, actual).await;
         }
+        best
     }
 
     async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
@@ -633,6 +655,14 @@ impl NodeController {
         let entry = guard.entry(wal_key.to_string()).or_insert(0);
         *entry += bytes;
         *entry
+    }
+
+    async fn update_tracked_if_smaller(&self, wal_key: &str, bytes: u64) {
+        let mut guard = self.offsets.write().await;
+        let entry = guard.entry(wal_key.to_string()).or_insert(0);
+        if *entry < bytes {
+            *entry = bytes;
+        }
     }
 
     async fn append_with_retry(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
