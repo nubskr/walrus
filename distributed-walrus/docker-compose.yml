@@ -22,7 +22,7 @@ services:
       - "9091"
     environment:
       - RUST_LOG=info
-      - WALRUS_DISABLE_IO_URING=0
+      - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000
       - WALRUS_RETENTION_GENERATIONS=0
@@ -61,7 +61,7 @@ services:
       - "node1:6001"
     environment:
       - RUST_LOG=info
-      - WALRUS_DISABLE_IO_URING=0
+      - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000
       - WALRUS_RETENTION_GENERATIONS=0
@@ -100,7 +100,7 @@ services:
       - "node1:6001"
     environment:
       - RUST_LOG=info
-      - WALRUS_DISABLE_IO_URING=0
+      - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000
       - WALRUS_RETENTION_GENERATIONS=0
@@ -141,7 +141,7 @@ services:
       - "node1:6001"
     environment:
       - RUST_LOG=info
-      - WALRUS_DISABLE_IO_URING=0
+      - WALRUS_DISABLE_IO_URING=1
     privileged: true
     security_opt:
       - seccomp:unconfined
