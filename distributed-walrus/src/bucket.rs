@@ -133,17 +133,21 @@ impl BucketService {
     ) -> Result<Vec<Entry>> {
         let engine = self.engine.clone();
         let key = wal_key.to_string();
-        
+
         let entries = tokio::task::spawn_blocking(move || {
             engine.batch_read_for_topic(&key, max_bytes, false, Some(start_offset))
         })
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
-        
+
         if entries.is_empty() {
-             tracing::warn!("bucket read returned empty for {} (size request {})", wal_key, max_bytes);
+            tracing::warn!(
+                "bucket read returned empty for {} (size request {})",
+                wal_key,
+                max_bytes
+            );
         }
-        
+
         Ok(entries)
     }
 
@@ -221,7 +225,10 @@ mod tests {
         assert_eq!(entries[0].data, b"hello-world");
 
         bucket.revoke_lease(pid).await;
-        let err = bucket.append(pid, b"after-revoke".to_vec()).await.unwrap_err();
+        let err = bucket
+            .append(pid, b"after-revoke".to_vec())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("NotLeaderForPartition"));
 
         let _ = std::fs::remove_dir_all(path);

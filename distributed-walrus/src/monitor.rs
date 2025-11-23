@@ -65,7 +65,7 @@ impl Monitor {
 
         for (topic, partition, generation) in assignments {
             let wal = wal_key(&topic, partition, generation);
-            
+
             let disk_size = self.controller.bucket.get_topic_size_blocking(&wal);
 
             let logical_head_start = self
@@ -82,8 +82,14 @@ impl Monitor {
 
             // Use the larger of disk vs. logical offsets to decide rollover and record size.
             let size = disk_size.max(logical_size);
-            
-            tracing::info!("Monitor check: {} disk={} logical={} max={}", wal, disk_size, logical_size, max_segment_size());
+
+            tracing::info!(
+                "Monitor check: {} disk={} logical={} max={}",
+                wal,
+                disk_size,
+                logical_size,
+                max_segment_size()
+            );
 
             if size <= max_segment_size() {
                 continue;
