@@ -296,7 +296,12 @@ async fn encode_fetch_response(
                 continue;
             }
             let read_res = controller
-                .route_and_read(&topic, partition as u32, fetch_offset as u64, max_bytes as usize)
+                .route_and_read(
+                    &topic,
+                    partition as u32,
+                    fetch_offset as u64,
+                    max_bytes as usize,
+                )
                 .await;
             match read_res {
                 Ok((data, observed_high_watermark)) => {

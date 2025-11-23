@@ -68,16 +68,13 @@ impl NodeController {
                     return InternalResp::Error("invalid wal_key".into());
                 };
                 match self
-                    .bucket
-                    .read_by_key_from_offset(&wal_key, start_offset, max_bytes)
+                    .read_entries_from_logical_offset(&wal_key, start_offset, max_bytes)
                     .await
                 {
                     Ok(entries) => {
-                        let high_watermark =
-                            self.partition_high_watermark(&topic, partition).await;
-                        let data = entries.into_iter().map(|e| e.data).collect();
+                        let high_watermark = self.partition_high_watermark(&topic, partition).await;
                         InternalResp::ReadResult {
-                            data,
+                            data: entries,
                             high_watermark,
                         }
                     }
@@ -250,9 +247,7 @@ impl NodeController {
                 seg.end_offset.saturating_sub(seg.start_offset)
             };
             let actual_end = seg.start_offset + seg_len;
-            let corrected_start = seg
-                .start_offset
-                .max(prev_actual_end.unwrap_or(0));
+            let corrected_start = seg.start_offset.max(prev_actual_end.unwrap_or(0));
 
             // If the previous segment completely covers this one, skip it.
             if corrected_start >= actual_end {
@@ -326,8 +321,9 @@ impl NodeController {
             // Gap Fix for Head
             if let Some(last_seg) = state.history.last() {
                 if last_seg.stored_on_node == self.node_id {
-                    let actual_end =
-                        last_actual_end.unwrap_or_else(|| last_seg.start_offset + (last_seg.end_offset - last_seg.start_offset));
+                    let actual_end = last_actual_end.unwrap_or_else(|| {
+                        last_seg.start_offset + (last_seg.end_offset - last_seg.start_offset)
+                    });
 
                     if req_offset < actual_end {
                         tracing::info!("Gap Fix (Head): req_offset={} falls in gap of last_gen={} (start={}, meta_end={}, actual_end={}). Redirecting.", 
@@ -344,7 +340,12 @@ impl NodeController {
                             )
                             .await;
                     } else {
-                        tracing::debug!("Gap Fix (Head): req_offset={} NOT in last_gen={} (actual_end={}).", req_offset, last_seg.generation, actual_end);
+                        tracing::debug!(
+                            "Gap Fix (Head): req_offset={} NOT in last_gen={} (actual_end={}).",
+                            req_offset,
+                            last_seg.generation,
+                            actual_end
+                        );
                     }
                 }
             }
@@ -408,11 +409,10 @@ impl NodeController {
         if leader == self.node_id {
             tracing::info!("reading head locally on node {}", self.node_id);
             let entries = self
-                .bucket
-                .read_by_key_from_offset(&wal_key, local_offset, max_bytes)
+                .read_entries_from_logical_offset(&wal_key, local_offset, max_bytes)
                 .await?;
             let watermark = self.partition_high_watermark(topic, partition).await;
-            return Ok((entries.into_iter().map(|e| e.data).collect(), watermark));
+            return Ok((entries, watermark));
         }
 
         let addr = self
@@ -473,21 +473,33 @@ impl NodeController {
                             "forward read to leader {} at {} returned error: {}",
                             leader, addr, e
                         );
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                     Ok(other) => {
                         warn!("unexpected response {:?}", other);
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                     Err(e) => {
                         warn!("failed to decode forward read response: {}", e);
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                 }
             }
             other => {
                 warn!("unexpected response: {:?}", other);
-                Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                Ok((
+                    Vec::new(),
+                    self.partition_high_watermark(topic, partition).await,
+                ))
             }
         }
     }
@@ -515,12 +527,15 @@ impl NodeController {
 
         if segment.stored_on_node == self.node_id {
             let entries = self
-                .bucket
-                .read_by_key_from_offset(&wal_key, local_offset, max_bytes)
+                .read_entries_from_logical_offset(&wal_key, local_offset, max_bytes)
                 .await?;
-            tracing::info!("read_historical_segment local: key={} entries={}", wal_key, entries.len());
+            tracing::info!(
+                "read_historical_segment local: key={} entries={}",
+                wal_key,
+                entries.len()
+            );
             let watermark = self.partition_high_watermark(topic, partition).await;
-            return Ok((entries.into_iter().map(|e| e.data).collect(), watermark));
+            return Ok((entries, watermark));
         }
 
         let addr = self
@@ -581,21 +596,33 @@ impl NodeController {
                             "forward read to node {} at {} returned error: {}",
                             segment.stored_on_node, addr, e
                         );
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                     Ok(other) => {
                         warn!("unexpected response {:?}", other);
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                     Err(e) => {
                         warn!("failed to decode forward read response: {}", e);
-                        Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                        Ok((
+                            Vec::new(),
+                            self.partition_high_watermark(topic, partition).await,
+                        ))
                     }
                 }
             }
             other => {
                 warn!("unexpected response: {:?}", other);
-                Ok((Vec::new(), self.partition_high_watermark(topic, partition).await))
+                Ok((
+                    Vec::new(),
+                    self.partition_high_watermark(topic, partition).await,
+                ))
             }
         }
     }
@@ -634,6 +661,83 @@ impl NodeController {
         let key = wal_key(topic, partition, state.current_generation);
         let active_bytes = self.active_bytes_for_key(&key).await;
         head_start + active_bytes
+    }
+
+    async fn map_logical_to_physical_offset(
+        &self,
+        wal_key: &str,
+        logical_offset: u64,
+    ) -> Result<(u64, usize)> {
+        if logical_offset == 0 {
+            return Ok((0, 0));
+        }
+
+        let total_physical = self.bucket.get_topic_size_blocking(wal_key);
+        let mut physical_cursor = 0u64;
+        let mut logical_cursor = 0u64;
+
+        // Cap per-read window to avoid loading huge logs at once while still progressing.
+        const SCAN_WINDOW: usize = 16 * 1024 * 1024;
+
+        while physical_cursor < total_physical {
+            let remaining = (total_physical - physical_cursor) as usize;
+            let max_bytes = remaining
+                .min(SCAN_WINDOW)
+                .max(Self::ENTRY_OVERHEAD as usize + 1);
+            let entries = self
+                .bucket
+                .read_by_key_from_offset(wal_key, physical_cursor, max_bytes)
+                .await?;
+            if entries.is_empty() {
+                break;
+            }
+
+            for entry in entries {
+                let payload_len = entry.data.len() as u64;
+
+                if logical_offset < logical_cursor + payload_len {
+                    let trim = (logical_offset - logical_cursor) as usize;
+                    return Ok((physical_cursor, trim));
+                }
+
+                logical_cursor += payload_len;
+                physical_cursor += payload_len + Self::ENTRY_OVERHEAD;
+
+                if logical_offset == logical_cursor {
+                    return Ok((physical_cursor, 0));
+                }
+            }
+        }
+
+        Ok((physical_cursor, 0))
+    }
+
+    async fn read_entries_from_logical_offset(
+        &self,
+        wal_key: &str,
+        logical_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let (physical_offset, trim) = self
+            .map_logical_to_physical_offset(wal_key, logical_offset)
+            .await?;
+
+        let mut entries = self
+            .bucket
+            .read_by_key_from_offset(wal_key, physical_offset, max_bytes)
+            .await?;
+
+        if trim > 0 {
+            if let Some(first) = entries.first_mut() {
+                if trim >= first.data.len() {
+                    first.data.clear();
+                } else {
+                    first.data.drain(0..trim);
+                }
+            }
+        }
+
+        Ok(entries.into_iter().map(|e| e.data).collect())
     }
 
     async fn active_bytes_for_key(&self, wal_key: &str) -> u64 {

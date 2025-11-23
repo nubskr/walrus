@@ -164,11 +164,8 @@ impl StateMachineTrait for MetadataStateMachine {
             } => {
                 if let Some(topic) = state.topics.get_mut(&name) {
                     if let Some(part) = topic.partition_states.get_mut(&partition) {
-                        let prev_head_start = part
-                            .history
-                            .last()
-                            .map(|s| s.end_offset)
-                            .unwrap_or(0);
+                        let prev_head_start =
+                            part.history.last().map(|s| s.end_offset).unwrap_or(0);
                         let sealed_end = prev_head_start + sealed_segment_size_bytes;
                         let record = SegmentRecord {
                             generation: part.current_generation,
@@ -191,8 +188,7 @@ impl StateMachineTrait for MetadataStateMachine {
             } => {
                 if let Some(topic) = state.topics.get_mut(&name) {
                     if let Some(part) = topic.partition_states.get_mut(&partition) {
-                        part.history
-                            .retain(|seg| seg.generation > up_to_generation);
+                        part.history.retain(|seg| seg.generation > up_to_generation);
                         return Ok(Bytes::from_static(b"TRIMMED"));
                     }
                 }
