@@ -1933,11 +1933,14 @@ dependencies = [
 name = "walrus-rust"
 version = "0.2.0"
 dependencies = [
+ "bytecheck",
  "io-uring 0.7.11",
  "libc",
  "memmap2",
  "rand 0.8.5",
  "rkyv",
+ "rkyv_derive",
+ "tracing",
 ]
 
 [[package]]
