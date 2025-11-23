@@ -9,9 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-//! Kafka facade: protocol parsing/encoding only. It delegates all stateful work to
-//! `NodeController` (route append/read, metadata, membership). Keep it dumb: decode → call
-//! controller → encode.
+// Kafka facade: protocol parsing/encoding only. It delegates all stateful work to
+// `NodeController` (route append/read, metadata, membership). Keep it dumb: decode → call
+// controller → encode.
 
 use crate::controller::NodeController;
 use crate::kafka::codec::{decode_string_array, KafkaPrimitive, RequestHeader};
@@ -19,9 +19,13 @@ use crate::kafka::protocol::{encode_api_versions_response, encode_topics};
 use crate::metadata::ClusterState;
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
-type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-type HandlerFn =
-    fn(&mut BytesMut, &mut Cursor<&[u8]>, &Arc<NodeController>, u16) -> HandlerFuture<'_>;
+type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<BytesMut>> + Send + 'a>>;
+type HandlerFn = for<'a, 'b> fn(
+    BytesMut,
+    &'a mut Cursor<&'b [u8]>,
+    Arc<NodeController>,
+    u16,
+) -> HandlerFuture<'a>;
 
 pub async fn run_server(port: u16, controller: Arc<NodeController>) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -105,7 +109,7 @@ async fn handle_request(
     let Some(handler) = handler_for(header.api_key) else {
         return Err(anyhow!("unsupported Kafka API key {}", header.api_key));
     };
-    handler(&mut res, buf, controller, advertised_port).await?;
+    let res = handler(res, buf, controller.clone(), advertised_port).await?;
 
     Ok(res.to_vec())
 }
@@ -127,101 +131,116 @@ fn handler_for(api_key: i16) -> Option<HandlerFn> {
     }
 }
 
-fn handle_metadata(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_metadata<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
         let topics = decode_string_array(buf)?;
         encode_metadata_response(
-            res,
+            &mut res,
             controller.metadata.snapshot_state(),
             controller.node_id as i32,
             advertised_port,
             topics,
         );
-        Ok(())
+        Ok(res)
     })
 }
 
-fn handle_internal_state(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_internal_state<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
         let topics = decode_string_array(buf)?;
-        encode_internal_state_response(res, controller.metadata.snapshot_state(), topics);
-        Ok(())
+        encode_internal_state_response(&mut res, controller.metadata.snapshot_state(), topics);
+        Ok(res)
     })
 }
 
-fn handle_api_versions(
-    res: &mut BytesMut,
-    _buf: &mut Cursor<&[u8]>,
-    _controller: &Arc<NodeController>,
+fn handle_api_versions<'a, 'b>(
+    mut res: BytesMut,
+    _buf: &'a mut Cursor<&'b [u8]>,
+    _controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
-        encode_api_versions_response(res);
-        Ok(())
+        encode_api_versions_response(&mut res);
+        Ok(res)
     })
 }
 
-fn handle_fetch(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_fetch<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
-    Box::pin(async move { encode_fetch_response(res, buf, controller).await })
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        encode_fetch_response(&mut res, buf, &controller).await?;
+        Ok(res)
+    })
 }
 
-fn handle_produce(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_produce<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
-    Box::pin(async move { encode_produce_response(res, buf, controller).await })
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        encode_produce_response(&mut res, buf, &controller).await?;
+        Ok(res)
+    })
 }
 
-fn handle_create_topics(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_create_topics<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
-    Box::pin(async move { encode_create_topics_response(res, buf, controller).await })
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        encode_create_topics_response(&mut res, buf, &controller).await?;
+        Ok(res)
+    })
 }
 
-fn handle_membership(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_membership<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
-    Box::pin(async move { encode_membership_response(res, buf, controller).await })
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        encode_membership_response(&mut res, buf, &controller).await?;
+        Ok(res)
+    })
 }
 
-fn handle_test_control(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_test_control<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
-    Box::pin(async move { encode_test_control_response(res, buf, controller).await })
+) -> HandlerFuture<'a> {
+    Box::pin(async move {
+        encode_test_control_response(&mut res, buf, &controller).await?;
+        Ok(res)
+    })
 }
 
-fn handle_force_monitor_error(
-    res: &mut BytesMut,
-    buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_force_monitor_error<'a, 'b>(
+    mut res: BytesMut,
+    buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
         let flag = i16::decode(buf)?;
         let resp = controller
@@ -231,44 +250,47 @@ fn handle_force_monitor_error(
             .await;
         let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
         res.put_i16(code | (flag != 0) as i16);
-        Ok(())
+        Ok(res)
     })
 }
 
-fn handle_force_dir_error(
-    res: &mut BytesMut,
-    _buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_force_dir_error<'a, 'b>(
+    mut res: BytesMut,
+    _buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
-        let resp = controller
-            .handle_rpc(crate::rpc::InternalOp::TestControl(
-                crate::rpc::TestControl::ForceDirSizeError,
-            ))
-            .await;
-        let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
-        res.put_i16(code);
-        Ok(())
+        run_simple_test_control(&mut res, &controller, crate::rpc::TestControl::ForceDirSizeError)
+            .await?;
+        Ok(res)
     })
 }
 
-fn handle_force_gc_error(
-    res: &mut BytesMut,
-    _buf: &mut Cursor<&[u8]>,
-    controller: &Arc<NodeController>,
+fn handle_force_gc_error<'a, 'b>(
+    mut res: BytesMut,
+    _buf: &'a mut Cursor<&'b [u8]>,
+    controller: Arc<NodeController>,
     _advertised_port: u16,
-) -> HandlerFuture<'_> {
+) -> HandlerFuture<'a> {
     Box::pin(async move {
-        let resp = controller
-            .handle_rpc(crate::rpc::InternalOp::TestControl(
-                crate::rpc::TestControl::ForceGcError,
-            ))
-            .await;
-        let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
-        res.put_i16(code);
-        Ok(())
+        run_simple_test_control(&mut res, &controller, crate::rpc::TestControl::ForceGcError)
+            .await?;
+        Ok(res)
     })
+}
+
+async fn run_simple_test_control(
+    res: &mut BytesMut,
+    controller: &Arc<NodeController>,
+    cmd: crate::rpc::TestControl,
+) -> Result<()> {
+    let resp = controller
+        .handle_rpc(crate::rpc::InternalOp::TestControl(cmd))
+        .await;
+    let code = matches!(resp, crate::rpc::InternalResp::Error(_)) as i16;
+    res.put_i16(code);
+    Ok(())
 }
 
 fn encode_metadata_response(

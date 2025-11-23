@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use crate::kafka::codec::KafkaPrimitive;
 use crate::metadata::{ClusterState, PartitionState};

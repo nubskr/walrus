@@ -4,22 +4,21 @@
 //! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
 
 use crate::bucket::BucketService;
-use crate::metadata::{MetadataStateMachine, NodeId, PartitionState, SegmentRecord};
+use crate::metadata::{MetadataStateMachine, NodeId, SegmentRecord};
 use crate::rpc::TestControl;
 use crate::rpc::{InternalOp, InternalResp};
-use anyhow::{anyhow, bail, Result};
-use bytes::Bytes;
-use octopii::rpc::{RequestPayload, ResponsePayload};
+use anyhow::{anyhow, Result};
 use octopii::OctopiiNode;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio::time::timeout;
-use tracing::warn;
-
+mod fetch;
+mod internal;
 mod logical_wal;
+mod produce;
+mod topics;
 mod types;
 use logical_wal::LogicalWal;
 pub use types::{parse_wal_key, wal_key, TopicPartition, WalKeyParts};
@@ -61,48 +60,12 @@ impl NodeController {
     pub async fn handle_rpc(&self, op: InternalOp) -> InternalResp {
         tracing::info!("handle_rpc: processing op {:?}", op);
         match op {
-            InternalOp::ForwardAppend { wal_key, data } => {
-                self.sync_leases_now().await;
-                let data_len = data.len() as u64;
-                match self.append_with_retry(&wal_key, data).await {
-                    Ok(_) => {
-                        tracing::info!("handle_rpc: append success for {}", wal_key);
-                        self.record_append(&wal_key, data_len).await;
-                        InternalResp::Ok
-                    }
-                    Err(e) => {
-                        tracing::error!("handle_rpc: append failed for {}: {}", wal_key, e);
-                        InternalResp::Error(e.to_string())
-                    }
-                }
-            }
+            InternalOp::ForwardAppend { wal_key, data } => self.forward_append(wal_key, data).await,
             InternalOp::ForwardRead {
                 wal_key,
                 start_offset,
                 max_bytes,
-            } => {
-                if self.test_fail_forward_read.load(Ordering::Relaxed) {
-                    return InternalResp::Error("forced forward read failure".into());
-                }
-                let Some(parts) = parse_wal_key(&wal_key) else {
-                    return InternalResp::Error("invalid wal_key".into());
-                };
-                let tp = TopicPartition::new(&parts.topic, parts.partition);
-                match self.logical_wal(&wal_key)
-                    .read(start_offset, max_bytes)
-                    .await
-                {
-                    Ok(entries) => {
-                        let high_watermark =
-                            self.partition_high_watermark(tp.topic, tp.partition).await;
-                        InternalResp::ReadResult {
-                            data: entries,
-                            high_watermark,
-                        }
-                    }
-                    Err(e) => InternalResp::Error(e.to_string()),
-                }
-            }
+            } => self.forward_read(&wal_key, start_offset, max_bytes).await,
             InternalOp::JoinCluster { node_id, addr } => {
                 self.handle_join_cluster(node_id, addr).await
             }
@@ -142,93 +105,6 @@ impl NodeController {
         }
     }
 
-    pub async fn create_topic(&self, name: String, partitions: u32) -> Result<()> {
-        if !self.raft.is_leader().await {
-            anyhow::bail!("not leader");
-        }
-        let cmd = crate::metadata::MetadataCmd::CreateTopic {
-            name,
-            partitions,
-            initial_leader: self.node_id,
-        };
-        self.raft
-            .propose(bincode::serialize(&cmd)?)
-            .await
-            .map(|_| ())
-            .map_err(|e| anyhow!(e))
-    }
-
-    pub async fn remove_node_from_membership(&self, removed: NodeId) -> Result<()> {
-        if !self.raft.is_leader().await {
-            bail!("not leader");
-        }
-        // Raft membership changes are not exposed here; we still reassign leaders away from the removed node.
-        self.metadata.reassign_leader(removed, self.node_id);
-        Ok(())
-    }
-
-    pub async fn route_and_append(&self, topic: &str, partition: u32, data: Vec<u8>) -> Result<()> {
-        let tp = TopicPartition::new(topic, partition);
-        let (leader, generation) = self
-            .metadata
-            .get_partition_leader(topic, partition)
-            .ok_or_else(|| anyhow!("unknown topic/partition"))?;
-        let key = tp.wal_key(generation);
-        tracing::info!(
-            "route_and_append topic={} partition={} leader={} gen={} key={}",
-            topic,
-            partition,
-            leader,
-            generation,
-            key
-        );
-        if leader == self.node_id {
-            tracing::info!("writing locally on node {}", self.node_id);
-            // Ensure local bucket has the latest leases from metadata before appending.
-            self.sync_leases_now().await;
-            let bytes = data.len() as u64;
-            self.append_with_retry(&key, data).await?;
-            self.record_append(&key, bytes).await;
-        } else {
-            let addr = self
-                .raft
-                .peer_addr_for(leader)
-                .await
-                .ok_or_else(|| anyhow!("missing peer address for {}", leader))?;
-            tracing::info!("forwarding to leader {} at {}", leader, addr);
-                let op = InternalOp::ForwardAppend { wal_key: key, data };
-                let payload = Bytes::from(bincode::serialize(&op)?);
-                let resp = self
-                    .raft
-                    .rpc_handler()
-                    .request(
-                        addr,
-                        RequestPayload::Custom {
-                            operation: "Forward".into(),
-                            data: payload,
-                        },
-                        self.config.forward_timeout,
-                    )
-                .await?;
-                match resp.payload {
-                    ResponsePayload::CustomResponse { data, .. } => {
-                        match bincode::deserialize::<InternalResp>(&data) {
-                        Ok(InternalResp::Ok) => {}
-                        Ok(InternalResp::Error(e)) => return Err(anyhow!(e)),
-                        Ok(other) => {
-                            warn!("unexpected response {:?}", other);
-                        }
-                        Err(e) => return Err(anyhow!(e)),
-                    }
-                }
-                other => {
-                    return Err(anyhow!("unexpected response: {:?}", other));
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub async fn route_and_read(
         &self,
         topic: &str,
@@ -236,46 +112,8 @@ impl NodeController {
         req_offset: u64,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let tp = TopicPartition::new(topic, partition);
-        let state = self
-            .metadata
-            .get_partition_state(topic, partition)
-            .ok_or_else(|| anyhow!("unknown topic/partition"))?;
-
-        let mut history_end = 0u64;
-        for seg in &state.history {
-            let seg_len = self.segment_logical_len(tp, seg).await;
-            let seg_end = seg.start_offset + seg_len;
-            history_end = history_end.max(seg_end);
-
-            if req_offset >= seg.start_offset && req_offset < seg_end {
-                let local_offset = req_offset - seg.start_offset;
-                return self
-                    .read_historical_segment(
-                        tp,
-                        &state,
-                        seg,
-                        local_offset,
-                        max_bytes,
-                    )
-                    .await;
-            }
-        }
-
-        if req_offset < history_end {
-            let watermark = self.partition_high_watermark(tp.topic, tp.partition).await;
-            return Ok((Vec::new(), watermark));
-        }
-
-        let local_offset = req_offset - history_end;
-        self.read_active_head(
-            tp,
-            &state,
-            local_offset,
-            max_bytes,
-            history_end,
-        )
-        .await
+        self.handle_fetch(topic, partition, req_offset, max_bytes)
+            .await
     }
 
     pub async fn sync_leases_now(&self) {
@@ -298,161 +136,6 @@ impl NodeController {
         loop {
             interval.tick().await;
             self.sync_leases_now().await;
-        }
-    }
-
-    async fn read_active_head(
-        &self,
-        tp: TopicPartition<'_>,
-        state: &PartitionState,
-        local_offset: u64,
-        max_bytes: usize,
-        head_start: u64,
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let wal_key = tp.wal_key(state.current_generation);
-        tracing::info!(
-            "route_and_read head topic={} partition={} leader={} gen={} key={} offset={}",
-            tp.topic,
-            tp.partition,
-            state.leader_node,
-            state.current_generation,
-            wal_key,
-            local_offset
-        );
-
-        if state.leader_node == self.node_id {
-            return self
-                .read_local_logical(&wal_key, local_offset, max_bytes, head_start)
-                .await;
-        }
-
-        self.forward_read_from(
-            state.leader_node,
-            &wal_key,
-            local_offset,
-            max_bytes,
-            tp,
-        )
-        .await
-    }
-
-    async fn read_historical_segment(
-        &self,
-        tp: TopicPartition<'_>,
-        segment: &SegmentRecord,
-        local_offset: u64,
-        max_bytes: usize,
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let wal_key = tp.wal_key(segment.generation);
-        tracing::info!(
-            "route_and_read history topic={} partition={} gen={} node={} key={} offset={} end_offset={}",
-            tp.topic,
-            tp.partition,
-            segment.generation,
-            segment.stored_on_node,
-            wal_key,
-            local_offset,
-            segment.end_offset
-        );
-
-        if segment.stored_on_node == self.node_id {
-            return self
-                .read_local_logical(&wal_key, local_offset, max_bytes, segment.start_offset)
-                .await;
-        }
-
-        self.forward_read_from(
-            segment.stored_on_node,
-            &wal_key,
-            local_offset,
-            max_bytes,
-            tp,
-        )
-        .await
-    }
-
-    async fn forward_read_from(
-        &self,
-        target: NodeId,
-        wal_key: &str,
-        start_offset: u64,
-        max_bytes: usize,
-        tp: TopicPartition<'_>,
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let Some(addr) = self.raft.peer_addr_for(target).await else {
-            bail!("missing peer address for {}", target);
-        };
-
-        let op = InternalOp::ForwardRead {
-            wal_key: wal_key.to_string(),
-            start_offset,
-            max_bytes,
-        };
-        let payload = Bytes::from(bincode::serialize(&op)?);
-        let forwarded = timeout(
-            self.config.forward_timeout,
-            self.raft.rpc_handler().request(
-                addr,
-                RequestPayload::Custom {
-                    operation: "Forward".into(),
-                    data: payload,
-                },
-                self.config.forward_timeout,
-            ),
-        )
-        .await;
-        let fallback_hw = self
-            .partition_high_watermark(tp.topic, tp.partition)
-            .await;
-
-        let resp = match forwarded {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                warn!(
-                    "forward read to node {} at {} failed: {}",
-                    target, addr, e
-                );
-                return Ok((Vec::new(), fallback_hw));
-            }
-            Err(_) => {
-                warn!(
-                    "forward read to node {} at {} timed out after {:?}",
-                    target,
-                    addr,
-                    self.config.forward_timeout
-                );
-                return Ok((Vec::new(), fallback_hw));
-            }
-        };
-
-        match resp.payload {
-            ResponsePayload::CustomResponse { data, .. } => {
-                match bincode::deserialize::<InternalResp>(&data) {
-                    Ok(InternalResp::ReadResult {
-                        data,
-                        high_watermark,
-                    }) => Ok((data, high_watermark)),
-                    Ok(InternalResp::Error(e)) => {
-                        warn!(
-                            "forward read to node {} at {} returned error: {}",
-                            target, addr, e
-                        );
-                        Ok((Vec::new(), fallback_hw))
-                    }
-                    Ok(other) => {
-                        warn!("unexpected response {:?}", other);
-                        Ok((Vec::new(), fallback_hw))
-                    }
-                    Err(e) => {
-                        warn!("failed to decode forward read response: {}", e);
-                        Ok((Vec::new(), fallback_hw))
-                    }
-                }
-            }
-            other => {
-                warn!("unexpected response: {:?}", other);
-                Ok((Vec::new(), fallback_hw))
-            }
         }
     }
 
