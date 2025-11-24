@@ -12,3 +12,4 @@ debug
 node*.log
 *.pyc
 .pytest_cache
+test_data_rollover
