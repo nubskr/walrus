@@ -9,109 +9,64 @@ pub type TopicName = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterState {
-    pub topics: HashMap<TopicName, TopicInfo>,
+    pub topics: HashMap<TopicName, TopicState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicInfo {
-    pub partitions: u32,
-    pub partition_states: HashMap<u32, PartitionState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionState {
-    pub current_generation: u64,
+pub struct TopicState {
+    pub current_segment: u64,
     pub leader_node: NodeId,
+    /// Cumulative number of entries in all sealed segments
     #[serde(default)]
-    pub history: Vec<SegmentRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SegmentRecord {
-    pub generation: u64,
-    pub stored_on_node: NodeId,
-    pub start_offset: u64,
-    pub end_offset: u64,
+    pub last_sealed_entry_offset: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MetadataCmd {
     CreateTopic {
         name: String,
-        partitions: u32,
         initial_leader: NodeId,
     },
-    RolloverPartition {
+    RolloverTopic {
         name: String,
-        partition: u32,
         new_leader: NodeId,
-        sealed_segment_size_bytes: u64,
+        sealed_segment_entry_count: u64,
     },
 }
 
 #[derive(Clone)]
-pub struct MetadataStateMachine {
+pub struct Metadata {
     state: Arc<RwLock<ClusterState>>,
 }
 
-impl MetadataStateMachine {
+impl Metadata {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(ClusterState::default())),
         }
     }
 
-    pub fn snapshot_state(&self) -> ClusterState {
-        self.state
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| ClusterState::default())
-    }
-
-    pub fn get_partition_leader(&self, topic: &str, partition: u32) -> Option<(NodeId, u64)> {
+    pub fn get_topic_state(&self, topic: &str) -> Option<TopicState> {
         let guard = self.state.read().ok()?;
-        let topic_info = guard.topics.get(topic)?;
-        let part = topic_info.partition_states.get(&partition)?;
-        Some((part.leader_node, part.current_generation))
+        guard.topics.get(topic).cloned()
     }
 
-    pub fn get_partition_state(&self, topic: &str, partition: u32) -> Option<PartitionState> {
-        let guard = self.state.read().ok()?;
-        let topic_info = guard.topics.get(topic)?;
-        topic_info.partition_states.get(&partition).cloned()
-    }
-
-    pub fn assignments_for_node(&self, node_id: NodeId) -> Vec<(String, u32, u64)> {
+    pub fn owned_topics(&self, node_id: NodeId) -> Vec<(String, u64)> {
         let guard = match self.state.read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
         let mut out = Vec::new();
-        for (topic, info) in guard.topics.iter() {
-            for (part_id, state) in info.partition_states.iter() {
-                if state.leader_node == node_id {
-                    out.push((topic.clone(), *part_id, state.current_generation));
-                }
+        for (topic, state) in guard.topics.iter() {
+            if state.leader_node == node_id {
+                out.push((topic.clone(), state.current_segment));
             }
         }
         out
     }
-
-    /// If a node is removed from membership, reassign any leaderships it held to the provided replacement.
-    pub fn reassign_leader(&self, removed: NodeId, replacement: NodeId) {
-        if let Ok(mut guard) = self.state.write() {
-            for (_topic, info) in guard.topics.iter_mut() {
-                for (_id, part) in info.partition_states.iter_mut() {
-                    if part.leader_node == removed {
-                        part.leader_node = replacement;
-                    }
-                }
-            }
-        }
-    }
 }
 
-impl StateMachineTrait for MetadataStateMachine {
+impl StateMachineTrait for Metadata {
     fn apply(&self, command: &[u8]) -> Result<Bytes, String> {
         let cmd: MetadataCmd =
             bincode::deserialize(command).map_err(|e| format!("decode cmd: {e}"))?;
@@ -123,58 +78,34 @@ impl StateMachineTrait for MetadataStateMachine {
         match cmd {
             MetadataCmd::CreateTopic {
                 name,
-                partitions,
                 initial_leader,
             } => {
                 if state.topics.contains_key(&name) {
                     return Ok(Bytes::from_static(b"EXISTS"));
                 }
 
-                let mut partition_states = HashMap::new();
-                for id in 0..partitions {
-                    partition_states.insert(
-                        id,
-                        PartitionState {
-                            current_generation: 1,
-                            leader_node: initial_leader,
-                            history: Vec::new(),
-                        },
-                    );
-                }
-
                 state.topics.insert(
                     name,
-                    TopicInfo {
-                        partitions,
-                        partition_states,
+                    TopicState {
+                        current_segment: 1,
+                        leader_node: initial_leader,
+                        last_sealed_entry_offset: 0,
                     },
                 );
                 Ok(Bytes::from_static(b"CREATED"))
             }
-            MetadataCmd::RolloverPartition {
+            MetadataCmd::RolloverTopic {
                 name,
-                partition,
                 new_leader,
-                sealed_segment_size_bytes,
+                sealed_segment_entry_count,
             } => {
-                if let Some(topic) = state.topics.get_mut(&name) {
-                    if let Some(part) = topic.partition_states.get_mut(&partition) {
-                        let prev_head_start =
-                            part.history.last().map(|s| s.end_offset).unwrap_or(0);
-                        let sealed_end = prev_head_start + sealed_segment_size_bytes;
-                        let record = SegmentRecord {
-                            generation: part.current_generation,
-                            stored_on_node: part.leader_node,
-                            start_offset: prev_head_start,
-                            end_offset: sealed_end,
-                        };
-                        part.history.push(record);
-                        part.current_generation += 1;
-                        part.leader_node = new_leader;
-                        return Ok(Bytes::from_static(b"ROLLED"));
-                    }
+                if let Some(topic_state) = state.topics.get_mut(&name) {
+                    topic_state.last_sealed_entry_offset += sealed_segment_entry_count;
+                    topic_state.current_segment += 1;
+                    topic_state.leader_node = new_leader;
+                    return Ok(Bytes::from_static(b"ROLLED"));
                 }
-                Err("Topic or partition not found".into())
+                Err("Topic not found".into())
             }
         }
     }

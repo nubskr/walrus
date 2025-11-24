@@ -1,25 +1,25 @@
-//! BucketService: thin Walrus wrapper that enforces leases (who may write), handles per-key
-//! mutexes for concurrent writers, and exposes read/append by partition id or raw wal key.
+//! Storage: thin Walrus wrapper that enforces leases (who may write), handles per-key
+//! mutexes for concurrent writers, and exposes read/append by wal key.
 
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
-use walrus_rust::{Entry, Walrus};
+use tracing::warn;
+use walrus_rust::Walrus;
 
 pub const DATA_NAMESPACE: &str = "data_plane";
 
 /// Wraps Walrus with fencing/lease awareness.
-pub struct BucketService {
+pub struct Storage {
     engine: Arc<Walrus>,
     active_leases: RwLock<HashSet<String>>,
     write_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
-impl BucketService {
-    /// Construct a new bucket service rooted at the provided storage directory.
+impl Storage {
+    /// Construct a new storage instance rooted at the provided storage directory.
     pub async fn new(storage_path: PathBuf) -> Result<Self> {
         if let Some(parent) = storage_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -42,23 +42,6 @@ impl BucketService {
     }
 
     pub async fn append_by_key(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
-        self.append_raw(wal_key, data).await
-    }
-
-    pub async fn read_by_key(&self, wal_key: &str, max_bytes: usize) -> Result<Vec<Entry>> {
-        self.read_raw(wal_key, max_bytes, None).await
-    }
-
-    pub async fn read_by_key_from_offset(
-        &self,
-        wal_key: &str,
-        start_offset: u64,
-        max_bytes: usize,
-    ) -> Result<Vec<Entry>> {
-        self.read_raw(wal_key, max_bytes, Some(start_offset)).await
-    }
-
-    async fn append_raw(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
         let _guard = BucketGuard::lock(self, wal_key).await?;
         let engine = self.engine.clone();
         let key = wal_key.to_string();
@@ -67,33 +50,7 @@ impl BucketService {
         Ok(())
     }
 
-    async fn read_raw(
-        &self,
-        wal_key: &str,
-        max_bytes: usize,
-        start_offset: Option<u64>,
-    ) -> Result<Vec<Entry>> {
-        let engine = self.engine.clone();
-        let key = wal_key.to_string();
-
-        let entries = tokio::task::spawn_blocking(move || {
-            engine.batch_read_for_topic(&key, max_bytes, false, start_offset)
-        })
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
-
-        if entries.is_empty() && start_offset.is_some() {
-            tracing::warn!(
-                "bucket read returned empty for {} (size request {})",
-                wal_key,
-                max_bytes
-            );
-        }
-
-        Ok(entries)
-    }
-
-    pub async fn sync_leases(&self, expected: &HashSet<String>) {
+    pub async fn update_leases(&self, expected: &HashSet<String>) {
         let mut leases = self.active_leases.write().await;
         leases.retain(|key| expected.contains(key));
         for key in expected.iter() {
@@ -112,17 +69,6 @@ impl BucketService {
             .clone()
     }
 
-    async fn grant_key(&self, key: String) {
-        info!("Granting lease for {}", key);
-        let mut leases = self.active_leases.write().await;
-        leases.insert(key);
-    }
-
-    async fn revoke_key(&self, key: String) {
-        info!("Revoking lease for {}", key);
-        let mut leases = self.active_leases.write().await;
-        leases.remove(&key);
-    }
 
     pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64 {
         self.engine.get_topic_size(wal_key)
@@ -131,22 +77,22 @@ impl BucketService {
 
 struct BucketGuard<'a> {
     _lock: tokio::sync::OwnedMutexGuard<()>,
-    _bucket: &'a BucketService,
+    _storage: &'a Storage,
 }
 
 impl<'a> BucketGuard<'a> {
-    async fn lock(bucket: &'a BucketService, wal_key: &str) -> Result<Self> {
-        bucket.ensure_lease(wal_key).await?;
-        let lock = bucket.lock_for_key(wal_key).await;
+    async fn lock(storage: &'a Storage, wal_key: &str) -> Result<Self> {
+        storage.ensure_lease(wal_key).await?;
+        let lock = storage.lock_for_key(wal_key).await;
         let guard = lock.lock_owned().await;
         Ok(Self {
             _lock: guard,
-            _bucket: bucket,
+            _storage: storage,
         })
     }
 }
 
-impl BucketService {
+impl Storage {
     async fn ensure_lease(&self, wal_key: &str) -> Result<()> {
         let leases = self.active_leases.read().await;
         if !leases.contains(wal_key) {
@@ -174,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn leases_gate_io() {
         let path = temp_path("leases");
-        let bucket = BucketService::new(path.clone()).await.expect("bucket init");
+        let bucket = Storage::new(path.clone()).await.expect("storage init");
         let wal_key = format!("t_{}_p_{}_g_{}", 9, 7, 3);
 
         // Writes without a lease should be rejected.
@@ -186,7 +132,7 @@ mod tests {
 
         let mut leases = HashSet::new();
         leases.insert(wal_key.clone());
-        bucket.sync_leases(&leases).await;
+        bucket.update_leases(&leases).await;
         bucket
             .append_by_key(&wal_key, b"hello-world".to_vec())
             .await
@@ -199,7 +145,7 @@ mod tests {
         assert_eq!(entries[0].data, b"hello-world");
 
         leases.clear();
-        bucket.sync_leases(&leases).await;
+        bucket.update_leases(&leases).await;
         let err = bucket
             .append_by_key(&wal_key, b"after-revoke".to_vec())
             .await
