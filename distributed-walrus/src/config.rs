@@ -35,6 +35,14 @@ pub struct NodeConfig {
     /// Optional file to write logs to. If not specified, logs go to stdout.
     #[arg(long = "log-file")]
     pub log_file: Option<PathBuf>,
+
+    /// Port for the simple client-facing TCP listener.
+    #[arg(long = "client-port", alias = "port", default_value = "8080")]
+    pub client_port: u16,
+
+    /// Host/interface to bind the client listener on.
+    #[arg(long = "client-host", default_value = "127.0.0.1")]
+    pub client_host: String,
 }
 
 impl NodeConfig {

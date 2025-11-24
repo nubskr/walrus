@@ -1,0 +1,27 @@
+services:
+  node1:
+    environment:
+      - WALRUS_MAX_SEGMENT_ENTRIES=10
+      - WALRUS_MONITOR_CHECK_MS=200
+    ports:
+      - "10091:9091"
+    volumes:
+      - ./test_data_rollover/node1:/data
+
+  node2:
+    environment:
+      - WALRUS_MAX_SEGMENT_ENTRIES=10
+      - WALRUS_MONITOR_CHECK_MS=200
+    ports:
+      - "10092:9092"
+    volumes:
+      - ./test_data_rollover/node2:/data
+
+  node3:
+    environment:
+      - WALRUS_MAX_SEGMENT_ENTRIES=10
+      - WALRUS_MONITOR_CHECK_MS=200
+    ports:
+      - "10093:9093"
+    volumes:
+      - ./test_data_rollover/node3:/data

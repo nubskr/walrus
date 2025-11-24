@@ -10,6 +10,9 @@ pub type TopicName = String;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterState {
     pub topics: HashMap<TopicName, TopicState>,
+    /// Map node id -> advertised Raft/internal RPC address.
+    #[serde(default)]
+    pub nodes: HashMap<NodeId, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +22,12 @@ pub struct TopicState {
     /// Cumulative number of entries in all sealed segments
     #[serde(default)]
     pub last_sealed_entry_offset: u64,
+    /// Map segment id -> number of entries in that sealed segment
+    #[serde(default)]
+    pub sealed_segments: HashMap<u64, u64>,
+    /// Map segment id -> leader responsible for that segment
+    #[serde(default)]
+    pub segment_leaders: HashMap<u64, NodeId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +40,10 @@ pub enum MetadataCmd {
         name: String,
         new_leader: NodeId,
         sealed_segment_entry_count: u64,
+    },
+    UpsertNode {
+        node_id: NodeId,
+        addr: String,
     },
 }
 
@@ -51,6 +64,11 @@ impl Metadata {
         guard.topics.get(topic).cloned()
     }
 
+    pub fn get_node_addr(&self, node_id: NodeId) -> Option<String> {
+        let guard = self.state.read().ok()?;
+        guard.nodes.get(&node_id).cloned()
+    }
+
     pub fn owned_topics(&self, node_id: NodeId) -> Vec<(String, u64)> {
         let guard = match self.state.read() {
             Ok(g) => g,
@@ -63,6 +81,23 @@ impl Metadata {
             }
         }
         out
+    }
+
+    pub fn sealed_count(&self, topic: &str, segment: u64) -> Option<u64> {
+        let guard = self.state.read().ok()?;
+        guard
+            .topics
+            .get(topic)
+            .and_then(|t| t.sealed_segments.get(&segment).copied())
+    }
+
+    pub fn segment_leader(&self, topic: &str, segment: u64) -> Option<NodeId> {
+        let guard = self.state.read().ok()?;
+        guard
+            .topics
+            .get(topic)
+            .and_then(|t| t.segment_leaders.get(&segment).copied())
+            .or_else(|| guard.topics.get(topic).map(|t| t.leader_node))
     }
 }
 
@@ -84,14 +119,15 @@ impl StateMachineTrait for Metadata {
                     return Ok(Bytes::from_static(b"EXISTS"));
                 }
 
-                state.topics.insert(
-                    name,
-                    TopicState {
-                        current_segment: 1,
-                        leader_node: initial_leader,
-                        last_sealed_entry_offset: 0,
-                    },
-                );
+                let mut topic = TopicState {
+                    current_segment: 1,
+                    leader_node: initial_leader,
+                    last_sealed_entry_offset: 0,
+                    sealed_segments: HashMap::new(),
+                    segment_leaders: HashMap::new(),
+                };
+                topic.segment_leaders.insert(1, initial_leader);
+                state.topics.insert(name, topic);
                 Ok(Bytes::from_static(b"CREATED"))
             }
             MetadataCmd::RolloverTopic {
@@ -100,12 +136,26 @@ impl StateMachineTrait for Metadata {
                 sealed_segment_entry_count,
             } => {
                 if let Some(topic_state) = state.topics.get_mut(&name) {
+                    let sealed_seg = topic_state.current_segment;
+                    topic_state
+                        .sealed_segments
+                        .insert(sealed_seg, sealed_segment_entry_count);
+                    topic_state
+                        .segment_leaders
+                        .insert(sealed_seg, topic_state.leader_node);
                     topic_state.last_sealed_entry_offset += sealed_segment_entry_count;
                     topic_state.current_segment += 1;
                     topic_state.leader_node = new_leader;
+                    topic_state
+                        .segment_leaders
+                        .insert(topic_state.current_segment, new_leader);
                     return Ok(Bytes::from_static(b"ROLLED"));
                 }
                 Err("Topic not found".into())
+            }
+            MetadataCmd::UpsertNode { node_id, addr } => {
+                state.nodes.insert(node_id, addr);
+                Ok(Bytes::from_static(b"NODE"))
             }
         }
     }

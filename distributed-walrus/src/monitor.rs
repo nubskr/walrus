@@ -14,6 +14,14 @@ use crate::metadata::MetadataCmd;
 
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_SEGMENT_ENTRIES: u64 = 1_000_000;
+pub fn max_segment_entries() -> u64 {
+    if let Ok(val) = std::env::var("WALRUS_MAX_SEGMENT_ENTRIES") {
+        if let Ok(parsed) = val.parse::<u64>() {
+            return parsed.max(1);
+        }
+    }
+    DEFAULT_MAX_SEGMENT_ENTRIES
+}
 
 #[derive(Clone, Copy)]
 struct MonitorLimits {
@@ -94,21 +102,9 @@ impl Monitor {
         for (topic, segment) in owned {
             let wal = wal_key(&topic, segment);
 
-            let sealed_entry_count = self
-                .controller
-                .metadata
-                .get_topic_state(&topic)
-                .map(|p| p.last_sealed_entry_offset)
-                .unwrap_or(0);
+            let entries_in_segment = self.controller.tracked_entry_count(&wal).await;
 
-            let current_entry_count = self
-                .controller
-                .tracked_entry_count(&wal)
-                .await;
-
-            let entries_in_segment = current_entry_count.saturating_sub(sealed_entry_count);
-
-            if entries_in_segment <= self.limits.max_segment_entries {
+            if entries_in_segment < self.limits.max_segment_entries {
                 continue;
             }
 
@@ -142,8 +138,7 @@ impl Monitor {
                 new_leader: next_leader,
                 sealed_segment_entry_count: entries_in_segment,
             };
-            let payload = bincode::serialize(&cmd)?;
-            self.controller.raft.propose(payload).await?;
+            self.controller.propose_metadata(cmd).await?;
         }
 
         Ok(())
@@ -157,15 +152,6 @@ fn check_interval() -> Duration {
         }
     }
     DEFAULT_CHECK_INTERVAL
-}
-
-fn max_segment_entries() -> u64 {
-    if let Ok(val) = std::env::var("WALRUS_MAX_SEGMENT_ENTRIES") {
-        if let Ok(parsed) = val.parse::<u64>() {
-            return parsed.max(1);
-        }
-    }
-    DEFAULT_MAX_SEGMENT_ENTRIES
 }
 
 #[cfg(test)]

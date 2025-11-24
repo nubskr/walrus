@@ -3,19 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Internal data-plane operations forwarded between nodes.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum InternalOp {
-    ForwardAppend {
-        wal_key: String,
-        data: Vec<u8>,
-    },
-    ForwardRead {
-        wal_key: String,
-        start_offset: u64,
-        max_bytes: usize,
-    },
-    JoinCluster {
-        node_id: u64,
-        addr: String,
-    },
+    ForwardAppend { wal_key: String, data: Vec<u8> },
+    ForwardRead { wal_key: String, max_entries: usize },
+    ForwardMetadata { cmd: crate::metadata::MetadataCmd },
+    JoinCluster { node_id: u64, addr: String },
     TestControl(TestControl),
 }
 
