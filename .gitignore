@@ -1,3 +1,4 @@
+distributed-walrus/test_data_rollover/
 *.py
 !scripts/*.py
 .DS_Store

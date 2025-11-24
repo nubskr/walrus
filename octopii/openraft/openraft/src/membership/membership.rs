@@ -318,7 +318,7 @@ where C: RaftTypeConfig
         let Membership { mut configs, nodes } = self.clone().compute_target_membership(change);
 
         // Safe unwrap(): `calculate_goal()` yields a uniform config.
-        let target_voter_ids = configs.pop().unwrap();
+        let target_voter_ids = configs.pop().ok_or_else(|| ChangeMembershipError::EmptyMembership(EmptyMembership {}))?;
 
         self.nodes = nodes;
         let new_membership = self.next_coherent(target_voter_ids, retain);
