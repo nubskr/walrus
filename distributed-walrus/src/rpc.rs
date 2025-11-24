@@ -33,7 +33,7 @@ pub enum InternalResp {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TestControl {
     ForceForwardReadError(bool),
-    RevokeLeases { topic: String, partition: u32 },
+    RevokeLeases { topic: String },
     SyncLeases,
     TriggerJoin { node_id: u64, addr: String },
     ForceMonitorError,

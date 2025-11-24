@@ -13,19 +13,19 @@ use crate::controller::{wal_key, NodeController};
 use crate::metadata::MetadataCmd;
 
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1_000_000_000;
+const DEFAULT_MAX_SEGMENT_ENTRIES: u64 = 1_000_000;
 
 #[derive(Clone, Copy)]
 struct MonitorLimits {
     check_interval: Duration,
-    max_segment_size: u64,
+    max_segment_entries: u64,
 }
 
 impl MonitorLimits {
     fn load() -> Self {
         Self {
             check_interval: check_interval(),
-            max_segment_size: max_segment_size(),
+            max_segment_entries: max_segment_entries(),
         }
     }
 }
@@ -86,46 +86,42 @@ impl Monitor {
         }
         let nodes: Vec<u64> = voters.into_iter().copied().collect();
 
-        let assignments = self
+        let owned = self
             .controller
             .metadata
-            .assignments_for_node(self.controller.node_id);
+            .owned_topics(self.controller.node_id);
 
-        for (topic, partition, generation) in assignments {
-            let wal = wal_key(&topic, partition, generation);
+        for (topic, segment) in owned {
+            let wal = wal_key(&topic, segment);
 
-            let disk_size = self.controller.bucket.get_topic_size_blocking(&wal);
-
-            let logical_head_start = self
+            let sealed_entry_count = self
                 .controller
                 .metadata
-                .get_partition_state(&topic, partition)
-                .and_then(|p| p.history.last().map(|h| h.end_offset))
+                .get_topic_state(&topic)
+                .map(|p| p.last_sealed_entry_offset)
                 .unwrap_or(0);
-            let logical_watermark = self
+
+            let current_entry_count = self
                 .controller
-                .partition_high_watermark(&topic, partition)
+                .tracked_entry_count(&wal)
                 .await;
-            let logical_size = logical_watermark.saturating_sub(logical_head_start);
 
-            // Use disk size to decide WHEN to rollover (to bound disk usage),
-            // but report logical size to metadata (so offsets remain consistent).
-            let trigger_size = disk_size.max(logical_size);
+            let entries_in_segment = current_entry_count.saturating_sub(sealed_entry_count);
 
-            if trigger_size <= self.limits.max_segment_size {
+            if entries_in_segment <= self.limits.max_segment_entries {
                 continue;
             }
 
             info!(
-                "Segment {} disk_size {} (logical {}) exceeds limit {}, proposing rollover with sealed size {}",
-                wal, disk_size, logical_size, self.limits.max_segment_size, logical_size
+                "Segment {} has {} entries (exceeds limit {}), proposing rollover",
+                wal, entries_in_segment, self.limits.max_segment_entries
             );
 
             let current_idx = nodes
                 .iter()
                 .position(|&id| id == self.controller.node_id)
                 .unwrap_or(0);
-            
+
             let next_leader = if nodes.is_empty() {
                 self.controller.node_id
             } else {
@@ -133,20 +129,18 @@ impl Monitor {
             };
 
             tracing::info!(
-                "Rollover for {} p{}: voters={:?}, current={} idx={}, next_leader={}",
+                "Rollover for {}: voters={:?}, current={} idx={}, next_leader={}",
                 topic,
-                partition,
                 nodes,
                 self.controller.node_id,
                 current_idx,
                 next_leader
             );
 
-            let cmd = MetadataCmd::RolloverPartition {
+            let cmd = MetadataCmd::RolloverTopic {
                 name: topic.clone(),
-                partition,
                 new_leader: next_leader,
-                sealed_segment_size_bytes: logical_size,
+                sealed_segment_entry_count: entries_in_segment,
             };
             let payload = bincode::serialize(&cmd)?;
             self.controller.raft.propose(payload).await?;
@@ -165,13 +159,13 @@ fn check_interval() -> Duration {
     DEFAULT_CHECK_INTERVAL
 }
 
-fn max_segment_size() -> u64 {
-    if let Ok(val) = std::env::var("WALRUS_MAX_SEGMENT_BYTES") {
+fn max_segment_entries() -> u64 {
+    if let Ok(val) = std::env::var("WALRUS_MAX_SEGMENT_ENTRIES") {
         if let Ok(parsed) = val.parse::<u64>() {
             return parsed.max(1);
         }
     }
-    DEFAULT_MAX_SEGMENT_SIZE
+    DEFAULT_MAX_SEGMENT_ENTRIES
 }
 
 #[cfg(test)]
@@ -188,25 +182,25 @@ mod tests {
     fn check_interval_and_limits_respect_env_overrides() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("WALRUS_MONITOR_CHECK_MS", "5");
-        std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "42");
+        std::env::set_var("WALRUS_MAX_SEGMENT_ENTRIES", "42");
 
         assert_eq!(check_interval(), Duration::from_millis(10)); // clamped to minimum
-        assert_eq!(max_segment_size(), 42);
+        assert_eq!(max_segment_entries(), 42);
 
         std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
-        std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
+        std::env::remove_var("WALRUS_MAX_SEGMENT_ENTRIES");
     }
 
     #[test]
     fn defaults_apply_for_invalid_env_values() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("WALRUS_MONITOR_CHECK_MS", "bogus");
-        std::env::set_var("WALRUS_MAX_SEGMENT_BYTES", "notanumber");
+        std::env::set_var("WALRUS_MAX_SEGMENT_ENTRIES", "notanumber");
 
         assert_eq!(check_interval(), DEFAULT_CHECK_INTERVAL);
-        assert_eq!(max_segment_size(), DEFAULT_MAX_SEGMENT_SIZE);
+        assert_eq!(max_segment_entries(), DEFAULT_MAX_SEGMENT_ENTRIES);
 
         std::env::remove_var("WALRUS_MONITOR_CHECK_MS");
-        std::env::remove_var("WALRUS_MAX_SEGMENT_BYTES");
+        std::env::remove_var("WALRUS_MAX_SEGMENT_ENTRIES");
     }
 }

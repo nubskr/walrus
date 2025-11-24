@@ -3,8 +3,8 @@
 //! mapping logical offsets onto Walrus’ physical offsets, and keeping leases in sync with
 //! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
 
-use crate::bucket::BucketService;
-use crate::metadata::{MetadataStateMachine, NodeId};
+use crate::bucket::Storage;
+use crate::metadata::{Metadata, NodeId};
 use crate::rpc::TestControl;
 use crate::rpc::{InternalOp, InternalResp};
 use anyhow::{anyhow, Result};
@@ -19,49 +19,23 @@ mod topics;
 mod types;
 pub use types::wal_key;
 
-#[derive(Clone, Copy)]
-pub struct ControllerConfig {
-    pub forward_timeout: Duration,
-}
-
-impl ControllerConfig {
-    pub fn from_env() -> Self {
-        let forward_timeout = std::env::var("WALRUS_RPC_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(2_000));
-        Self { forward_timeout }
-    }
-}
-
 pub struct NodeController {
     pub node_id: NodeId,
-    pub bucket: Arc<BucketService>,
-    pub metadata: Arc<MetadataStateMachine>,
+    pub bucket: Arc<Storage>,
+    pub metadata: Arc<Metadata>,
     pub raft: Arc<OctopiiNode>,
     pub offsets: Arc<RwLock<HashMap<String, u64>>>,
     pub test_fail_forward_read: AtomicBool,
     pub test_fail_monitor: AtomicBool,
     pub test_fail_dir_size: AtomicBool,
-    pub config: ControllerConfig,
 }
 
 impl NodeController {
-    // Each WAL entry reserves a fixed prefix (matches wal::config::PREFIX_META_SIZE).
-    const ENTRY_OVERHEAD: u64 = 256;
-    const SCAN_WINDOW: usize = 16 * 1024 * 1024;
-
     pub async fn handle_rpc(&self, op: InternalOp) -> InternalResp {
         tracing::info!("handle_rpc: processing op {:?}", op);
         match op {
             InternalOp::ForwardAppend { wal_key, data } => self.forward_append(wal_key, data).await,
-            InternalOp::ForwardRead {
-                wal_key,
-                start_offset,
-                max_bytes,
-            } => {
-                // TODO: Implement with new simple protocol
+            InternalOp::ForwardRead { .. } => {
                 InternalResp::Error("ForwardRead not implemented yet".to_string())
             }
             InternalOp::JoinCluster { node_id, addr } => {
@@ -72,16 +46,16 @@ impl NodeController {
                     self.test_fail_forward_read.store(flag, Ordering::Relaxed);
                     InternalResp::Ok
                 }
-                TestControl::RevokeLeases { topic, partition } => {
+                TestControl::RevokeLeases { topic } => {
                     let expected = HashSet::new();
-                    self.bucket.sync_leases(&expected).await;
-                    let key = wal_key(&topic, partition, 1);
+                    self.bucket.update_leases(&expected).await;
+                    let key = wal_key(&topic, 1);
                     let mut guard = self.offsets.write().await;
                     guard.remove(&key);
                     InternalResp::Ok
                 }
                 TestControl::SyncLeases => {
-                    self.sync_leases_now().await;
+                    self.update_leases().await;
                     InternalResp::Ok
                 }
                 TestControl::TriggerJoin { node_id, addr } => {
@@ -99,62 +73,38 @@ impl NodeController {
         }
     }
 
-    // TODO: Implement with new simple protocol
-    // pub async fn route_and_read(
-    //     &self,
-    //     topic: &str,
-    //     partition: u32,
-    //     req_offset: u64,
-    //     max_bytes: usize,
-    // ) -> Result<(Vec<Vec<u8>>, u64)> {
-    //     unimplemented!("route_and_read removed with Kafka protocol")
-    // }
-
-    pub async fn sync_leases_now(&self) {
+    pub async fn update_leases(&self) {
         let expected: HashSet<String> = self
             .metadata
-            .assignments_for_node(self.node_id)
+            .owned_topics(self.node_id)
             .into_iter()
-            .map(|(topic, part, gen)| wal_key(&topic, part, gen))
+            .map(|(topic, seg)| wal_key(&topic, seg))
             .collect();
         tracing::info!(
-            "sync_leases_now node={} leases={:?}",
+            "update_leases node={} leases={:?}",
             self.node_id,
             expected
         );
-        self.bucket.sync_leases(&expected).await;
+        self.bucket.update_leases(&expected).await;
     }
 
-    pub async fn run_lease_sync_loop(self: Arc<Self>) {
+    pub async fn run_lease_update_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
-            self.sync_leases_now().await;
+            self.update_leases().await;
         }
     }
 
-    // TODO: All logical_wal methods removed - will be replaced with message-based reading
-
-    pub async fn partition_high_watermark(&self, _topic: &str, _partition: u32) -> u64 {
-        // TODO: Implement with message-based counting
-        0
-    }
-
-    pub(super) async fn tracked_len(&self, wal_key: &str) -> u64 {
+    pub(crate) async fn tracked_entry_count(&self, wal_key: &str) -> u64 {
         let guard = self.offsets.read().await;
         guard.get(wal_key).copied().unwrap_or(0)
     }
 
-    pub(super) async fn set_tracked_len(&self, wal_key: &str, bytes: u64) {
+    async fn record_append(&self, wal_key: &str, num_entries: u64) -> u64 {
         let mut guard = self.offsets.write().await;
         let entry = guard.entry(wal_key.to_string()).or_insert(0);
-        *entry = bytes;
-    }
-
-    async fn record_append(&self, wal_key: &str, bytes: u64) -> u64 {
-        let mut guard = self.offsets.write().await;
-        let entry = guard.entry(wal_key.to_string()).or_insert(0);
-        *entry += bytes;
+        *entry += num_entries;
         *entry
     }
 
@@ -168,7 +118,7 @@ impl NodeController {
                     self.node_id,
                     attempt + 1
                 );
-                self.sync_leases_now().await;
+                self.update_leases().await;
             }
             match self.bucket.append_by_key(wal_key, data.clone()).await {
                 Ok(_) => return Ok(()),

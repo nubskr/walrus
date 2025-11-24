@@ -7,11 +7,11 @@ mod metadata;
 mod monitor;
 mod rpc;
 
-use bucket::BucketService;
+use bucket::Storage;
 use clap::Parser;
 use config::NodeConfig;
 use controller::NodeController;
-use metadata::{MetadataCmd, MetadataStateMachine};
+use metadata::{Metadata, MetadataCmd};
 use octopii::rpc::{RequestPayload, ResponsePayload};
 use octopii::{Config as OctopiiConfig, OctopiiNode, OctopiiRuntime};
 use rpc::{InternalOp, InternalResp};
@@ -44,9 +44,9 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     info!("Node {} booting", node_config.node_id);
     let data_path = node_config.data_wal_dir();
     std::fs::create_dir_all(&data_path)?;
-    let bucket = Arc::new(BucketService::new(data_path).await?);
+    let bucket = Arc::new(Storage::new(data_path).await?);
 
-    let metadata = Arc::new(MetadataStateMachine::new());
+    let metadata = Arc::new(Metadata::new());
 
     let meta_path = node_config.meta_wal_dir();
     std::fs::create_dir_all(&meta_path)?;
@@ -72,21 +72,21 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         };
     }
 
-    let mut oct_peers = vec![];
+    let mut raft_peers = vec![];
     if node_config.node_id == 1 && node_config.join_addr.is_none() {
-        oct_peers = node_config
+        raft_peers = node_config
             .initial_peers
             .iter()
             .map(|s| s.parse())
             .collect::<Result<_, _>>()?;
     } else if let Some(addr) = join_target_resolved {
-        oct_peers.push(addr);
+        raft_peers.push(addr);
     }
 
-    let oct_cfg = OctopiiConfig {
+    let raft_cfg = OctopiiConfig {
         node_id: node_config.node_id,
         bind_addr: raft_bind_addr.parse()?,
-        peers: oct_peers,
+        peers: raft_peers,
         wal_dir: meta_path,
         is_initial_leader: node_config.node_id == 1
             && node_config.join_addr.is_none()
@@ -96,7 +96,7 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
 
     let runtime = OctopiiRuntime::from_handle(tokio::runtime::Handle::current());
     let raft =
-        Arc::new(OctopiiNode::new_with_state_machine(oct_cfg, runtime, metadata.clone()).await?);
+        Arc::new(OctopiiNode::new_with_state_machine(raft_cfg, runtime, metadata.clone()).await?);
 
     let controller = Arc::new(NodeController {
         node_id: node_config.node_id,
@@ -107,7 +107,6 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         test_fail_forward_read: std::sync::atomic::AtomicBool::new(false),
         test_fail_monitor: std::sync::atomic::AtomicBool::new(false),
         test_fail_dir_size: std::sync::atomic::AtomicBool::new(false),
-        config: controller::ControllerConfig::from_env(),
     });
 
     let controller_rpc = controller.clone();
@@ -148,20 +147,11 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     bootstrap_node_one(&controller, &raft, has_existing_meta).await?;
     attempt_join(&raft, &node_config, &advertise_host, join_target_resolved).await?;
 
-    controller.sync_leases_now().await;
+    controller.update_leases().await;
     let sync_controller = controller.clone();
     tokio::spawn(async move {
-        sync_controller.run_lease_sync_loop().await;
+        sync_controller.run_lease_update_loop().await;
     });
-
-    // TODO: Spawn simple protocol server here
-    // let simple_controller = controller.clone();
-    // let simple_port = node_config.simple_port;
-    // tokio::spawn(async move {
-    //     if let Err(e) = simple::server::run_server(simple_port, simple_controller).await {
-    //         error!("Simple protocol server exited: {e}");
-    //     }
-    // });
 
     let monitor_controller = controller.clone();
     let monitor_config = node_config.clone();
@@ -199,7 +189,6 @@ async fn bootstrap_node_one(
     info!("--- Create topic via Raft ---");
     let cmd = MetadataCmd::CreateTopic {
         name: "logs".into(),
-        partitions: 2,
         initial_leader: 1,
     };
 
@@ -222,11 +211,10 @@ async fn bootstrap_node_one(
     }
 
     // Always rollover to self (1) initially since we don't know if peers joined yet
-    let roll = MetadataCmd::RolloverPartition {
+    let roll = MetadataCmd::RolloverTopic {
         name: "logs".into(),
-        partition: 0,
         new_leader: 1,
-        sealed_segment_size_bytes: 0,
+        sealed_segment_entry_count: 0,
     };
 
     loop {
@@ -239,21 +227,10 @@ async fn bootstrap_node_one(
         }
     }
 
-    // Allow time for state machine and sync leases
+    // Allow time for state machine and lease updates
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    controller.sync_leases_now().await;
-    // TODO: Re-enable once we have simple protocol
-    // controller
-    //     .route_and_append("logs", 0, b"payload-from-node1".to_vec())
-    //     .await?;
-    // info!("Append routed through controller");
-
-    // let (reads, high_watermark) = controller.route_and_read("logs", 0, 0, 1024).await?;
-    // info!("Read {} entries (hw={})", reads.len(), high_watermark);
-    // for (i, data) in reads.iter().enumerate() {
-    //     info!("Entry {}: {:?}", i, String::from_utf8_lossy(data));
-    // }
+    controller.update_leases().await;
 
     Ok(())
 }
