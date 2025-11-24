@@ -47,11 +47,6 @@ pub enum MetadataCmd {
         new_leader: NodeId,
         sealed_segment_size_bytes: u64,
     },
-    TrimHistory {
-        name: String,
-        partition: u32,
-        up_to_generation: u64,
-    },
 }
 
 #[derive(Clone)]
@@ -177,19 +172,6 @@ impl StateMachineTrait for MetadataStateMachine {
                         part.current_generation += 1;
                         part.leader_node = new_leader;
                         return Ok(Bytes::from_static(b"ROLLED"));
-                    }
-                }
-                Err("Topic or partition not found".into())
-            }
-            MetadataCmd::TrimHistory {
-                name,
-                partition,
-                up_to_generation,
-            } => {
-                if let Some(topic) = state.topics.get_mut(&name) {
-                    if let Some(part) = topic.partition_states.get_mut(&partition) {
-                        part.history.retain(|seg| seg.generation > up_to_generation);
-                        return Ok(Bytes::from_static(b"TRIMMED"));
                     }
                 }
                 Err("Topic or partition not found".into())

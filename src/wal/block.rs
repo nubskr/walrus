@@ -4,8 +4,6 @@ use rkyv::Deserialize as _;
 use rkyv_derive::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
 
-use bytecheck::CheckBytes;
-
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub data: Vec<u8>,

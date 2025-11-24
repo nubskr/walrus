@@ -38,5 +38,4 @@ pub enum TestControl {
     TriggerJoin { node_id: u64, addr: String },
     ForceMonitorError,
     ForceDirSizeError,
-    ForceGcError,
 }

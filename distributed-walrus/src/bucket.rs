@@ -11,24 +11,6 @@ use walrus_rust::{Entry, Walrus};
 
 pub const DATA_NAMESPACE: &str = "data_plane";
 
-/// Logical identifier for a distributed Walrus partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PartitionId {
-    pub topic_id: u64,
-    pub partition_id: u32,
-    pub generation_id: u64,
-}
-
-impl PartitionId {
-    /// Convert the logical identifier into Walrus' topic naming scheme.
-    pub fn to_wal_key(&self) -> String {
-        format!(
-            "t_{}_p_{}_g_{}",
-            self.topic_id, self.partition_id, self.generation_id
-        )
-    }
-}
-
 /// Wraps Walrus with fencing/lease awareness.
 pub struct BucketService {
     engine: Arc<Walrus>,
@@ -57,26 +39,6 @@ impl BucketService {
             active_leases: RwLock::new(HashSet::new()),
             write_locks: RwLock::new(HashMap::new()),
         })
-    }
-
-    /// Allow future writes for the partition/generation.
-    pub async fn grant_lease(&self, pid: PartitionId) {
-        self.grant_key(pid.to_wal_key()).await;
-    }
-
-    /// Revoke write permission for the partition/generation.
-    pub async fn revoke_lease(&self, pid: PartitionId) {
-        self.revoke_key(pid.to_wal_key()).await;
-    }
-
-    /// Append bytes to the topic corresponding to the partition.
-    pub async fn append(&self, pid: PartitionId, data: Vec<u8>) -> Result<()> {
-        self.append_raw(&pid.to_wal_key(), data).await
-    }
-
-    /// Read up to `max_bytes` from the partition.
-    pub async fn read(&self, pid: PartitionId, max_bytes: usize) -> Result<Vec<Entry>> {
-        self.read_raw(&pid.to_wal_key(), max_bytes, None).await
     }
 
     pub async fn append_by_key(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
@@ -198,6 +160,7 @@ impl BucketService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -209,32 +172,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_ids_gate_leases_and_io() {
+    async fn leases_gate_io() {
         let path = temp_path("leases");
         let bucket = BucketService::new(path.clone()).await.expect("bucket init");
-        let pid = PartitionId {
-            topic_id: 9,
-            partition_id: 7,
-            generation_id: 3,
-        };
-        assert_eq!(pid.to_wal_key(), "t_9_p_7_g_3");
+        let wal_key = format!("t_{}_p_{}_g_{}", 9, 7, 3);
 
         // Writes without a lease should be rejected.
-        let err = bucket.append(pid, b"nope".to_vec()).await.unwrap_err();
+        let err = bucket
+            .append_by_key(&wal_key, b"nope".to_vec())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("NotLeaderForPartition"));
 
-        bucket.grant_lease(pid).await;
+        let mut leases = HashSet::new();
+        leases.insert(wal_key.clone());
+        bucket.sync_leases(&leases).await;
         bucket
-            .append(pid, b"hello-world".to_vec())
+            .append_by_key(&wal_key, b"hello-world".to_vec())
             .await
             .expect("append with lease");
-        let entries = bucket.read(pid, 1024).await.expect("read with lease");
+        let entries = bucket
+            .read_by_key(&wal_key, 1024)
+            .await
+            .expect("read with lease");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, b"hello-world");
 
-        bucket.revoke_lease(pid).await;
+        leases.clear();
+        bucket.sync_leases(&leases).await;
         let err = bucket
-            .append(pid, b"after-revoke".to_vec())
+            .append_by_key(&wal_key, b"after-revoke".to_vec())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("NotLeaderForPartition"));
