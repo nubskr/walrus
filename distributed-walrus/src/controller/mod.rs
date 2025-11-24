@@ -4,7 +4,7 @@
 //! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
 
 use crate::bucket::BucketService;
-use crate::metadata::{MetadataStateMachine, NodeId, SegmentRecord};
+use crate::metadata::{MetadataStateMachine, NodeId};
 use crate::rpc::TestControl;
 use crate::rpc::{InternalOp, InternalResp};
 use anyhow::{anyhow, Result};
@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 mod internal;
 mod topics;
 mod types;
-pub use types::{parse_wal_key, wal_key, TopicPartition, WalKeyParts};
+pub use types::wal_key;
 
 #[derive(Clone, Copy)]
 pub struct ControllerConfig {
@@ -44,7 +44,6 @@ pub struct NodeController {
     pub test_fail_forward_read: AtomicBool,
     pub test_fail_monitor: AtomicBool,
     pub test_fail_dir_size: AtomicBool,
-    pub test_fail_gc: AtomicBool,
     pub config: ControllerConfig,
 }
 
@@ -94,10 +93,6 @@ impl NodeController {
                 }
                 TestControl::ForceDirSizeError => {
                     self.test_fail_dir_size.store(true, Ordering::Relaxed);
-                    InternalResp::Ok
-                }
-                TestControl::ForceGcError => {
-                    self.test_fail_gc.store(true, Ordering::Relaxed);
                     InternalResp::Ok
                 }
             },

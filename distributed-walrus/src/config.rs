@@ -20,10 +20,6 @@ pub struct NodeConfig {
     #[arg(long = "initial-peer")]
     pub initial_peers: Vec<String>,
 
-    /// Port for the Kafka facade listener.
-    #[arg(long = "port", default_value = "9092")]
-    pub kafka_port: u16,
-
     /// Port for the Raft/Internal RPC listener.
     #[arg(long = "raft-port", default_value = "6000")]
     pub raft_port: u16,

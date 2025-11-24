@@ -3,7 +3,6 @@
 mod bucket;
 mod config;
 mod controller;
-mod fs_utils;
 mod metadata;
 mod monitor;
 mod rpc;
@@ -108,7 +107,6 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         test_fail_forward_read: std::sync::atomic::AtomicBool::new(false),
         test_fail_monitor: std::sync::atomic::AtomicBool::new(false),
         test_fail_dir_size: std::sync::atomic::AtomicBool::new(false),
-        test_fail_gc: std::sync::atomic::AtomicBool::new(false),
         config: controller::ControllerConfig::from_env(),
     });
 

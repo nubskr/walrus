@@ -12,7 +12,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-log = "0.2"
 bytes = "1.0"
-tokio-util = { version = "0.7", features = ["codec"] }
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 
