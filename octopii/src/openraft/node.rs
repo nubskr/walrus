@@ -30,11 +30,8 @@ fn namespace_key_from_path(path: &std::path::Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn cluster_namespace_from_wal_dir(wal_dir: &std::path::Path) -> String {
-    match wal_dir.parent() {
-        Some(parent) => namespace_key_from_path(parent),
-        None => namespace_key_from_path(wal_dir),
-    }
+fn cluster_namespace_from_wal_dir(_wal_dir: &std::path::Path) -> String {
+    "distributed_walrus_cluster".to_string()
 }
 
 pub fn peer_namespace_from_base(path: &std::path::Path) -> String {
@@ -128,7 +125,8 @@ impl OpenRaftNode {
 
         let cluster_namespace = Arc::new(cluster_namespace_from_wal_dir(&config.wal_dir));
 
-        register_global_peer_addr(cluster_namespace.as_str(), config.node_id, config.bind_addr);
+        let my_addr = config.public_addr.unwrap_or(config.bind_addr);
+        register_global_peer_addr(cluster_namespace.as_str(), config.node_id, my_addr);
 
         let flush_interval = Duration::from_millis(config.wal_flush_interval_ms);
         let log_store = new_wal_log_store(Arc::new(
@@ -482,10 +480,11 @@ impl OpenRaftNode {
                 self.config.node_id
             );
             let mut nodes = BTreeMap::new();
+            let my_addr = self.config.public_addr.unwrap_or(self.config.bind_addr);
             nodes.insert(
                 self.config.node_id,
                 BasicNode {
-                    addr: self.config.bind_addr.to_string(),
+                    addr: my_addr.to_string(),
                 },
             );
 

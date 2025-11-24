@@ -4,20 +4,27 @@
 //! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
 
 use crate::bucket::Storage;
-use crate::metadata::{Metadata, NodeId};
+use crate::metadata::{Metadata, MetadataCmd, NodeId};
+use crate::monitor::max_segment_entries;
 use crate::rpc::TestControl;
 use crate::rpc::{InternalOp, InternalResp};
 use anyhow::{anyhow, Result};
+use bincode;
+use octopii::rpc::{RequestPayload, ResponsePayload};
 use octopii::OctopiiNode;
+use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tracing::info;
 mod internal;
 mod topics;
 mod types;
+pub use types::parse_wal_key;
 pub use types::wal_key;
+pub use types::ReadCursor;
 
 pub struct NodeController {
     pub node_id: NodeId,
@@ -25,6 +32,7 @@ pub struct NodeController {
     pub metadata: Arc<Metadata>,
     pub raft: Arc<OctopiiNode>,
     pub offsets: Arc<RwLock<HashMap<String, u64>>>,
+    pub read_cursors: Arc<Mutex<HashMap<String, ReadCursor>>>,
     pub test_fail_forward_read: AtomicBool,
     pub test_fail_monitor: AtomicBool,
     pub test_fail_dir_size: AtomicBool,
@@ -35,9 +43,14 @@ impl NodeController {
         tracing::info!("handle_rpc: processing op {:?}", op);
         match op {
             InternalOp::ForwardAppend { wal_key, data } => self.forward_append(wal_key, data).await,
-            InternalOp::ForwardRead { .. } => {
-                InternalResp::Error("ForwardRead not implemented yet".to_string())
-            }
+            InternalOp::ForwardRead {
+                wal_key,
+                max_entries,
+            } => self.forward_read(&wal_key, max_entries).await,
+            InternalOp::ForwardMetadata { cmd } => match self.propose_metadata(cmd).await {
+                Ok(_) => InternalResp::Ok,
+                Err(e) => InternalResp::Error(e.to_string()),
+            },
             InternalOp::JoinCluster { node_id, addr } => {
                 self.handle_join_cluster(node_id, addr).await
             }
@@ -80,12 +93,153 @@ impl NodeController {
             .into_iter()
             .map(|(topic, seg)| wal_key(&topic, seg))
             .collect();
-        tracing::info!(
-            "update_leases node={} leases={:?}",
-            self.node_id,
-            expected
-        );
+        tracing::info!("update_leases node={} leases={:?}", self.node_id, expected);
         self.bucket.update_leases(&expected).await;
+    }
+
+    /// Create the topic in Raft if it does not already exist.
+    pub async fn ensure_topic(&self, topic: &str) -> Result<()> {
+        if self.metadata.get_topic_state(topic).is_some() {
+            return Ok(());
+        }
+
+        let cmd = MetadataCmd::CreateTopic {
+            name: topic.to_string(),
+            initial_leader: self.node_id,
+        };
+
+        self.propose_metadata(cmd).await?;
+        tracing::info!("ensure_topic: CreateTopic proposed for {}", topic);
+        // Raft apply will update Metadata, but refresh leases eagerly.
+        self.update_leases().await;
+        Ok(())
+    }
+
+    pub async fn upsert_node(&self, node_id: NodeId, addr: String) -> Result<()> {
+        let cmd = MetadataCmd::UpsertNode { node_id, addr };
+        self.propose_metadata(cmd).await?;
+        Ok(())
+    }
+
+    /// Append data for the given topic. Only succeeds if this node is the leader.
+    pub async fn append_for_topic(&self, topic: &str, data: Vec<u8>) -> Result<()> {
+        self.update_leases().await;
+        let Some(topic_state) = self.metadata.get_topic_state(topic) else {
+            return Err(anyhow!("unknown topic {}", topic));
+        };
+
+        let key = wal_key(topic, topic_state.current_segment);
+        tracing::info!(
+            "append_for_topic topic={} leader={} self={}",
+            topic,
+            topic_state.leader_node,
+            self.node_id
+        );
+        if topic_state.leader_node == self.node_id {
+            match self.forward_append(key.clone(), data).await {
+                InternalResp::Ok => Ok(()),
+                InternalResp::Error(e) => Err(anyhow!(e)),
+                other => Err(anyhow!("unexpected append response: {:?}", other)),
+            }
+        } else {
+            self.forward_append_remote(topic_state.leader_node, key, data)
+                .await
+        }
+    }
+
+    pub fn topic_snapshot(&self, topic: &str) -> Result<String> {
+        let Some(state) = self.metadata.get_topic_state(topic) else {
+            return Err(anyhow!("unknown topic {}", topic));
+        };
+        let json = serde_json::to_string(&state)?;
+        Ok(json)
+    }
+
+    /// Read a single entry for the topic using the provided cursor. Advances the cursor
+    /// across sealed segments based on sealed counts in metadata.
+    pub async fn read_one_for_topic(
+        &self,
+        topic: &str,
+        cursor: &mut ReadCursor,
+    ) -> Result<Option<Vec<u8>>> {
+        loop {
+            let Some(topic_state) = self.metadata.get_topic_state(topic) else {
+                return Err(anyhow!("unknown topic {}", topic));
+            };
+
+            if cursor.segment == 0 {
+                cursor.segment = 1;
+            }
+
+            let current_segment = topic_state.current_segment;
+            if cursor.segment < current_segment {
+                let sealed_count = self
+                    .metadata
+                    .sealed_count(topic, cursor.segment)
+                    .unwrap_or(0);
+                if cursor.delivered_in_segment >= sealed_count {
+                    cursor.segment += 1;
+                    cursor.delivered_in_segment = 0;
+                    continue;
+                }
+            }
+
+            let leader = if cursor.segment == current_segment {
+                topic_state.leader_node
+            } else {
+                self.metadata
+                    .segment_leader(topic, cursor.segment)
+                    .unwrap_or(topic_state.leader_node)
+            };
+
+            let wal = wal_key(topic, cursor.segment);
+            let data_vec = if leader == self.node_id {
+                match self.forward_read(&wal, 1).await {
+                    InternalResp::ReadResult { data, .. } => data,
+                    InternalResp::Error(e) => return Err(anyhow!(e)),
+                    other => return Err(anyhow!("unexpected read response: {:?}", other)),
+                }
+            } else {
+                self.forward_read_remote(leader, wal).await?
+            };
+
+            if let Some(entry) = data_vec.into_iter().next() {
+                cursor.delivered_in_segment += 1;
+                return Ok(Some(entry));
+            }
+
+            // No entry available: if this segment is sealed and we've consumed it, advance;
+            // otherwise return None to signal empty.
+            if cursor.segment < current_segment {
+                let sealed_count = self
+                    .metadata
+                    .sealed_count(topic, cursor.segment)
+                    .unwrap_or(0);
+                if cursor.delivered_in_segment < sealed_count {
+                    cursor.delivered_in_segment = sealed_count;
+                }
+                if cursor.delivered_in_segment >= sealed_count {
+                    cursor.segment += 1;
+                    cursor.delivered_in_segment = 0;
+                    continue;
+                }
+            }
+            return Ok(None);
+        }
+    }
+
+    /// Shared read path that preserves a per-topic cursor across client connections.
+    pub async fn read_one_for_topic_shared(&self, topic: &str) -> Result<Option<Vec<u8>>> {
+        let mut guard = self.read_cursors.lock().await;
+        let cursor = guard.entry(topic.to_string()).or_default();
+        let res = self.read_one_for_topic(topic, cursor).await?;
+        Ok(res)
+    }
+
+    pub fn get_metrics(&self) -> Result<String> {
+        let metrics = self.raft.raft_metrics();
+        let json = serde_json::to_string_pretty(&metrics)?;
+        Ok(json)
     }
 
     pub async fn run_lease_update_loop(self: Arc<Self>) {
@@ -106,6 +260,218 @@ impl NodeController {
         let entry = guard.entry(wal_key.to_string()).or_insert(0);
         *entry += num_entries;
         *entry
+    }
+
+    async fn forward_read(&self, wal_key: &str, _max_entries: usize) -> InternalResp {
+        if self.test_fail_forward_read.load(Ordering::Relaxed) {
+            return InternalResp::Error("forced forward read failure".into());
+        }
+        match self.bucket.read_one(wal_key).await {
+            Ok(Some(data)) => InternalResp::ReadResult {
+                data: vec![data],
+                high_watermark: self.tracked_entry_count(wal_key).await,
+            },
+            Ok(None) => InternalResp::ReadResult {
+                data: Vec::new(),
+                high_watermark: self.tracked_entry_count(wal_key).await,
+            },
+            Err(e) => InternalResp::Error(e.to_string()),
+        }
+    }
+
+    async fn forward_append_remote(
+        &self,
+        leader_node: NodeId,
+        wal_key: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let Some(addr) = self.metadata.get_node_addr(leader_node) else {
+            return Err(anyhow!("unknown addr for node {}", leader_node));
+        };
+        tracing::info!(
+            "forward_append_remote leader={} addr={} key={}",
+            leader_node,
+            addr,
+            wal_key
+        );
+        let payload = InternalOp::ForwardAppend { wal_key, data };
+        let bytes = bincode::serialize(&payload)?;
+        let rpc = self.raft.rpc_handler();
+        let target_sock = match addr.parse() {
+            Ok(sock) => sock,
+            Err(_) => tokio::net::lookup_host(addr.clone())
+                .await?
+                .next()
+                .ok_or_else(|| anyhow!("could not resolve addr {}", addr))?,
+        };
+        let resp = rpc
+            .request(
+                target_sock,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: bytes.into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        match resp.payload {
+            ResponsePayload::CustomResponse { success, data: _ } if success => Ok(()),
+            ResponsePayload::CustomResponse { data, .. } => {
+                let err = bincode::deserialize::<InternalResp>(&data)
+                    .ok()
+                    .and_then(|r| match r {
+                        InternalResp::Error(e) => Some(e),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "unknown error".to_string());
+                Err(anyhow!("forward append failed: {}", err))
+            }
+            other => Err(anyhow!("unexpected response: {:?}", other)),
+        }
+    }
+
+    pub(crate) async fn propose_metadata(&self, cmd: MetadataCmd) -> Result<()> {
+        if self.raft.is_leader().await {
+            let payload = bincode::serialize(&cmd)?;
+            let _ = self.raft.propose(payload).await?;
+            return Ok(());
+        }
+
+        let metrics = self.raft.raft_metrics();
+        let Some(leader_id) = metrics.current_leader else {
+            return Err(anyhow!("no raft leader known for metadata proposal"));
+        };
+
+        if leader_id == self.node_id {
+            let payload = bincode::serialize(&cmd)?;
+            let _ = self.raft.propose(payload).await?;
+            return Ok(());
+        }
+
+        let Some(addr) = self.metadata.get_node_addr(leader_id) else {
+            return Err(anyhow!("unknown addr for raft leader {}", leader_id));
+        };
+
+        let payload = InternalOp::ForwardMetadata { cmd };
+        let bytes = bincode::serialize(&payload)?;
+        let rpc = self.raft.rpc_handler();
+        let target_sock = match addr.parse() {
+            Ok(sock) => sock,
+            Err(_) => tokio::net::lookup_host(addr.clone())
+                .await?
+                .next()
+                .ok_or_else(|| anyhow!("could not resolve addr {}", addr))?,
+        };
+
+        let resp = rpc
+            .request(
+                target_sock,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: bytes.into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        match resp.payload {
+            ResponsePayload::CustomResponse { success, data } if success => Ok(()),
+            ResponsePayload::CustomResponse { data, .. } => {
+                let err = bincode::deserialize::<InternalResp>(&data)
+                    .ok()
+                    .and_then(|r| match r {
+                        InternalResp::Error(e) => Some(e),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "unknown error".to_string());
+                Err(anyhow!("forwarded metadata failed: {}", err))
+            }
+            other => Err(anyhow!("unexpected response: {:?}", other)),
+        }
+    }
+
+    async fn maybe_rollover(&self, topic: &str, segment: u64) -> Result<()> {
+        let wal = wal_key(topic, segment);
+        let count = self.tracked_entry_count(&wal).await;
+        if count < max_segment_entries() {
+            return Ok(());
+        }
+
+        let metrics = self.raft.raft_metrics();
+        let membership = metrics.membership_config.membership();
+        let mut voters = std::collections::BTreeSet::new();
+        for config in membership.get_joint_config() {
+            voters.extend(config.iter());
+        }
+        let nodes: Vec<u64> = voters.into_iter().copied().collect();
+
+        let current_idx = nodes.iter().position(|&id| id == self.node_id).unwrap_or(0);
+
+        let next_leader = if nodes.is_empty() {
+            self.node_id
+        } else {
+            nodes[(current_idx + 1) % nodes.len()]
+        };
+
+        info!(
+            "maybe_rollover: proposing rollover for {} segment {} entries={} next={}",
+            topic, segment, count, next_leader
+        );
+
+        let cmd = MetadataCmd::RolloverTopic {
+            name: topic.to_string(),
+            new_leader: next_leader,
+            sealed_segment_entry_count: count,
+        };
+        self.propose_metadata(cmd).await?;
+        Ok(())
+    }
+
+    async fn forward_read_remote(
+        &self,
+        leader_node: NodeId,
+        wal_key: String,
+    ) -> Result<Vec<Vec<u8>>> {
+        let Some(addr) = self.metadata.get_node_addr(leader_node) else {
+            return Err(anyhow!("unknown addr for node {}", leader_node));
+        };
+        let payload = InternalOp::ForwardRead {
+            wal_key,
+            max_entries: 1,
+        };
+        let bytes = bincode::serialize(&payload)?;
+        let rpc = self.raft.rpc_handler();
+        let target_sock = match addr.parse() {
+            Ok(sock) => sock,
+            Err(_) => tokio::net::lookup_host(addr.clone())
+                .await?
+                .next()
+                .ok_or_else(|| anyhow!("could not resolve addr {}", addr))?,
+        };
+        let resp = rpc
+            .request(
+                target_sock,
+                RequestPayload::Custom {
+                    operation: "Forward".into(),
+                    data: bytes.into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        match resp.payload {
+            ResponsePayload::CustomResponse { data, .. } => {
+                let decoded: InternalResp =
+                    bincode::deserialize(&data).map_err(|e| anyhow!("decode read: {e}"))?;
+                match decoded {
+                    InternalResp::ReadResult { data, .. } => Ok(data),
+                    InternalResp::Error(e) => Err(anyhow!(e)),
+                    other => Err(anyhow!("unexpected read response: {:?}", other)),
+                }
+            }
+            other => Err(anyhow!("unexpected response: {:?}", other)),
+        }
     }
 
     async fn append_with_retry(&self, wal_key: &str, data: Vec<u8>) -> Result<()> {
@@ -172,6 +538,9 @@ impl NodeController {
         match self.raft.add_learner(node_id, socket_addr).await {
             Ok(_) => {
                 tracing::info!("Node {}: Added learner {}", self.node_id, node_id);
+                if let Err(e) = self.upsert_node(node_id, addr.clone()).await {
+                    tracing::warn!("Failed to record node {} address {}: {}", node_id, addr, e);
+                }
                 let raft_clone = self.raft.clone();
                 let node_id_clone = node_id;
                 tokio::spawn(async move {
@@ -200,7 +569,11 @@ impl NodeController {
                             }
                             Ok(false) => {
                                 if i % 10 == 0 {
-                                    tracing::debug!("Node {} not caught up yet (attempt {}/120)", node_id_clone, i);
+                                    tracing::debug!(
+                                        "Node {} not caught up yet (attempt {}/120)",
+                                        node_id_clone,
+                                        i
+                                    );
                                 }
                             }
                             Err(e) => {

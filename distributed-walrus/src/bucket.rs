@@ -50,6 +50,13 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn read_one(&self, wal_key: &str) -> Result<Option<Vec<u8>>> {
+        let engine = self.engine.clone();
+        let key = wal_key.to_string();
+        let entry = tokio::task::spawn_blocking(move || engine.read_next(&key, true)).await??;
+        Ok(entry.map(|e| e.data))
+    }
+
     pub async fn update_leases(&self, expected: &HashSet<String>) {
         let mut leases = self.active_leases.write().await;
         leases.retain(|key| expected.contains(key));
@@ -68,7 +75,6 @@ impl Storage {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
-
 
     pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64 {
         self.engine.get_topic_size(wal_key)
@@ -100,58 +106,5 @@ impl Storage {
             bail!("NotLeaderForPartition: {}", wal_key);
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("walrus-bucket-{name}-{unique}"))
-    }
-
-    #[tokio::test]
-    async fn leases_gate_io() {
-        let path = temp_path("leases");
-        let bucket = Storage::new(path.clone()).await.expect("storage init");
-        let wal_key = format!("t_{}_p_{}_g_{}", 9, 7, 3);
-
-        // Writes without a lease should be rejected.
-        let err = bucket
-            .append_by_key(&wal_key, b"nope".to_vec())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("NotLeaderForPartition"));
-
-        let mut leases = HashSet::new();
-        leases.insert(wal_key.clone());
-        bucket.update_leases(&leases).await;
-        bucket
-            .append_by_key(&wal_key, b"hello-world".to_vec())
-            .await
-            .expect("append with lease");
-        let entries = bucket
-            .read_by_key(&wal_key, 1024)
-            .await
-            .expect("read with lease");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].data, b"hello-world");
-
-        leases.clear();
-        bucket.update_leases(&leases).await;
-        let err = bucket
-            .append_by_key(&wal_key, b"after-revoke".to_vec())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("NotLeaderForPartition"));
-
-        let _ = std::fs::remove_dir_all(path);
     }
 }

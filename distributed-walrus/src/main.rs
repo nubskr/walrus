@@ -1,6 +1,7 @@
 // Binary wiring only: construct the bucket (Walrus IO), metadata (Raft state machine), controller
 // (routing), Kafka facade, monitor loop, and join/bootstrap helpers.
 mod bucket;
+mod client;
 mod config;
 mod controller;
 mod metadata;
@@ -9,6 +10,7 @@ mod rpc;
 
 use bucket::Storage;
 use clap::Parser;
+use client::start_client_listener;
 use config::NodeConfig;
 use controller::NodeController;
 use metadata::{Metadata, MetadataCmd};
@@ -60,6 +62,15 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| node_config.raft_host.clone());
     let raft_bind_addr = format!("{}:{}", node_config.raft_host, node_config.raft_port);
+    let advertised_addr = format!("{}:{}", advertise_host, node_config.raft_port);
+
+    let advertised_socket_addr = match advertised_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr,
+        Err(_) => tokio::net::lookup_host(&advertised_addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve advertised addr {}", advertised_addr))?,
+    };
 
     let mut join_target_resolved: Option<std::net::SocketAddr> = None;
     if let Some(join_target) = &node_config.join_addr {
@@ -86,6 +97,7 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     let raft_cfg = OctopiiConfig {
         node_id: node_config.node_id,
         bind_addr: raft_bind_addr.parse()?,
+        public_addr: Some(advertised_socket_addr),
         peers: raft_peers,
         wal_dir: meta_path,
         is_initial_leader: node_config.node_id == 1
@@ -104,9 +116,44 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         metadata: metadata.clone(),
         raft: raft.clone(),
         offsets: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        read_cursors: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         test_fail_forward_read: std::sync::atomic::AtomicBool::new(false),
         test_fail_monitor: std::sync::atomic::AtomicBool::new(false),
         test_fail_dir_size: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    // Register this node's address in metadata for routing (leader only; others are registered via JoinCluster).
+    if node_config.node_id == 1 {
+        let register_controller = controller.clone();
+        let advertised_addr_clone = advertised_addr.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=10 {
+                match register_controller
+                    .upsert_node(register_controller.node_id, advertised_addr_clone.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Registered node address {}", advertised_addr_clone);
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to register node address (attempt {}): {}",
+                            attempt, e
+                        );
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    let client_addr = format!("{}:{}", node_config.client_host, node_config.client_port);
+    let client_controller = controller.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_client_listener(client_controller, client_addr.clone()).await {
+            error!("Client listener {} exited: {}", client_addr, e);
+        }
     });
 
     let controller_rpc = controller.clone();
@@ -145,7 +192,7 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     raft.start().await?;
 
     bootstrap_node_one(&controller, &raft, has_existing_meta).await?;
-    attempt_join(&raft, &node_config, &advertise_host, join_target_resolved).await?;
+    attempt_join(&raft, &node_config, &advertised_addr, join_target_resolved).await?;
 
     controller.update_leases().await;
     let sync_controller = controller.clone();
@@ -238,7 +285,7 @@ async fn bootstrap_node_one(
 async fn attempt_join(
     raft: &Arc<OctopiiNode>,
     node_config: &NodeConfig,
-    advertise_host: &str,
+    advertised_addr: &str,
     join_target_resolved: Option<std::net::SocketAddr>,
 ) -> anyhow::Result<()> {
     let Some(join_target) = &node_config.join_addr else {
@@ -246,10 +293,9 @@ async fn attempt_join(
     };
 
     info!("Joining cluster via {}", join_target);
-    let my_addr = format!("{}:{}", advertise_host, node_config.raft_port);
     let op = InternalOp::JoinCluster {
         node_id: node_config.node_id,
-        addr: my_addr,
+        addr: advertised_addr.to_string(),
     };
     let payload = bytes::Bytes::from(bincode::serialize(&op)?);
     let target_sock: std::net::SocketAddr = join_target_resolved

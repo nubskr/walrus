@@ -40,3 +40,13 @@ cluster-restart:
 
 cluster-logs:
 	docker compose -f docker-compose.yml logs -f
+
+cluster-logs:
+	docker compose -f docker-compose.yml logs -f
+
+cluster-clean:
+	rm -rf ./test_data/* ./test_data_rollover/*
+
+.PHONY: cluster-test-rollover
+cluster-test-rollover:
+	cd distributed-walrus && ./scripts/rollover_read_test.py
