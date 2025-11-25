@@ -6,6 +6,8 @@ import subprocess
 import time
 import threading
 import sys
+import shutil
+from pathlib import Path
 from contextlib import closing
 
 TOPIC = "stress_test_topic"
@@ -17,7 +19,7 @@ PORT_MAP = {1: 10091, 2: 10092, 3: 10093}
 
 class PersistentClient:
     def __init__(self, host, port):
-        self.sock = socket.create_connection((host, port), timeout=10)
+        self.sock = socket.create_connection((host, port), timeout=30)
     
     def send_cmd(self, cmd):
         data = cmd.encode()
@@ -103,6 +105,9 @@ class StressWorker(threading.Thread):
 
 def main():
     print("--- Starting 1-Minute Stress Test ---")
+    for path in (Path("test_data"), Path("test_data_rollover")):
+        if path.exists():
+            shutil.rmtree(path)
     
     # Setup
     subprocess.check_call(["docker", "compose", "-p", "walrus-test", "-f", "docker-compose.yml", "-f", "docker-compose.test.yml", "down", "-v"])

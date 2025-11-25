@@ -254,9 +254,9 @@ impl OpenRaftNode {
 
         // Create Raft config
         let mut raft_config = RaftConfig::default();
-        raft_config.heartbeat_interval = 200;
-        raft_config.election_timeout_min = 800;
-        raft_config.election_timeout_max = 1600;
+        raft_config.election_timeout_min = 5000;
+        raft_config.election_timeout_max = 10000;
+        raft_config.heartbeat_interval = 1000;
         let raft_config = Arc::new(
             raft_config
                 .validate()

@@ -3,6 +3,7 @@ services:
     environment:
       - WALRUS_MAX_SEGMENT_ENTRIES=10
       - WALRUS_MONITOR_CHECK_MS=200
+      - RUST_LOG=debug
     ports:
       - "10091:9091"
     volumes:
@@ -12,6 +13,7 @@ services:
     environment:
       - WALRUS_MAX_SEGMENT_ENTRIES=10
       - WALRUS_MONITOR_CHECK_MS=200
+      - RUST_LOG=debug
     ports:
       - "10092:9092"
     volumes:
@@ -21,6 +23,7 @@ services:
     environment:
       - WALRUS_MAX_SEGMENT_ENTRIES=10
       - WALRUS_MONITOR_CHECK_MS=200
+      - RUST_LOG=debug
     ports:
       - "10093:9093"
     volumes:

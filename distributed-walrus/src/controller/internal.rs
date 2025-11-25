@@ -7,7 +7,7 @@ impl NodeController {
         self.update_leases().await;
         match self.append_with_retry(&wal_key, data).await {
             Ok(_) => {
-                tracing::info!("handle_rpc: append success for {}", wal_key);
+                tracing::debug!("handle_rpc: append success for {}", wal_key);
                 self.record_append(&wal_key, 1).await; // 1 entry appended
                 if let Some((topic, segment)) = parse_wal_key(&wal_key) {
                     if let Err(e) = self.maybe_rollover(&topic, segment).await {

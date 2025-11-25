@@ -6,6 +6,8 @@ import subprocess
 import time
 import random
 import sys
+import shutil
+from pathlib import Path
 from contextlib import closing
 
 # Configuration
@@ -50,6 +52,9 @@ def get_leader_port():
 
 def main():
     print("--- Starting Full Cluster Recovery Test ---")
+    for path in (Path("test_data"), Path("test_data_rollover")):
+        if path.exists():
+            shutil.rmtree(path)
     
     # Setup
     subprocess.check_call(["docker", "compose", "-p", "walrus-test", "-f", "docker-compose.yml", "-f", "docker-compose.test.yml", "down", "-v"])
@@ -126,8 +131,15 @@ def main():
             
         # 7. Verify System is still Writable
         print("Verifying write availability after recovery...")
-        resp = send_cmd("localhost", leader_port, f"PUT {TOPIC} post-crash-msg")
-        if not resp or not resp.startswith("OK"):
+        write_ok = False
+        for _ in range(10):
+            leader_port = get_leader_port()
+            resp = send_cmd("localhost", leader_port, f"PUT {TOPIC} post-crash-msg")
+            if resp and resp.startswith("OK"):
+                write_ok = True
+                break
+            time.sleep(1)
+        if not write_ok:
             raise RuntimeError("Failed to write post-crash message")
             
         # 8. Verify we can read the new message

@@ -58,6 +58,14 @@ impl Storage {
     }
 
     pub async fn update_leases(&self, expected: &HashSet<String>) {
+        // Fast path: check if leases match without acquiring write lock
+        {
+            let leases = self.active_leases.read().await;
+            if *leases == *expected {
+                return;
+            }
+        }
+        // Slow path: update leases
         let mut leases = self.active_leases.write().await;
         leases.retain(|key| expected.contains(key));
         for key in expected.iter() {

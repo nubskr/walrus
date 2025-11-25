@@ -160,7 +160,6 @@ impl NodeController {
 
     /// Append data for the given topic. Only succeeds if this node is the leader.
     pub async fn append_for_topic(&self, topic: &str, data: Vec<u8>) -> Result<()> {
-        self.update_leases().await;
         let Some(topic_state) = self.metadata.get_topic_state(topic) else {
             return Err(anyhow!("unknown topic {}", topic));
         };
@@ -371,18 +370,40 @@ impl NodeController {
     pub(crate) async fn propose_metadata(&self, cmd: MetadataCmd) -> Result<()> {
         if self.raft.is_leader().await {
             let payload = bincode::serialize(&cmd)?;
-            let _ = self.raft.propose(payload).await?;
+            let _ = tokio::time::timeout(Duration::from_secs(10), self.raft.propose(payload))
+                .await
+                .map_err(|_| anyhow!("raft propose timed out"))??;
             return Ok(());
         }
 
-        let metrics = self.raft.raft_metrics();
-        let Some(leader_id) = metrics.current_leader else {
-            return Err(anyhow!("no raft leader known for metadata proposal"));
+        let mut leader_id = None;
+        let mut attempts = 0;
+        let max_attempts = 50; // 5 seconds with 100ms sleep
+        while leader_id.is_none() && attempts < max_attempts {
+            let metrics = self.raft.raft_metrics();
+            leader_id = metrics.current_leader;
+            tracing::debug!(
+                "propose_metadata retry (attempt {}): current_leader={:?}, state={:?}, last_log_index={:?}",
+                attempts,
+                metrics.current_leader,
+                metrics.state,
+                metrics.last_log_index
+            );
+            if leader_id.is_none() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                attempts += 1;
+            }
+        }
+
+        let Some(leader_id) = leader_id else {
+            return Err(anyhow!("no raft leader known for metadata proposal after retries"));
         };
 
         if leader_id == self.node_id {
             let payload = bincode::serialize(&cmd)?;
-            let _ = self.raft.propose(payload).await?;
+            let _ = tokio::time::timeout(Duration::from_secs(10), self.raft.propose(payload))
+                .await
+                .map_err(|_| anyhow!("raft propose timed out"))??;
             return Ok(());
         }
 

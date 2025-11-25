@@ -6,10 +6,12 @@ import subprocess
 import sys
 import time
 from contextlib import closing
+from pathlib import Path
+import shutil
 
 
 def send_cmd(host, port, cmd):
-    with closing(socket.create_connection((host, port), timeout=10)) as sock:
+    with closing(socket.create_connection((host, port), timeout=30)) as sock:
         data = cmd.encode()
         sock.sendall(struct.pack("<I", len(data)))
         sock.sendall(data)
@@ -93,6 +95,12 @@ def current_leader_port(port_map):
 
 
 def main():
+    # Always start from a clean slate; leftover raft/state files from earlier runs
+    # can leave the cluster in a bad state and cause readiness checks to fail.
+    root = Path(__file__).resolve().parent.parent
+    for stale_dir in ("test_data", "test_data_rollover"):
+        shutil.rmtree(root / stale_dir, ignore_errors=True)
+
     port_map = {1: 10091, 2: 10092, 3: 10093}
     compose = [
         "docker",

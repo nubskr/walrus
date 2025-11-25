@@ -57,22 +57,12 @@ impl QuicTransport {
             }
         }
 
-        // Create new connection
-        let mut peers = self.peers.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(peer) = peers.get(&addr) {
-            if !peer.is_closed() {
-                tracing::debug!("Reusing existing connection to {} (after lock)", addr);
-                return Ok(Arc::clone(peer));
-            }
-        }
-
         tracing::debug!("Creating new QUIC connection to {}", addr);
 
         // Configure client with permissive TLS (accept any cert for simplicity)
         let client_config = tls::create_client_config()?;
 
+        // Initiate connection (handshake) OUTSIDE of the write lock to avoid blocking other operations
         let connection = self
             .endpoint
             .connect_with(client_config, addr, "localhost")
@@ -86,12 +76,23 @@ impl QuicTransport {
                 OctopiiError::Transport(format!("Connection failed: {}", e))
             })?;
 
-        let peer = Arc::new(PeerConnection::new(connection));
-        peers.insert(addr, Arc::clone(&peer));
+        let new_peer = Arc::new(PeerConnection::new(connection));
 
+        // Acquire write lock only to insert the new connection
+        let mut peers = self.peers.write().await;
+
+        // Double-check in case someone else connected while we were handshaking
+        if let Some(peer) = peers.get(&addr) {
+            if !peer.is_closed() {
+                tracing::debug!("Reusing existing connection to {} (race won by other task)", addr);
+                return Ok(Arc::clone(peer));
+            }
+        }
+
+        peers.insert(addr, Arc::clone(&new_peer));
         tracing::info!("Connected to peer {}", addr);
 
-        Ok(peer)
+        Ok(new_peer)
     }
 
     /// Accept incoming connections
@@ -142,6 +143,13 @@ impl QuicTransport {
         } else {
             false
         }
+    }
+
+    /// Invalidate a peer connection (remove from cache)
+    pub async fn invalidate_peer(&self, addr: SocketAddr) {
+        let mut peers = self.peers.write().await;
+        peers.remove(&addr);
+        tracing::info!("Invalidated connection to {}", addr);
     }
 }
 
