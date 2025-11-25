@@ -69,6 +69,17 @@ impl Metadata {
         guard.nodes.get(&node_id).cloned()
     }
 
+    pub fn all_node_addrs(&self) -> Vec<(NodeId, String)> {
+        match self.state.read() {
+            Ok(guard) => guard
+                .nodes
+                .iter()
+                .map(|(id, addr)| (*id, addr.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn owned_topics(&self, node_id: NodeId) -> Vec<(String, u64)> {
         let guard = match self.state.read() {
             Ok(g) => g,

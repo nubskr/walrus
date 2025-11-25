@@ -7,7 +7,6 @@ distributed-walrus/test_data_rollover/
 digest.txt
 *.csv
 changes.md
-!distributed-walrus/tests/*.py
 !distributed-walrus/tests/**/*.py
 distributed-walrus/tests/__pycache__/
 distributed-walrus/target/

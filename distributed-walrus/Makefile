@@ -51,3 +51,22 @@ cluster-test-logs: cluster-clean
 .PHONY: cluster-test-rollover
 cluster-test-rollover: cluster-clean
 	python3 ./scripts/rollover_read_test.py
+
+.PHONY: cluster-test-resilience
+cluster-test-resilience: cluster-clean
+	python3 ./scripts/resilience_test.py
+
+.PHONY: cluster-test-recovery
+cluster-test-recovery: cluster-clean
+	python3 ./scripts/recovery_test.py
+
+.PHONY: cluster-test-stress
+cluster-test-stress: cluster-clean
+	python3 ./scripts/stress_test.py
+
+.PHONY: cluster-test-multi-topic
+cluster-test-multi-topic: cluster-clean
+	python3 ./scripts/multi_topic_stress_test.py
+
+.PHONY: test
+test: cluster-test-logs cluster-test-rollover cluster-test-resilience cluster-test-recovery cluster-test-stress cluster-test-multi-topic

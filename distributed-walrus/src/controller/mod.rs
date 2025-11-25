@@ -14,6 +14,8 @@ use octopii::rpc::{RequestPayload, ResponsePayload};
 use octopii::OctopiiNode;
 use serde_json;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,8 +95,26 @@ impl NodeController {
             .into_iter()
             .map(|(topic, seg)| wal_key(&topic, seg))
             .collect();
-        tracing::info!("update_leases node={} leases={:?}", self.node_id, expected);
+        self.sync_peer_addrs_from_metadata().await;
+        tracing::debug!("update_leases node={} leases={:?}", self.node_id, expected);
         self.bucket.update_leases(&expected).await;
+    }
+
+    async fn sync_peer_addrs_from_metadata(&self) {
+        for (node_id, addr) in self.metadata.all_node_addrs() {
+            if let Some(sock) = self.resolve_node_addr(&addr).await {
+                if self.raft.peer_addr_for(node_id).await != Some(sock) {
+                    self.raft.update_peer_addr(node_id, sock).await;
+                }
+            }
+        }
+    }
+
+    async fn resolve_node_addr(&self, addr: &str) -> Option<SocketAddr> {
+        match addr.parse() {
+            Ok(sock) => Some(sock),
+            Err(_) => tokio::net::lookup_host(addr).await.ok().and_then(|mut it| it.next()),
+        }
     }
 
     /// Create the topic in Raft if it does not already exist.
@@ -103,13 +123,30 @@ impl NodeController {
             return Ok(());
         }
 
+        let mut all_nodes = self.metadata.all_node_addrs();
+        all_nodes.sort_by_key(|(id, _)| *id); // deterministic order
+
+        let initial_leader = if all_nodes.is_empty() {
+            self.node_id
+        } else {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            topic.hash(&mut hasher);
+            let hash = hasher.finish();
+            let idx = (hash as usize) % all_nodes.len();
+            all_nodes[idx].0
+        };
+
         let cmd = MetadataCmd::CreateTopic {
             name: topic.to_string(),
-            initial_leader: self.node_id,
+            initial_leader,
         };
 
         self.propose_metadata(cmd).await?;
-        tracing::info!("ensure_topic: CreateTopic proposed for {}", topic);
+        tracing::info!(
+            "ensure_topic: CreateTopic proposed for {} with leader {}",
+            topic,
+            initial_leader
+        );
         // Raft apply will update Metadata, but refresh leases eagerly.
         self.update_leases().await;
         Ok(())

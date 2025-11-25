@@ -159,33 +159,33 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     let controller_rpc = controller.clone();
     // Use set_custom_rpc_handler so we don't clobber Octopii's Raft handler
     raft.set_custom_rpc_handler(move |req| {
-        if let RequestPayload::Custom { operation, data } = req.payload {
-            if operation == "Forward" {
-                info!("Received Forward RPC, payload size: {}", data.len());
-                match bincode::deserialize::<InternalOp>(&data) {
-                    Ok(op) => {
-                        let resp = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(async { controller_rpc.handle_rpc(op).await })
-                        });
-                        let success = !matches!(resp, InternalResp::Error(_));
-                        let bytes = bincode::serialize(&resp).unwrap_or_default();
-                        return ResponsePayload::CustomResponse {
-                            success,
-                            data: bytes.into(),
-                        };
-                    }
-                    Err(e) => {
-                        return ResponsePayload::Error {
-                            message: format!("decode error: {e}"),
-                        };
+        let controller_rpc = controller_rpc.clone();
+        Box::pin(async move {
+            if let RequestPayload::Custom { operation, data } = req.payload {
+                if operation == "Forward" {
+                    info!("Received Forward RPC, payload size: {}", data.len());
+                    match bincode::deserialize::<InternalOp>(&data) {
+                        Ok(op) => {
+                            let resp = controller_rpc.handle_rpc(op).await;
+                            let success = !matches!(resp, InternalResp::Error(_));
+                            let bytes = bincode::serialize(&resp).unwrap_or_default();
+                            return ResponsePayload::CustomResponse {
+                                success,
+                                data: bytes.into(),
+                            };
+                        }
+                        Err(e) => {
+                            return ResponsePayload::Error {
+                                message: format!("decode error: {e}"),
+                            };
+                        }
                     }
                 }
             }
-        }
-        ResponsePayload::Error {
-            message: "unsupported request".into(),
-        }
+            ResponsePayload::Error {
+                message: "unsupported request".into(),
+            }
+        })
     })
     .await;
 
