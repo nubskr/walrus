@@ -15,7 +15,7 @@ PORT_MAP = {1: 10091, 2: 10092, 3: 10093}
 CONTAINER_MAP = {1: "walrus-1", 2: "walrus-2", 3: "walrus-3"}
 NETWORK_NAME = "walrus-test_walrus-net"
 
-def send_cmd(host, port, cmd, timeout=5):
+def send_cmd(host, port, cmd, timeout=30):
     try:
         with closing(socket.create_connection((host, port), timeout=timeout)) as sock:
             data = cmd.encode()

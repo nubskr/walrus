@@ -90,21 +90,24 @@ impl RpcHandler {
         self.ensure_peer_receiver(addr, Arc::clone(&peer)).await;
 
         tracing::debug!("RPC request {}: sending data to {}", id, addr);
-        timeout(timeout_duration, peer.send(data))
-            .await
-            .map_err(|_| {
-                tracing::error!("RPC request {}: send timeout to {}", id, addr);
-                OctopiiError::Rpc("Request send timeout".to_string())
-            })?
-            .map_err(|e| {
+        match timeout(timeout_duration, peer.send(data)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
                 tracing::error!(
                     "RPC request {}: transport send failed to {}: {}",
                     id,
                     addr,
                     e
                 );
-                OctopiiError::Rpc(format!("Transport send failed: {}", e))
-            })?;
+                self.transport.invalidate_peer(addr).await;
+                return Err(OctopiiError::Rpc(format!("Transport send failed: {}", e)));
+            }
+            Err(_) => {
+                tracing::error!("RPC request {}: send timeout to {}", id, addr);
+                self.transport.invalidate_peer(addr).await;
+                return Err(OctopiiError::Rpc("Request send timeout".to_string()));
+            }
+        }
 
         tracing::debug!("RPC request {}: waiting for response from {}", id, addr);
         // Wait for response with timeout

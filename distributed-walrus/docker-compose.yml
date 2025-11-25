@@ -22,7 +22,7 @@ services:
       - "--client-port"
       - "9091"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000
@@ -62,7 +62,7 @@ services:
       - "--join"
       - "node1:6001"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000
@@ -102,7 +102,7 @@ services:
       - "--join"
       - "node1:6001"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - WALRUS_DISABLE_IO_URING=1
       - WALRUS_MONITOR_CHECK_MS=1000
       - WALRUS_MAX_SEGMENT_BYTES=10000000

@@ -7,18 +7,20 @@ import time
 import threading
 import random
 import sys
+import shutil
+from pathlib import Path
 from contextlib import closing
 
 # Configuration
 BASE_TOPIC = "resilience_topic"
 NUM_MESSAGES = 500
-CHAOS_DURATION_SEC = 30
+CHAOS_DURATION_SEC = 60
 NODES = [1, 2, 3]
 PORT_MAP = {1: 10091, 2: 10092, 3: 10093}
 
 def send_cmd(host, port, cmd):
     try:
-        with closing(socket.create_connection((host, port), timeout=5)) as sock:
+        with closing(socket.create_connection((host, port), timeout=30)) as sock:
             data = cmd.encode()
             sock.sendall(struct.pack("<I", len(data)))
             sock.sendall(data)
@@ -214,8 +216,46 @@ def chaos_monkey():
         
         time.sleep(5)
 
+def wait_ports(addrs, deadline=120):
+    start = time.time()
+    while time.time() - start < deadline:
+        ok = True
+        for host, port in addrs:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    pass
+            except Exception:
+                ok = False
+                break
+        if ok:
+            return
+        time.sleep(1)
+    raise RuntimeError("Ports did not come up in time")
+
+def wait_for_any_leader(deadline=120):
+    start = time.time()
+    while time.time() - start < deadline:
+        for port in PORT_MAP.values():
+            try:
+                resp = send_cmd("localhost", port, "METRICS")
+                if resp:
+                    metrics = json.loads(resp)
+                    if metrics.get("current_leader") is not None:
+                        print(f"Cluster has leader: {metrics['current_leader']}")
+                        return
+            except:
+                pass
+        time.sleep(1)
+    raise RuntimeError("Cluster did not elect a leader in time")
+
+def cleanup_data_dirs():
+    for path in [Path("test_data"), Path("test_data_rollover")]:
+        if path.exists():
+            shutil.rmtree(path)
+
 def main():
     print("--- Starting Resilience Test (Multi-Topic Failover) ---")
+    cleanup_data_dirs()
     
     subprocess.check_call(["docker", "compose", "-p", "walrus-test", "-f", "docker-compose.yml", "-f", "docker-compose.test.yml", "down", "-v"])
     subprocess.check_call(["docker", "rm", "-f", "walrus-1", "walrus-2", "walrus-3"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -223,7 +263,9 @@ def main():
     
     try:
         print("Waiting for cluster init...")
-        time.sleep(10) 
+        wait_ports([("localhost", 10091), ("localhost", 10092), ("localhost", 10093)])
+        wait_for_any_leader()
+        time.sleep(5) 
         
         writer = Writer()
         reader = Reader()

@@ -6,6 +6,8 @@ import subprocess
 import time
 import threading
 import sys
+import shutil
+from pathlib import Path
 from contextlib import closing
 
 DURATION_SEC = 60
@@ -16,7 +18,7 @@ PORT_MAP = {1: 10091, 2: 10092, 3: 10093}
 
 class PersistentClient:
     def __init__(self, host, port):
-        self.sock = socket.create_connection((host, port), timeout=10)
+        self.sock = socket.create_connection((host, port), timeout=30)
     
     def send_cmd(self, cmd):
         data = cmd.encode()
@@ -78,14 +80,20 @@ class TopicWorker(threading.Thread):
         
         # 1. Register
         client = None
-        try:
-            client = PersistentClient("localhost", self.leader_port)
-            resp = client.send_cmd(f"REGISTER {self.topic}")
-            if not resp.startswith("OK"):
-                print(f"[{self.topic}] Register failed: {resp}")
-                return
-        except Exception as e:
-            print(f"[{self.topic}] Register error: {e}")
+        for attempt in range(10):
+            try:
+                client = PersistentClient("localhost", self.leader_port)
+                resp = client.send_cmd(f"REGISTER {self.topic}")
+                if resp.startswith("OK"):
+                    break
+                print(f"[{self.topic}] Register failed (attempt {attempt + 1}): {resp}")
+            except Exception as e:
+                print(f"[{self.topic}] Register error (attempt {attempt + 1}): {e}")
+            if client:
+                client.close()
+                client = None
+            time.sleep(0.5)
+        else:
             return
 
         # 2. Write Loop
@@ -146,8 +154,27 @@ class TopicWorker(threading.Thread):
         except Exception as e:
             print(f"[{self.topic}] Verify exception: {e}")
 
+def wait_ports(addrs, deadline=120):
+    start = time.time()
+    while time.time() - start < deadline:
+        ok = True
+        for host, port in addrs:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    pass
+            except Exception:
+                ok = False
+                break
+        if ok:
+            return
+        time.sleep(1)
+    raise RuntimeError("Ports did not come up in time")
+
 def main():
     print(f"--- Starting Multi-Topic ({NUM_CLIENTS}) Stress Test ---")
+    for path in (Path("test_data"), Path("test_data_rollover")):
+        if path.exists():
+            shutil.rmtree(path)
     
     subprocess.check_call(["docker", "compose", "-p", "walrus-test", "-f", "docker-compose.yml", "-f", "docker-compose.test.yml", "down", "-v"])
     subprocess.check_call(["docker", "rm", "-f", "walrus-1", "walrus-2", "walrus-3"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -155,7 +182,7 @@ def main():
     
     try:
         print("Waiting for cluster init...")
-        time.sleep(10)
+        wait_ports([("localhost", 10091), ("localhost", 10092), ("localhost", 10093)], 180)
         
         leader_port = get_leader_port()
         print(f"Targeting Leader at port {leader_port}")
