@@ -3,6 +3,7 @@ use super::{
 };
 use crate::error::{OctopiiError, Result};
 use crate::transport::{PeerConnection, QuicTransport};
+use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 /// Callback for handling incoming requests
-pub type RequestHandler = Arc<dyn Fn(RpcRequest) -> ResponsePayload + Send + Sync>;
+pub type RequestHandler = Arc<dyn Fn(RpcRequest) -> BoxFuture<'static, ResponsePayload> + Send + Sync>;
 
 /// RPC handler that manages request/response correlation
 pub struct RpcHandler {
@@ -37,7 +38,7 @@ impl RpcHandler {
     /// Set the request handler callback
     pub async fn set_request_handler<F>(&self, handler: F)
     where
-        F: Fn(RpcRequest) -> ResponsePayload + Send + Sync + 'static,
+        F: Fn(RpcRequest) -> BoxFuture<'static, ResponsePayload> + Send + Sync + 'static,
     {
         let mut h = self.request_handler.write().await;
         *h = Some(Arc::new(handler));
@@ -190,30 +191,37 @@ impl RpcHandler {
         req: RpcRequest,
         peer: Option<Arc<PeerConnection>>,
     ) {
-        let handler = self.request_handler.read().await;
-
-        let response_payload = match handler.as_ref() {
-            Some(h) => h(req.clone()),
-            None => ResponsePayload::Error {
-                message: "No request handler registered".to_string(),
-            },
+        let handler = {
+            let guard = self.request_handler.read().await;
+            guard.clone()
         };
 
-        let response = RpcMessage::new_response(req.id, response_payload);
+        let transport = Arc::clone(&self.transport);
+        
+        tokio::spawn(async move {
+            let response_payload = match handler.as_ref() {
+                Some(h) => h(req.clone()).await,
+                None => ResponsePayload::Error {
+                    message: "No request handler registered".to_string(),
+                },
+            };
 
-        // Send response back on the same connection if peer is provided,
-        // otherwise fall back to creating a new connection
-        if let Ok(data) = serialize(&response) {
-            if let Some(peer) = peer {
-                if let Err(e) = peer.send(data).await {
-                    tracing::error!("Failed to send response via peer: {}", e);
-                }
-            } else {
-                if let Err(e) = self.transport.send(addr, data).await {
-                    tracing::error!("Failed to send response to {}: {}", addr, e);
+            let response = RpcMessage::new_response(req.id, response_payload);
+
+            // Send response back on the same connection if peer is provided,
+            // otherwise fall back to creating a new connection
+            if let Ok(data) = serialize(&response) {
+                if let Some(peer) = peer {
+                    if let Err(e) = peer.send(data).await {
+                        tracing::error!("Failed to send response via peer: {}", e);
+                    }
+                } else {
+                    if let Err(e) = transport.send(addr, data).await {
+                        tracing::error!("Failed to send response to {}: {}", addr, e);
+                    }
                 }
             }
-        }
+        });
     }
 
     /// Handle an incoming response

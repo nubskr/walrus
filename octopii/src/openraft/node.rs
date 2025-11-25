@@ -12,6 +12,8 @@ use crate::runtime::OctopiiRuntime;
 use crate::state_machine::{KvStateMachine, StateMachine};
 use crate::wal::WriteAheadLog;
 use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use once_cell::sync::Lazy;
 use openraft::impls::BasicNode;
 use openraft::metrics::RaftMetrics;
@@ -101,7 +103,7 @@ pub struct OpenRaftNode {
     peer_addrs: Arc<RwLock<std::collections::HashMap<u64, SocketAddr>>>,
     peer_addr_wal: Arc<WriteAheadLog>,
     peer_namespace: Arc<String>,
-    custom_rpc_handler: Arc<RwLock<Option<Arc<dyn Fn(crate::rpc::RpcRequest) -> crate::rpc::ResponsePayload + Send + Sync>>>>,
+    custom_rpc_handler: Arc<RwLock<Option<Arc<dyn Fn(crate::rpc::RpcRequest) -> BoxFuture<'static, crate::rpc::ResponsePayload> + Send + Sync>>>>,
     #[cfg(feature = "openraft-filters")]
     filters: Arc<OpenRaftFilters>,
 }
@@ -337,7 +339,7 @@ impl OpenRaftNode {
 
     pub async fn set_custom_rpc_handler<F>(&self, handler: F)
     where
-        F: Fn(crate::rpc::RpcRequest) -> crate::rpc::ResponsePayload + Send + Sync + 'static,
+        F: Fn(crate::rpc::RpcRequest) -> BoxFuture<'static, crate::rpc::ResponsePayload> + Send + Sync + 'static,
     {
         let mut h = self.custom_rpc_handler.write().await;
         *h = Some(Arc::new(handler));
@@ -381,87 +383,81 @@ impl OpenRaftNode {
         self.rpc
             .set_request_handler(move |req| {
                 let raft = raft_clone.clone();
+                let custom_handler = custom_handler.clone();
 
-                match req.payload {
-                    crate::rpc::RequestPayload::OpenRaft { kind, data } => {
-                        tracing::info!(
-                            "Node {}: OpenRaft RPC handler received: kind={}",
-                            node_id,
-                            kind
-                        );
-                        let response_data = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                match kind.as_str() {
-                                    "append_entries" => {
-                                        if let Ok(req) =
-                                            bincode::deserialize::<
-                                                openraft::raft::AppendEntriesRequest<AppTypeConfig>,
-                                            >(&data)
-                                        {
-                                            if let Ok(resp) = raft.append_entries(req).await {
-                                                bincode::serialize(&resp).unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
+                async move {
+                    match req.payload {
+                        crate::rpc::RequestPayload::OpenRaft { kind, data } => {
+                            tracing::info!(
+                                "Node {}: OpenRaft RPC handler received: kind={}",
+                                node_id,
+                                kind
+                            );
+                            let response_data = match kind.as_str() {
+                                "append_entries" => {
+                                    if let Ok(req) = bincode::deserialize::<
+                                        openraft::raft::AppendEntriesRequest<AppTypeConfig>,
+                                    >(&data)
+                                    {
+                                        if let Ok(resp) = raft.append_entries(req).await {
+                                            bincode::serialize(&resp).unwrap_or_default()
                                         } else {
                                             Vec::new()
                                         }
+                                    } else {
+                                        Vec::new()
                                     }
-                                    "vote" => {
-                                        if let Ok(req) =
-                                            bincode::deserialize::<
-                                                openraft::raft::VoteRequest<AppTypeConfig>,
-                                            >(&data)
-                                        {
-                                            if let Ok(resp) = raft.vote(req).await {
-                                                bincode::serialize(&resp).unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        }
-                                    }
-                                    "install_snapshot" => {
-                                        if let Ok(req) = bincode::deserialize::<
-                                            openraft::raft::InstallSnapshotRequest<AppTypeConfig>,
-                                        >(
-                                            &data
-                                        ) {
-                                            if let Ok(resp) = raft.install_snapshot(req).await {
-                                                bincode::serialize(&resp).unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        }
-                                    }
-                                    _ => Vec::new(),
                                 }
-                            })
-                        });
+                                "vote" => {
+                                    if let Ok(req) = bincode::deserialize::<
+                                        openraft::raft::VoteRequest<AppTypeConfig>,
+                                    >(&data)
+                                    {
+                                        if let Ok(resp) = raft.vote(req).await {
+                                            bincode::serialize(&resp).unwrap_or_default()
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                                "install_snapshot" => {
+                                    if let Ok(req) = bincode::deserialize::<
+                                        openraft::raft::InstallSnapshotRequest<AppTypeConfig>,
+                                    >(&data)
+                                    {
+                                        if let Ok(resp) = raft.install_snapshot(req).await {
+                                            bincode::serialize(&resp).unwrap_or_default()
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                                _ => Vec::new(),
+                            };
 
-                        crate::rpc::ResponsePayload::OpenRaft {
-                            kind,
-                            data: bytes::Bytes::from(response_data),
+                            crate::rpc::ResponsePayload::OpenRaft {
+                                kind,
+                                data: bytes::Bytes::from(response_data),
+                            }
                         }
-                    }
-                    _ => {
-                        let custom = custom_handler.clone();
-                        tokio::task::block_in_place(|| {
-                            let guard = tokio::runtime::Handle::current().block_on(async { custom.read().await });
+                        _ => {
+                            let guard = custom_handler.read().await;
                             if let Some(h) = guard.as_ref() {
-                                h(req)
+                                h(req).await
                             } else {
                                 crate::rpc::ResponsePayload::CustomResponse {
                                     success: false,
                                     data: bytes::Bytes::new(),
                                 }
                             }
-                        })
+                        }
                     }
                 }
+                .boxed()
             })
             .await;
 
