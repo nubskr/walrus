@@ -348,7 +348,7 @@ impl NodeController {
                     operation: "Forward".into(),
                     data: bytes.into(),
                 },
-                Duration::from_secs(5),
+                Duration::from_secs(15),
             )
             .await?;
 
@@ -408,7 +408,7 @@ impl NodeController {
                     operation: "Forward".into(),
                     data: bytes.into(),
                 },
-                Duration::from_secs(5),
+                Duration::from_secs(15),
             )
             .await?;
 
@@ -493,7 +493,7 @@ impl NodeController {
                     operation: "Forward".into(),
                     data: bytes.into(),
                 },
-                Duration::from_secs(5),
+                Duration::from_secs(15),
             )
             .await?;
 
