@@ -1,13 +1,11 @@
 distributed-walrus/test_data_rollover/
 *.py
-!scripts/*.py
 .DS_Store
 /target
 /wal_files
 digest.txt
 *.csv
 changes.md
-!distributed-walrus/tests/**/*.py
 distributed-walrus/tests/__pycache__/
 distributed-walrus/target/
 distributed-walrus/.venv/
