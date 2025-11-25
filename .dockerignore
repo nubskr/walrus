@@ -11,3 +11,5 @@ test_data_rollover/
 test_data_rollover
 /test_data_rollover
 distributed-walrus/test_data_rollover/
+distributed-walrus/test_data
+distributed-walrus/test_data_*/

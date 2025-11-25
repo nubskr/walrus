@@ -1,586 +1,1093 @@
 # Distributed Walrus Architecture
 
-> A distributed write-ahead log built on Raft consensus and Walrus local storage
+## Overview
 
----
+Distributed Walrus is a distributed streaming log system built on top of the Walrus storage engine. It provides a fault-tolerant, distributed write-ahead log with automatic leadership rotation and segment-based partitioning. The system uses Raft consensus (via Octopii) for metadata coordination and Walrus for durable data storage.
 
-## What Is It?
-
-Distributed Walrus is a **distributed WAL** that spreads writes across nodes using **segments**. When a segment gets full (1M entries by default), it automatically rolls over to the next node in round-robin fashion.
-
-**Core idea:**
-- One **topic** (like "logs") split into **segments** (s1, s2, s3...)
-- Each segment has one **leader node** that can write to it
-- Segments are immutable once sealed (rollover happens → new segment, new leader)
-- Raft metadata tracks who owns what
-
----
-
-## The System in 30 Seconds
+## High-Level Architecture
 
 ```
-Topic "logs" — spread across 3 nodes:
+                           ┌─────────────────────────────────┐
+                           │      Client Applications         │
+                           │  (walrus-cli, Python scripts)    │
+                           └──┬────────────────────────────┬──┘
+                              │                            │
+                        TCP   │                            │   TCP
+                    :8080-9093│                            │:8080-9093
+                              │                            │
+        ┌─────────────────────▼─────────┐   ┌─────────────▼──────────────┐
+        │        Node 1 (Leader)        │   │         Node 2              │
+        │                               │   │                             │
+        │  ┌─────────────────────────┐  │   │  ┌─────────────────────┐   │
+        │  │   Client Listener       │  │   │  │  Client Listener    │   │
+        │  │   • Length-prefixed     │  │   │  │  • REGISTER/PUT/GET │   │
+        │  │   • REGISTER/PUT/GET    │  │   │  │  • STATE/METRICS    │   │
+        │  └──────────┬──────────────┘  │   │  └──────────┬──────────┘   │
+        │             │                  │   │             │              │
+        │             ▼                  │   │             ▼              │
+        │  ┌─────────────────────────┐  │   │  ┌─────────────────────┐   │
+        │  │   NodeController        │  │   │  │   NodeController    │   │
+        │  │  ┌──────────────────┐   │  │   │  │  ┌──────────────┐   │   │
+        │  │  │ Routing Logic    │   │  │   │  │  │ Routing Logic│   │   │
+        │  │  │ • ensure_topic() │   │  │   │  │  │ • Forward to │   │   │
+        │  │  │ • append/read    │   │  │   │  │  │   leader     │   │   │
+        │  │  └──────────────────┘   │  │   │  │  └──────────────┘   │   │
+        │  │  ┌──────────────────┐   │  │   │  │  ┌──────────────┐   │   │
+        │  │  │ Lease Sync       │   │  │   │  │  │ Lease Sync   │   │   │
+        │  │  │ • 100ms loop     │   │  │   │  │  │ • 100ms loop │   │   │
+        │  │  │ • update_leases()│   │  │   │  │  │ update_leases│   │   │
+        │  │  └──────────────────┘   │  │   │  │  └──────────────┘   │   │
+        │  └─┬───────┬────────┬──────┘  │   │  └─┬───────┬─────┬────┘   │
+        │    │       │        │         │   │    │       │     │        │
+        │    │       │        │         │   │    │       │     │        │
+        │ ┌──▼───┐ ┌▼──────┐ │         │   │ ┌──▼───┐ ┌▼────┐│        │
+        │ │Meta- │ │Bucket │ │         │   │ │Meta- │ │Buckｅ││        │
+        │ │data  │ │(Stor- │ │         │   │ │data  │ │t(Sto││        │
+        │ │State │ │age)   │ │         │   │ │State │ │rage)││        │
+        │ │      │ │       │ │         │   │ │      │ │     ││        │
+        │ │Topics│ │Leases:│ │         │   │ │Topics│ │Lease││        │
+        │ │Nodes │ │logs:1 │ │         │   │ │Nodes │ │logs:││        │
+        │ │Segs  │ │logs:2 │ │         │   │ │Segs  │ │     ││        │
+        │ └──┬───┘ └───┬───┘ │         │   │ └──┬───┘ └──┬──┘│        │
+        │    │         │     │         │   │    │        │   │        │
+        │    │    ┌────▼─────▼──────┐  │   │    │   ┌────▼───▼─────┐  │
+        │    │    │  Walrus Engine  │  │   │    │   │ Walrus Engine│  │
+        │    │    │  • batch_append │  │   │    │   │ • read_next  │  │
+        │    │    │  • read_next    │  │   │    │   │ • Disk I/O   │  │
+        │    │    └─────────────────┘  │   │    │   └──────────────┘  │
+        │    │                         │   │    │                     │
+        │    │    ┌──Monitor Loop────┐ │   │    │    ┌─Monitor Loop┐ │
+        │    │    │ • Check segments │ │   │    │    │ • Rollover  │ │
+        │    │    │ • Trigger        │ │   │    │    │   checks    │ │
+        │    │    │   rollover       │ │   │    │    └─────────────┘ │
+        │    │    └──────────────────┘ │   │    │                     │
+        │    │                         │   │    │                     │
+        │ ┌──▼─────────────────────────▼┐ │   │ ┌──▼─────────────────▼┐
+        │ │   Octopii (Raft Engine)    │ │   │ │  Octopii (Raft)     │
+        │ │   • Metadata replication   │◄┼───┼─┤  • Follower         │
+        │ │   • Leader election        │ │   │ │  • Vote/heartbeat   │
+        │ │   • Log commit             │ │   │ │  • Apply commands   │
+        │ └────────────────────────────┘ │   │ └─────────────────────┘
+        │                                │   │                         │
+        │       Port :6001 (Raft RPC)    │   │   Port :6002 (Raft)     │
+        └────────────────────────────────┘   └─────────────────────────┘
+                         │                                  │
+                         │      Raft Consensus Network      │
+                         │  (AppendEntries, RequestVote)    │
+                         └──────────────┬───────────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │      Node 3                  │
+                         │  • Similar structure         │
+                         │  • Port :6003 (Raft)         │
+                         │  • Port :9093 (Client)       │
+                         └──────────────────────────────┘
 
- ┌─────────────┬─────────────┬─────────────┬─────────────┐
- │  Segment 1  │  Segment 2  │  Segment 3  │  Segment 4  │
- │   (sealed)  │   (sealed)  │  (ACTIVE)   │  (pending)  │
- ├─────────────┼─────────────┼─────────────┼─────────────┤
- │   Node 1    │   Node 2    │   Node 3    │   Node 1    │
- │  [0→1M]     │  [1M→2M]    │  [2M→3M]    │ [not yet]   │
- └─────────────┴─────────────┴─────────────┴─────────────┘
-                                    ▲
-                                    │
-                            writes go here
-
-Round-robin: Node 1 → Node 2 → Node 3 → Node 1 → ...
+Legend:
+━━━ Raft consensus (metadata only, not data)
+─── Component communication within node
+↑↓  External connections (client TCP, node RPC)
 ```
 
-**How it works:**
-1. Client sends append to any node
-2. Node checks Raft metadata: "Who owns the current segment?"
-3. If this node owns it → write to local Walrus
-4. If another node owns it → return error (client retries to correct node)
-5. When segment hits 1M entries → monitor proposes rollover via Raft
-6. Raft increments segment number, assigns next node round-robin
+## Component Interactions
+
+Understanding how components collaborate is key to understanding the system. Here's how they work together:
+
+### Startup & Initialization Flow
 
 ```
-                         3-Node Cluster View
-                         ===================
-
-  ┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
-  │      Node 1         │   │      Node 2         │   │      Node 3         │
-  │                     │   │                     │   │                     │
-  │  ┌──────────────┐   │   │  ┌──────────────┐   │   │  ┌──────────────┐   │
-  │  │ Controller   │   │   │  │ Controller   │   │   │  │ Controller   │   │
-  │  └──────┬───────┘   │   │  └──────┬───────┘   │   │  └──────┬───────┘   │
-  │         │           │   │         │           │   │         │           │
-  │  ┌──────▼───────┐   │   │  ┌──────▼───────┐   │   │  ┌──────▼───────┐   │
-  │  │   Storage    │   │   │  │   Storage    │   │   │  │   Storage    │   │
-  │  │              │   │   │  │              │   │   │  │              │   │
-  │  │ owns: s1, s4 │   │   │  │   owns: s2   │   │   │  │   owns: s3   │   │
-  │  └──────┬───────┘   │   │  └──────┬───────┘   │   │  └──────┬───────┘   │
-  │         │           │   │         │           │   │         │           │
-  │  ┌──────▼───────┐   │   │  ┌──────▼───────┐   │   │  ┌──────▼───────┐   │
-  │  │   Walrus     │   │   │  │   Walrus     │   │   │  │   Walrus     │   │
-  │  │              │   │   │  │              │   │   │  │              │   │
-  │  │  t_logs_s_1  │   │   │  │  t_logs_s_2  │   │   │  │  t_logs_s_3  │   │
-  │  │  t_logs_s_4  │   │   │  │  (sealed)    │   │   │  │  (ACTIVE)    │   │
-  │  │  (sealed)    │   │   │  │              │   │   │  │              │   │
-  │  └──────────────┘   │   │  └──────────────┘   │   │  └──────────────┘   │
-  │                     │   │                     │   │                     │
-  └──────────┬──────────┘   └──────────┬──────────┘   └──────────┬──────────┘
-             │                         │                         │
-             └─────────────────────────┼─────────────────────────┘
-                                       │
-                            ╔══════════▼══════════╗
-                            ║   Raft Metadata     ║
-                            ║                     ║
-                            ║  topic: "logs"      ║
-                            ║  segment: 3         ║
-                            ║  leader: node3      ║
-                            ║  sealed_offset: 2M  ║
-                            ╚═════════════════════╝
-
-Write to segment 3 → must go to Node 3 (current leader)
-Segments 1, 2, 4 are sealed (no more writes, read-only)
+┌───────────────────────────────────────────────────────────────────────┐
+│ Node Startup (main.rs:start_node)                                    │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  1. Parse CLI Config                                                 │
+│     ├─ node_id, ports, join_addr, data directories                  │
+│     └─ Create data_wal_dir and meta_wal_dir                         │
+│                                                                       │
+│  2. Initialize Storage (Bucket)                                      │
+│     ├─ Create Walrus instance for "data_plane" namespace            │
+│     ├─ Initialize empty lease set                                   │
+│     └─ Ready to accept append/read (but lease checks will fail)     │
+│                                                                       │
+│  3. Initialize Metadata State Machine                               │
+│     ├─ Create empty ClusterState (topics, nodes maps)               │
+│     └─ Will be populated via Raft replication                       │
+│                                                                       │
+│  4. Start Octopii (Raft)                                            │
+│     ├─ Load/create WAL in meta_wal_dir                              │
+│     ├─ Bind to raft_port for peer communication                     │
+│     ├─ If node_id==1 && !join: Bootstrap as initial leader          │
+│     └─ If join specified: Contact existing node                     │
+│                                                                       │
+│  5. Create NodeController                                           │
+│     ├─ Holds references: bucket, metadata, raft                     │
+│     ├─ Initialize empty: offsets, read_cursors                      │
+│     └─ Ready to coordinate between components                       │
+│                                                                       │
+│  6. Register Custom RPC Handler                                     │
+│     ├─ Octopii handles Raft RPCs (AppendEntries, RequestVote)      │
+│     └─ Custom handler for InternalOp (Forward*, JoinCluster)        │
+│                                                                       │
+│  7. Start Background Tasks                                          │
+│     ├─ Client Listener (TCP server on client_port)                  │
+│     ├─ Lease Update Loop (every 100ms: sync leases from metadata)   │
+│     └─ Monitor Loop (every 10s: check for rollover triggers)        │
+│                                                                       │
+│  8. Bootstrap First Topic (node_id==1 only)                         │
+│     ├─ Propose CreateTopic("logs", leader=1)                        │
+│     ├─ Propose RolloverTopic (seal nothing, start segment 1)        │
+│     └─ Call update_leases() to grant self write lease              │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### The Lease Synchronization Dance
 
-## Components
-
-```
-                Component Architecture (Single Node)
-                ====================================
-
-         ┌───────────────────────────────────────────────────┐
-         │                                                   │
-    RPC  │              NodeController                       │
-   ─────►│  • Routes requests                                │
-         │  • Updates leases every 100ms                     │
-         │  • Tracks entry counts (in-memory HashMap)        │
-         │                                                   │
-         └───┬─────────────────┬─────────────────┬───────────┘
-             │                 │                 │
-             │ owns_topics()   │ propose()       │ update_leases()
-             │                 │                 │
-         ┌───▼──────┐     ┌────▼────────┐   ┌───▼──────────┐
-         │          │     │             │   │              │
-         │ Metadata │     │    Raft     │   │   Storage    │
-         │ (state)  │◄────┤  Consensus  │   │  (leases)    │
-         │          │     │             │   │              │
-         └──────────┘     └─────────────┘   └───┬──────────┘
-                                                 │ append()
-                                                 │
-                                             ┌───▼──────────┐
-                                             │              │
-                                             │   Walrus     │
-                                             │ (local WAL)  │
-                                             │              │
-                                             └──────────────┘
-                                                    │
-                                                    ▼
-                                             [disk: io_uring]
-
-         ┌───────────────────────────────────────────────────┐
-         │              Monitor                              │
-         │  • Checks segment sizes every 10s                 │
-         │  • Proposes rollover when over limit              │
-         │                                                   │
-         └───────────────────────────────────────────────────┘
-```
-
-### 1. Storage (bucket.rs)
-**What it is:** Thin wrapper around Walrus (the local WAL engine)
-
-**What it does:**
-- Enforces **leases**: only write if you own the segment
-- Per-key locks: prevent concurrent writes to same segment
-- Simple API: `append_by_key(wal_key, data)` and `update_leases(keys)`
-
-**Why leases?**
-Prevents split-brain: if Raft reassigns segment 3 from node A to node B, node A must stop writing immediately.
+Leases are the critical mechanism that prevents split-brain writes. Here's the continuous synchronization:
 
 ```
-Storage
-  ├── Walrus engine (io_uring or mmap backend)
-  ├── active_leases: HashSet<String>     (which segments can I write?)
-  └── write_locks: per-key mutexes       (serialize writes to each segment)
+┌──────────────────────────────────────────────────────────────────┐
+│ Lease Sync Flow (runs every 100ms per node)                     │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Controller::run_lease_update_loop()                            │
+│     │                                                            │
+│     ├─► Controller::update_leases()                             │
+│           │                                                      │
+│           ├─► Metadata::owned_topics(self.node_id)              │
+│           │     └─ Query local replica of Raft state            │
+│           │        Example result: [("logs", 1), ("metrics", 3)]│
+│           │                                                      │
+│           ├─► Convert to wal_keys: ["logs:1", "metrics:3"]      │
+│           │                                                      │
+│           ├─► Storage::update_leases(expected_set)              │
+│           │     │                                                │
+│           │     ├─ Compare current leases vs expected           │
+│           │     ├─ Add missing: leases.insert("logs:1")         │
+│           │     └─ Remove stale: leases.remove("old:5")         │
+│           │                                                      │
+│           └─► Sync peer addresses from metadata                 │
+│                 └─ Update Raft peer table if addresses changed  │
+│                                                                  │
+│  Result: Storage now accepts appends for owned segments only    │
+│                                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ When Metadata Changes (via Raft):                               │
+│                                                                  │
+│  RolloverTopic committed                                         │
+│     ├─ Metadata state updated (new leader, sealed segment)      │
+│     │                                                            │
+│     └─ Within 100ms:                                             │
+│          ├─ Old leader: next update_leases() removes lease      │
+│          │               writes to old segment start failing    │
+│          │                                                       │
+│          └─ New leader: next update_leases() grants lease       │
+│                         starts accepting writes to new segment  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-### 2. Metadata (metadata.rs)
-**What it is:** Raft state machine storing topic/segment ownership
-
-**Data model:**
-```rust
-ClusterState {
-    topics: HashMap<TopicName, TopicState>
-}
-
-TopicState {
-    current_segment: u64,              // e.g., 3
-    leader_node: NodeId,               // e.g., node 2
-    last_sealed_entry_offset: u64,    // total entries in sealed segments
-}
-```
-
-**Commands:**
-- `CreateTopic { name, initial_leader }` - Bootstrap a new topic
-- `RolloverTopic { name, new_leader, sealed_segment_entry_count }` - Seal current segment, start new one
-
-**Key method:**
-- `owned_topics(node_id)` - Returns `Vec<(topic, segment)>` this node currently leads
-
----
-
-### 3. NodeController (controller/mod.rs)
-**What it is:** Request router and lease coordinator
-
-**Jobs:**
-1. Handle RPC: `ForwardAppend`, `JoinCluster`, etc.
-2. Update leases: fetch owned segments from Raft metadata → sync to Storage
-3. Track entry counts: in-memory HashMap for rollover decisions
-4. Retry logic: if append fails, update leases and retry once
-
-**Key loop:**
-```rust
-run_lease_update_loop() {
-    every 100ms:
-        owned = metadata.owned_topics(this_node)
-        storage.update_leases(owned)
-}
-```
-
-**Why the loop?** Reactive polling. When Raft applies a rollover, this catches it within 100ms.
-
----
-
-### 4. Monitor (monitor.rs)
-**What it is:** Background loop that checks segment sizes and proposes rollovers
-
-**How it works:**
-```
-Every 10 seconds:
-    for each (topic, segment) I own:
-        sealed = metadata.last_sealed_entry_offset
-        current = controller.tracked_entry_count(segment)
-        entries_in_segment = current - sealed
-
-        if entries_in_segment > 1M:
-            propose RolloverTopic via Raft
-```
-
-**Round-robin assignment:**
-```rust
-nodes = [1, 2, 3]
-current_idx = nodes.position(my_id)
-next_leader = nodes[(current_idx + 1) % nodes.len()]
-```
-
-**Environment variables:**
-- `WALRUS_MONITOR_CHECK_MS` - how often to check (default 10s)
-- `WALRUS_MAX_SEGMENT_ENTRIES` - rollover threshold (default 1M)
-
----
-
-## Data Flow: Append
+### Write Path: Complete Interaction Chain
 
 ```
-                     Write Request Flow
-                     ==================
-
-  ┌──────────┐
-  │  Client  │  "Append to 'logs'"
-  └─────┬────┘
-        │
-        │ 1. RPC: ForwardAppend { wal_key: "t_logs_s_3", data: [...] }
-        │
-        ▼
-  ╔═══════════════════╗
-  ║ NodeController    ║  ◄── (can land on any node)
-  ╚═══════════════════╝
-        │
-        │ 2. update_leases() — "Do I own segment 3?"
-        │
-        ▼
-  ┌───────────────────┐
-  │  Metadata (Raft)  │
-  │                   │
-  │  logs:            │
-  │   segment: 3      │
-  │   leader: node2   │
-  └─────────┬─────────┘
-            │
-            │ 3. Check ownership
-            │
-      ┌─────▼──────┐
-      │  Own it?   │───no───► ❌ Error: "NotLeaderForPartition"
-      └─────┬──────┘
-            │ yes
-            │
-            ▼
-  ┌───────────────────┐
-  │  Storage          │
-  │                   │
-  │  ✓ Check lease    │
-  │  ✓ Lock key       │
-  │  ✓ Append         │
-  └─────────┬─────────┘
-            │
-            ▼
-  ┌───────────────────┐
-  │  Walrus Engine    │  ◄── (local disk, io_uring)
-  │                   │
-  │  batch_append()   │
-  └─────────┬─────────┘
-            │
-            │ ✅ Success
-            │
-            ▼
-  ┌───────────────────┐
-  │  NodeController   │
-  │                   │
-  │  record_append()  │  (entry count += 1)
-  └───────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Client → Cluster → Storage: Write Flow                              │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Client: PUT logs "hello world"                                     │
+│     │                                                                │
+│     ├─► [TCP to any node] Client Listener receives                 │
+│           │                                                          │
+│           ├─► Parse command: topic="logs", data="hello world"       │
+│           │                                                          │
+│           └─► Controller::ensure_topic("logs")                      │
+│                 │                                                    │
+│                 ├─► Metadata::get_topic_state("logs")               │
+│                 │     └─ Check if topic exists                      │
+│                 │                                                    │
+│                 ├─ If missing:                                      │
+│                 │   ├─ Hash("logs") % num_nodes → initial_leader   │
+│                 │   ├─ Propose CreateTopic via Raft                │
+│                 │   └─ Wait for Raft commit                        │
+│                 │                                                    │
+│                 └─► Controller::append_for_topic("logs", data)      │
+│                       │                                              │
+│                       ├─► Metadata::get_topic_state("logs")         │
+│                       │     └─ Returns: {current_segment: 1,        │
+│                       │                  leader_node: 2}            │
+│                       │                                              │
+│                       ├─ Am I leader? (self.node_id == 2?)          │
+│                       │                                              │
+│        ┌──────────────┴──────────────┐                              │
+│       NO                             YES                             │
+│        │                              │                              │
+│        │                              │                              │
+│   ┌────▼─────────────────┐      ┌────▼─────────────────┐           │
+│   │ forward_append_remote│      │ forward_append (local)│           │
+│   └────┬─────────────────┘      └────┬─────────────────┘           │
+│        │                              │                              │
+│        │ RPC to leader node           │                              │
+│        │ InternalOp::ForwardAppend    │                              │
+│        │                              │                              │
+│        └────────────┬─────────────────┘                              │
+│                     │                                                │
+│                     ├─► append_with_retry(wal_key, data)            │
+│                           │                                          │
+│                           ├─► Storage::append_by_key("logs:1", data)│
+│                           │     │                                    │
+│                           │     ├─► ensure_lease("logs:1")           │
+│                           │     │     └─ Check: "logs:1" in leases? │
+│                           │     │        └─ YES → proceed            │
+│                           │     │           NO  → NotLeaderError     │
+│                           │     │                                    │
+│                           │     ├─► Acquire per-key mutex            │
+│                           │     │     └─ Prevents concurrent writes  │
+│                           │     │                                    │
+│                           │     └─► Walrus::batch_append_for_topic   │
+│                           │           └─ Durable write to WAL file  │
+│                           │                                          │
+│                           └─► record_append(wal_key, 1)              │
+│                                 └─ offsets["logs:1"] += 1            │
+│                                    (used for rollover detection)    │
+│                                                                      │
+│  ◄── Return OK to client                                            │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Data Flow: Rollover
+### Read Path: Cursor Advancement Across Segments
 
 ```
-                    Segment Rollover Flow
-                    =====================
-
-  ┌─────────────────────────────────────────────────────┐
-  │  Monitor Loop (every 10s)                           │
-  │                                                     │
-  │  "Check my segments..."                             │
-  │   Segment 3: 1.2M entries (OVER 1M limit!) 🚨       │
-  └───────────────────┬─────────────────────────────────┘
-                      │
-                      │ Propose rollover
-                      ▼
-         ╔════════════════════════════╗
-         ║    Raft Cluster            ║
-         ║                            ║
-         ║  RolloverTopic {           ║
-         ║    name: "logs"            ║
-         ║    new_leader: node3       ║
-         ║    sealed_count: 200k      ║
-         ║  }                         ║
-         ╚════════════╦═══════════════╝
-                      │
-                      │ Consensus!
-                      ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  Metadata.apply()                                   │
-  │                                                     │
-  │  last_sealed_entry_offset += 200k  (2M → 2.2M)     │
-  │  current_segment += 1              (3 → 4)         │
-  │  leader_node = node3                               │
-  └─────────────────┬───────────────────────────────────┘
-                    │
-                    │ All nodes see this update
-                    ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  Lease Update Loop (next 100ms tick)                │
-  │                                                     │
-  │  Node 2: ❌ loses lease for segment 3               │
-  │  Node 3: ✅ gains lease for segment 4               │
-  └─────────────────────────────────────────────────────┘
-
-               Before                After
-            ┌──────────┐         ┌──────────┐
-  Segment 3 │  Node 2  │   →     │  SEALED  │
-            │ (ACTIVE) │         └──────────┘
-            └──────────┘
-  Segment 4 │ (pending)│   →     │  Node 3  │
-            └──────────┘         │ (ACTIVE) │
-                                 └──────────┘
-
-Two-phase commit:
-  Phase 1: Monitor detects → Raft consensus (async)
-  Phase 2: Lease loop reacts → Storage updated (polling)
+┌──────────────────────────────────────────────────────────────────────┐
+│ Client → Cluster → Storage: Read Flow with Cursor                   │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Client: GET logs                                                   │
+│     │                                                                │
+│     └─► Controller::read_one_for_topic_shared("logs")               │
+│           │                                                          │
+│           ├─► Fetch shared cursor from read_cursors map             │
+│           │    Initial: { segment: 1, delivered_in_segment: 0 }     │
+│           │                                                          │
+│           └─► read_one_for_topic("logs", &mut cursor) [LOOP]        │
+│                 │                                                    │
+│                 ├─► Metadata::get_topic_state("logs")               │
+│                 │    Returns: {                                     │
+│                 │      current_segment: 3,                          │
+│                 │      sealed_segments: {1 → 1000000, 2 → 950000},  │
+│                 │      segment_leaders: {1 → node2, 2 → node3}      │
+│                 │    }                                              │
+│                 │                                                    │
+│                 ├─ Is cursor.segment (1) < current_segment (3)?     │
+│                 │  YES → segment 1 is sealed                        │
+│                 │    │                                              │
+│                 │    ├─ sealed_count = 1_000_000                    │
+│                 │    ├─ cursor.delivered_in_segment = 5             │
+│                 │    └─ 5 < 1_000_000? YES, more data available    │
+│                 │                                                    │
+│                 ├─► Determine leader for segment 1                  │
+│                 │    └─ segment_leaders[1] = node2                  │
+│                 │                                                    │
+│                 ├─ Is leader local? (self.node_id == node2?)        │
+│                 │                                                    │
+│       ┌─────────┴─────────┐                                         │
+│      NO                   YES                                       │
+│       │                    │                                         │
+│  ┌────▼───────────┐  ┌────▼──────────┐                             │
+│  │forward_read_   │  │forward_read   │                             │
+│  │  remote        │  │  (local)      │                             │
+│  │  (RPC)         │  │               │                             │
+│  └────┬───────────┘  └────┬──────────┘                             │
+│       │                   │                                         │
+│       └────────┬──────────┘                                         │
+│                │                                                    │
+│                ├─► Storage::read_one("logs:1")                      │
+│                │     └─ Walrus::read_next("logs:1", advance=true)  │
+│                │        └─ Returns Some(b"entry_5")                │
+│                │                                                    │
+│                ├─ Got data?                                         │
+│                │  YES:                                              │
+│                │    ├─ cursor.delivered_in_segment += 1 (now 6)    │
+│                │    └─ Return Some(entry)                          │
+│                │                                                    │
+│                │  NO (empty):                                       │
+│                │    ├─ Is segment sealed?                           │
+│                │    │  YES:                                         │
+│                │    │    ├─ delivered >= sealed_count?              │
+│                │    │    │  YES:                                    │
+│                │    │    │    ├─ cursor.segment += 1 (now 2)        │
+│                │    │    │    ├─ cursor.delivered = 0               │
+│                │    │    │    └─ CONTINUE LOOP (try segment 2)      │
+│                │    │    │                                          │
+│                │    │    └─ NO: Return None (waiting for data)      │
+│                │    │                                                │
+│                │    └─ NO (active segment):                         │
+│                │         └─ Return None (no data yet)               │
+│                │                                                    │
+│                └─► Update shared cursor in read_cursors map         │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Metadata Replication via Raft
 
-## WAL Key Format
-
-```
-t_{topic}_s_{segment}
-```
-
-Examples:
-- `t_logs_s_1` - topic "logs", segment 1
-- `t_logs_s_42` - topic "logs", segment 42
-
-This is the **physical key** passed to Walrus. It's also the lease identifier.
-
----
-
-## Entry Count Tracking
-
-**Problem:** Walrus is byte-oriented, but we rollover based on entry count.
-
-**Current approach:**
-- `NodeController.offsets: HashMap<String, u64>` - in-memory entry counter
-- After each append: `record_append(wal_key, 1)`
-- Monitor reads this to decide when to rollover
-
-**Limitation:**
-- Assumes 1 append = 1 entry (no batching)
-- State is lost on restart (non-durable)
-- Diverges if append succeeds but increment fails
-
-**Better approach (not yet implemented):**
-- Query Walrus directly for byte size
-- Parse entries OR store entry count in segment metadata
-
----
-
-## Cluster Membership
-
-**Bootstrap (node 1):**
-1. Start as single-node Raft cluster
-2. Campaign for leadership
-3. Create topic "logs" via Raft
-4. Rollover immediately to create segment 1
-
-**Join (nodes 2, 3, ...):**
-1. Start with `--join-addr <node1-address>`
-2. Send `JoinCluster` RPC to node 1
-3. Node 1 adds as Raft **learner** (read-only)
-4. Wait for learner to catch up (polls every 500ms, max 60s)
-5. Promote learner to **voter** (can participate in consensus)
-
-**Why learner → voter?**
-If you add a voter immediately and it's behind, Raft can't commit (needs majority). Learners don't vote, so cluster stays available during catch-up.
-
----
-
-## Lease Enforcement
-
-**Goal:** Prevent stale writes when ownership changes
-
-**How it works:**
-
-1. **Raft decides ownership:**
-   ```rust
-   TopicState { segment: 3, leader: node2 }
-   ```
-
-2. **Lease update loop (every 100ms):**
-   ```rust
-   owned = metadata.owned_topics(my_node_id)  // e.g., [(logs, 3)]
-   storage.update_leases(owned)               // grants t_logs_s_3
-   ```
-
-3. **Append checks lease:**
-   ```rust
-   if !active_leases.contains(wal_key) {
-       bail!("NotLeaderForPartition")
-   }
-   ```
-
-**Edge case:**
-- Raft rolls over segment 3 from node 2 → node 3
-- Node 2's lease loop hasn't run yet (could be 99ms away)
-- Node 2 still has the lease for ~100ms after losing ownership
-
-**Mitigation:**
-- Append calls `update_leases()` before writing (eager sync)
-- Retry logic also calls `update_leases()` on failure
-- So in practice, stale lease window is ~1ms, not 100ms
-
----
-
-## Testing & Development
-
-**Test controls (via RPC):**
-```rust
-TestControl::ForceMonitorError       // Make monitor fail
-TestControl::ForceDirSizeError       // Make size check fail
-TestControl::RevokeLeases { topic }  // Manually drop all leases
-TestControl::SyncLeases              // Force immediate lease update
-TestControl::TriggerJoin { ... }     // Manual cluster join
-```
-
-**Environment overrides:**
-```bash
-# Use mmap backend instead of io_uring (for containers)
-WALRUS_DISABLE_IO_URING=1
-
-# Check segment sizes every 1 second (instead of 10s)
-WALRUS_MONITOR_CHECK_MS=1000
-
-# Rollover at 100k entries (instead of 1M)
-WALRUS_MAX_SEGMENT_ENTRIES=100000
-```
-
----
-
-## Limitations & Future Work
-
-### 1. No Read Path
-Currently only writes are implemented. To add reads:
-- Need to forward reads to segment owner (or allow reads from any replica)
-- Need to track high watermark (last committed entry)
-- Need to handle reads across sealed segments (s1 on node1, s2 on node2, etc.)
-
-### 2. Entry Count Tracking
-In-memory HashMap is fragile:
-- Not durable (lost on restart)
-- Assumes 1 append = 1 entry (no batching support)
-- Can diverge from reality
-
-**Fix:** Store entry count in Raft metadata, or parse Walrus on startup.
-
-### 3. Reactive Lease Updates
-100ms polling loop is wasteful and adds latency.
-
-**Fix:** Make Raft state machine emit events when ownership changes → immediate lease update.
-
-### 4. No Compaction/Retention
-Old sealed segments stay on nodes forever.
-
-**Fix:** Add retention policies (time-based or size-based), garbage collect old segments.
-
-### 5. Single Topic
-Hardcoded to "logs" topic in bootstrap.
-
-**Fix:** Add topic management API (create/delete topics dynamically).
-
----
-
-## FAQ
-
-**Q: What happens if a node crashes?**
-
-A: Depends on what it owned:
-- **Sealed segments:** Data is durable on that node's disk. When it restarts, Raft knows it still owns those segments. Reads would fail until it's back (no read path yet).
-- **Active segment:** Raft will eventually timeout waiting for heartbeats, elect new leader, and that leader can propose a rollover to move the segment to a healthy node. Writes block until then.
-
-**Q: Can multiple nodes write to the same segment?**
-
-A: No. Leases prevent this:
-1. Raft metadata has one `leader_node` per segment
-2. Storage checks lease before every write
-3. If you don't have the lease, append fails
-
-**Q: How does rollover avoid data loss?**
-
-A: The monitor proposes rollover with the exact entry count in the segment:
-```rust
-RolloverTopic {
-    sealed_segment_entry_count: 200_000  // exactly what's in s3
-}
-```
-Raft adds this to `last_sealed_entry_offset`, so the next segment starts at the right offset.
-
-**Q: What if two monitors propose rollover at the same time?**
-
-A: Raft serializes them. Only one RolloverTopic command applies at a time. The second one will see the segment already rolled over (entry count is now low) and won't propose again.
-
-**Q: Why round-robin assignment?**
-
-A: Simple load balancing. Each node gets 1/N of the segments. More sophisticated schemes could consider disk space, CPU, network, etc.
-
-**Q: What's the difference between Walrus and Distributed Walrus?**
-
-A:
-- **Walrus**: Local WAL engine (like RocksDB), single-node, byte-oriented, io_uring/mmap backend
-- **Distributed Walrus**: Multi-node coordinator, uses Raft for metadata, routes writes to Walrus instances, handles segments and rollovers
-
-Think of Distributed Walrus as "Kafka" and Walrus as "the local log storage."
-
-**Q: Why not just use Kafka?**
-
-A: This is simpler (no partitions, no consumer groups, no Zookeeper), and tightly integrated with Walrus's high-performance local WAL. It's purpose-built for Walrus.
-
----
-
-## File Guide
+All cluster state changes flow through Raft consensus:
 
 ```
-src/
-├── main.rs           # Binary wiring: start Raft, storage, controller, monitor
-├── config.rs         # CLI args (--node-id, --raft-host, --join-addr, etc.)
-├── metadata.rs       # Raft state machine (TopicState, CreateTopic, RolloverTopic)
-├── bucket.rs         # Storage wrapper (leases, locks, Walrus API)
-├── controller/
-│   ├── mod.rs        # NodeController (RPC handler, lease updates)
-│   ├── internal.rs   # forward_append() implementation
-│   ├── types.rs      # wal_key() helper
-│   └── topics.rs     # (empty, placeholder)
-├── monitor.rs        # Background loop (check sizes → propose rollover)
-└── rpc.rs            # InternalOp enum (ForwardAppend, JoinCluster, TestControl)
+┌──────────────────────────────────────────────────────────────────────┐
+│ Metadata Change Flow (CreateTopic example)                          │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Controller::ensure_topic("metrics")                                │
+│     │                                                                │
+│     ├─► propose_metadata(CreateTopic{name:"metrics", leader: 3})    │
+│           │                                                          │
+│           ├─ Am I Raft leader?                                      │
+│           │                                                          │
+│    ┌──────┴──────┐                                                  │
+│   YES            NO                                                 │
+│    │              │                                                  │
+│    │              ├─► Wait for Raft leader election                 │
+│    │              │    (check raft.raft_metrics())                  │
+│    │              │                                                  │
+│    │              └─► Forward to Raft leader via RPC                │
+│    │                   InternalOp::ForwardMetadata                  │
+│    │                                                                 │
+│    └─► Serialize command: bincode(CreateTopic{...})                 │
+│           │                                                          │
+│           └─► Raft::propose(bytes)                                  │
+│                 │                                                    │
+│                 ├─► Append to local Raft log                        │
+│                 │                                                    │
+│                 ├─► Send AppendEntries RPC to followers             │
+│                 │     │                                              │
+│                 │     ├─ Node 2: append to log, ACK                 │
+│                 │     └─ Node 3: append to log, ACK                 │
+│                 │                                                    │
+│                 ├─► Wait for quorum (2 of 3 nodes)                  │
+│                 │                                                    │
+│                 ├─► Commit entry (advance commit_index)             │
+│                 │                                                    │
+│                 └─► Apply to state machine on ALL nodes:            │
+│                       │                                              │
+│                       └─► Metadata::apply(command_bytes)            │
+│                             │                                        │
+│                             ├─ Deserialize CreateTopic              │
+│                             │                                        │
+│                             ├─ state.topics.insert("metrics", ...)  │
+│                             │                                        │
+│                             └─ Return b"CREATED"                    │
+│                                                                      │
+│  All nodes now have consistent view:                                │
+│    topics["metrics"] = {                                            │
+│      current_segment: 1,                                            │
+│      leader_node: 3,                                                │
+│      sealed_segments: {},                                           │
+│      segment_leaders: {1 → 3}                                       │
+│    }                                                                │
+│                                                                      │
+│  Next lease sync (within 100ms):                                    │
+│    Node 3: grants self lease for "metrics:1"                        │
+│    Other nodes: no lease for "metrics:1"                            │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Monitor-Triggered Rollover
 
-## Architecture Principles
+The monitor loop orchestrates leadership rotation:
 
-1. **Raft is the source of truth** - All ownership decisions go through Raft consensus
-2. **Leases prevent split-brain** - Storage only writes if it owns the segment
-3. **Segments are immutable** - Once sealed, they never change (simplifies reasoning)
-4. **Round-robin is enough** - Simple load balancing beats complex heuristics
-5. **Monitor is stateless** - Just reads metadata and proposes, doesn't mutate directly
-6. **Polling is acceptable** - 100ms lease update loop is simple and correct enough
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ Monitor → Rollover → Lease Transfer                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Node 2 (owns "logs:1"):                                            │
+│     │                                                                │
+│     └─► Monitor::tick() [every 10s]                                 │
+│           │                                                          │
+│           ├─► check_rollovers()                                     │
+│                 │                                                    │
+│                 ├─► Metadata::owned_topics(2)                       │
+│                 │    └─ Returns: [("logs", 1)]                      │
+│                 │                                                    │
+│                 ├─► For each owned segment:                         │
+│                 │     │                                              │
+│                 │     ├─ wal_key = "logs:1"                         │
+│                 │     │                                              │
+│                 │     ├─► Controller::tracked_entry_count("logs:1") │
+│                 │     │    └─ Returns: 1_000_050                    │
+│                 │     │                                              │
+│                 │     ├─ Check: 1_000_050 >= 1_000_000?             │
+│                 │     │  YES → TRIGGER ROLLOVER                     │
+│                 │     │                                              │
+│                 │     ├─ Get Raft voters: [1, 2, 3]                │
+│                 │     │                                              │
+│                 │     ├─ Find my position: index 1 (node 2)         │
+│                 │     │                                              │
+│                 │     ├─ Calculate next: (1 + 1) % 3 = 2            │
+│                 │     │   next_leader = voters[2] = node 3          │
+│                 │     │                                              │
+│                 │     └─► propose_metadata(RolloverTopic {          │
+│                 │           name: "logs",                           │
+│                 │           new_leader: 3,                          │
+│                 │           sealed_segment_entry_count: 1_000_050   │
+│                 │         })                                        │
+│                 │                                                    │
+│                 └─► Raft consensus (as shown in previous diagram)   │
+│                       │                                              │
+│                       └─► Metadata::apply(RolloverTopic)            │
+│                             │                                        │
+│                             ├─ sealed_segments[1] = 1_000_050       │
+│                             ├─ segment_leaders[1] = 2 (preserve)    │
+│                             ├─ current_segment = 2                  │
+│                             ├─ leader_node = 3                      │
+│                             └─ segment_leaders[2] = 3               │
+│                                                                      │
+│  Within 100ms (lease sync):                                         │
+│                                                                      │
+│    Node 2:                                                          │
+│      └─ owned_topics(2) → []  (no longer owns anything)             │
+│          └─ Leases: {} (removed "logs:1")                           │
+│             └─ Future writes to "logs:1" → NotLeaderError           │
+│                But sealed data still readable!                      │
+│                                                                      │
+│    Node 3:                                                          │
+│      └─ owned_topics(3) → [("logs", 2)]                             │
+│          └─ Leases: {"logs:2"} (granted new segment)                │
+│             └─ Starts accepting writes to "logs:2"                  │
+│                                                                      │
+│  Client writes:                                                     │
+│    PUT logs "new data" → Routes to node 3, appends to "logs:2"      │
+│                                                                      │
+│  Client reads:                                                      │
+│    GET logs → Cursor on segment 1? → Routes to node 2               │
+│              Cursor on segment 2? → Routes to node 3               │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
----
+## Core Components
 
-## Summary
+### 1. NodeController (`controller/mod.rs`)
 
-**Distributed Walrus** = Raft metadata + Walrus storage + lease enforcement
+The central coordination hub that glues together all components. It is responsible for:
 
-- **Segments** spread writes across nodes
-- **Raft** decides who owns what
-- **Leases** prevent stale writes
-- **Monitor** triggers rollovers when segments get full
-- **Simple** round-robin, no partitions, no consumer groups
+- **Topic Routing**: Determines which node is the leader for a given topic/segment
+- **Request Forwarding**: Routes read/write requests to the appropriate leader node
+- **Lease Management**: Maintains write leases that enforce single-writer semantics
+- **Offset Tracking**: Tracks logical offsets and maps them to Walrus physical offsets
+- **Cursor Management**: Maintains read cursors for consumers across sealed segments
 
-It's a distributed WAL focused on simplicity and correctness.
+```
+┌─────────────────────────────────────────────────────────┐
+│                    NodeController                        │
+├─────────────────────────────────────────────────────────┤
+│  Key Responsibilities:                                  │
+│  • ensure_topic(topic) -> Create if doesn't exist       │
+│  • append_for_topic(topic, data) -> Write routing       │
+│  • read_one_for_topic(topic, cursor) -> Read routing    │
+│  • update_leases() -> Sync with metadata state          │
+│  • propose_metadata(cmd) -> Forward to Raft leader      │
+├─────────────────────────────────────────────────────────┤
+│  State:                                                 │
+│  • offsets: HashMap<wal_key, entry_count>               │
+│  • read_cursors: HashMap<topic, ReadCursor>             │
+│  • bucket: Arc<Storage>                                 │
+│  • metadata: Arc<Metadata>                              │
+│  • raft: Arc<OctopiiNode>                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 2. Metadata (`metadata.rs`)
+
+Raft-replicated state machine that stores cluster topology and topic ownership:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                  Metadata State Machine                   │
+├──────────────────────────────────────────────────────────┤
+│  ClusterState {                                          │
+│    topics: HashMap<TopicName, TopicState>                │
+│    nodes: HashMap<NodeId, RaftAddress>                   │
+│  }                                                       │
+│                                                          │
+│  TopicState {                                            │
+│    current_segment: u64                                  │
+│    leader_node: NodeId                                   │
+│    sealed_segments: HashMap<segment_id, entry_count>     │
+│    segment_leaders: HashMap<segment_id, NodeId>          │
+│  }                                                       │
+├──────────────────────────────────────────────────────────┤
+│  Commands (Raft-replicated):                            │
+│  • CreateTopic { name, initial_leader }                 │
+│  • RolloverTopic { name, new_leader, sealed_count }     │
+│  • UpsertNode { node_id, addr }                         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 3. Storage (Bucket) (`bucket.rs`)
+
+Thin wrapper around Walrus that enforces lease-based write fencing:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Storage (Bucket)                       │
+├──────────────────────────────────────────────────────────┤
+│  • Wraps Walrus write-ahead log engine                  │
+│  • Enforces write leases (single writer per segment)    │
+│  • Per-key write locks to prevent concurrent writes     │
+│  • Namespace isolation (DATA_NAMESPACE = "data_plane")  │
+├──────────────────────────────────────────────────────────┤
+│  Operations:                                             │
+│  • append_by_key(wal_key, data)                         │
+│    - Check lease: MUST hold lease for wal_key           │
+│    - Acquire per-key mutex                              │
+│    - Call Walrus batch_append_for_topic                 │
+│                                                          │
+│  • read_one(wal_key)                                    │
+│    - No lease required (reads allowed from any node)    │
+│    - Call Walrus read_next                              │
+│                                                          │
+│  • update_leases(expected_set)                          │
+│    - Sync active leases with metadata ownership         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 4. Client Listener (`client.rs`)
+
+TCP server that exposes a simple text protocol for clients:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Client Listener                         │
+├──────────────────────────────────────────────────────────┤
+│  Protocol (length-prefixed text):                        │
+│  • REGISTER <topic>        -> Create topic if missing    │
+│  • PUT <topic> <payload>   -> Append to topic            │
+│  • GET <topic>             -> Read next entry (shared)   │
+│  • STATE <topic>           -> Get topic metadata (JSON)  │
+│  • METRICS                 -> Get Raft metrics (JSON)    │
+│                                                          │
+│  Wire Format:                                            │
+│  [4 bytes: length (LE)] [UTF-8 command text]            │
+│                                                          │
+│  Response:                                               │
+│  [4 bytes: length (LE)] [UTF-8 response text]           │
+│  • Success: "OK" or "OK <data>"                         │
+│  • Empty read: "EMPTY"                                  │
+│  • Error: "ERR <message>"                               │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 5. Monitor (`monitor.rs`)
+
+Background loop that watches segment sizes and triggers rollovers:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      Monitor Loop                         │
+├──────────────────────────────────────────────────────────┤
+│  Runs every WALRUS_MONITOR_CHECK_MS (default: 10s)      │
+│                                                          │
+│  For each owned topic/segment:                          │
+│    1. Check tracked_entry_count >= max_segment_entries  │
+│    2. If threshold exceeded:                            │
+│       - Select next leader (round-robin from voters)    │
+│       - Propose RolloverTopic command to Raft           │
+│                                                          │
+│  Rollover Effect:                                        │
+│    - Current segment sealed with final entry count      │
+│    - New segment created with incremented ID            │
+│    - Leadership transferred to next node                │
+│    - Old leader retains sealed segment for reads        │
+│                                                          │
+│  Config:                                                 │
+│  • WALRUS_MAX_SEGMENT_ENTRIES (default: 1,000,000)      │
+│  • WALRUS_MONITOR_CHECK_MS (default: 10000)             │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 6. RPC Layer (`rpc.rs`)
+
+Internal node-to-node communication protocol:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Internal RPC Protocol                   │
+├──────────────────────────────────────────────────────────┤
+│  InternalOp (request operations):                        │
+│  • ForwardAppend { wal_key, data }                       │
+│    - Client wrote to non-leader, forward to leader      │
+│                                                          │
+│  • ForwardRead { wal_key, max_entries }                  │
+│    - Read from sealed segment on different node         │
+│                                                          │
+│  • ForwardMetadata { cmd }                               │
+│    - Non-Raft-leader forwards metadata change           │
+│                                                          │
+│  • JoinCluster { node_id, addr }                         │
+│    - New node joining the cluster                       │
+│                                                          │
+│  InternalResp (responses):                               │
+│  • Ok                                                    │
+│  • ReadResult { data, high_watermark }                  │
+│  • Error(message)                                        │
+└──────────────────────────────────────────────────────────┘
+```
+
+## Data Flow Diagrams
+
+### Write Path
+
+```
+┌────────┐
+│ Client │
+└───┬────┘
+    │ PUT logs "hello"
+    ▼
+┌────────────────┐
+│ Client Listener│
+│  (any node)    │
+└───┬────────────┘
+    │ ensure_topic("logs")
+    ▼
+┌────────────────┐     ┌─────────────────────────────────────┐
+│ Controller     │     │ If topic doesn't exist:             │
+│                │────►│ 1. Hash topic name → initial_leader │
+│                │     │ 2. Propose CreateTopic via Raft     │
+└───┬────────────┘     └─────────────────────────────────────┘
+    │ append_for_topic("logs", "hello")
+    │
+    │ Lookup metadata: logs → segment 1 → leader node 2
+    │
+    ▼
+    ┌─────── Local node is leader? ─────┐
+    │                                    │
+   YES                                  NO
+    │                                    │
+    ▼                                    ▼
+┌────────────────┐              ┌──────────────────┐
+│ forward_append │              │ forward_append_  │
+│   (local)      │              │   remote         │
+└───┬────────────┘              └───┬──────────────┘
+    │                               │
+    │                               │ RPC to node 2
+    │                               │ InternalOp::ForwardAppend
+    │                               ▼
+    │                          ┌────────────────┐
+    │                          │ Node 2         │
+    │                          │ handle_rpc     │
+    │                          └───┬────────────┘
+    │                              │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │ Check lease      │
+          │ for wal_key      │
+          └───┬──────────────┘
+              │
+              ▼
+          ┌─────────────────┐
+          │ Acquire per-key │
+          │ write mutex     │
+          └───┬──────────────┘
+              │
+              ▼
+          ┌─────────────────┐
+          │ Walrus::        │
+          │ batch_append_   │
+          │ for_topic       │
+          └───┬──────────────┘
+              │
+              ▼
+          ┌─────────────────┐
+          │ Update offset   │
+          │ counter         │
+          └───┬──────────────┘
+              │
+              ▼
+          ┌─────────────────┐
+          │ Return OK       │
+          └─────────────────┘
+```
+
+### Read Path
+
+```
+┌────────┐
+│ Client │
+└───┬────┘
+    │ GET logs
+    ▼
+┌────────────────┐
+│ Client Listener│
+└───┬────────────┘
+    │ read_one_for_topic_shared("logs")
+    ▼
+┌────────────────┐
+│ Controller     │
+│ (fetch shared  │
+│  cursor)       │
+└───┬────────────┘
+    │ cursor = { segment: 1, delivered_in_segment: 0 }
+    │
+    ▼
+┌───────────────────────────────────────────────────────┐
+│ Loop: Read from current segment or advance            │
+├───────────────────────────────────────────────────────┤
+│ 1. Lookup segment leader from metadata:              │
+│    - Active segment → current leader                 │
+│    - Sealed segment → historical leader (or current) │
+│                                                       │
+│ 2. Is leader local?                                  │
+│    YES → forward_read (local)                        │
+│    NO  → forward_read_remote (RPC)                   │
+│                                                       │
+│ 3. Got data?                                         │
+│    YES → increment cursor.delivered_in_segment       │
+│          return data                                 │
+│                                                       │
+│    NO (empty) → segment sealed?                      │
+│       YES → cursor.segment++                         │
+│             cursor.delivered_in_segment = 0          │
+│             continue loop                            │
+│       NO  → return None (no more data available)     │
+└───────────────────────────────────────────────────────┘
+```
+
+### Segment Rollover Flow
+
+```
+┌───────────────┐
+│ Monitor Loop  │
+│ (every 10s)   │
+└───┬───────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ For each owned topic/segment:                        │
+│   Check tracked_entry_count >= max_segment_entries   │
+└───┬──────────────────────────────────────────────────┘
+    │
+    │ Threshold exceeded
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ Calculate next_leader:                               │
+│   voters = [1, 2, 3]  (from Raft membership)         │
+│   current_idx = position of self in voters           │
+│   next_leader = voters[(current_idx + 1) % len]      │
+└───┬──────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ Propose MetadataCmd::RolloverTopic {                 │
+│   name: "logs",                                      │
+│   new_leader: next_leader,                           │
+│   sealed_segment_entry_count: tracked_count          │
+│ }                                                    │
+└───┬──────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ Raft commit → apply to Metadata state machine        │
+│                                                      │
+│ TopicState update:                                   │
+│   sealed_segments[1] = 1_000_000                     │
+│   segment_leaders[1] = current_leader                │
+│   current_segment = 2                                │
+│   leader_node = next_leader                          │
+│   segment_leaders[2] = next_leader                   │
+└───┬──────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ All nodes receive Raft apply:                        │
+│   - Old leader: loses lease for segment 1            │
+│                 keeps sealed segment readable        │
+│   - New leader: gains lease for segment 2            │
+│                 starts accepting writes              │
+└──────────────────────────────────────────────────────┘
+```
+
+### Cluster Join Flow
+
+```
+┌──────────────┐
+│ New Node 4   │
+│ (starting)   │
+└───┬──────────┘
+    │ --join node1:6001
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ attempt_join():                                      │
+│   Create InternalOp::JoinCluster {                   │
+│     node_id: 4,                                      │
+│     addr: "node4:6004"                               │
+│   }                                                  │
+└───┬──────────────────────────────────────────────────┘
+    │
+    │ RPC to node1:6001
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ Node 1 (leader):                                     │
+│   handle_join_cluster(4, "node4:6004")               │
+└───┬──────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ 1. raft.add_learner(4, socket_addr)                  │
+│    → Add node 4 as non-voting learner                │
+│                                                      │
+│ 2. upsert_node(4, "node4:6004")                      │
+│    → Store node address in metadata                 │
+│                                                      │
+│ 3. Background task: wait for catchup                 │
+│    Loop (max 60s):                                   │
+│      if raft.is_learner_caught_up(4):                │
+│        raft.promote_learner(4)                       │
+│        → Node 4 becomes voting member                │
+│        break                                         │
+│      sleep 500ms                                     │
+└──────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│ Node 4 is now a full voting member:                 │
+│   - Participates in Raft consensus                  │
+│   - Can be assigned topic/segment leadership        │
+│   - Will be included in rollover round-robin        │
+└──────────────────────────────────────────────────────┘
+```
+
+## Key Design Patterns
+
+### 1. Lease-Based Write Fencing
+
+Only the node holding a lease for a wal_key can write to it. Leases are derived from metadata:
+
+```
+Metadata state:  logs → segment 1 → leader node 2
+
+Node 2 lease set:  { "logs:1" }
+Node 1 lease set:  { }
+Node 3 lease set:  { }
+
+Write to "logs:1" on node 2 → SUCCESS (has lease)
+Write to "logs:1" on node 1 → ERROR: NotLeaderForPartition
+```
+
+### 2. Offset Mapping
+
+Walrus uses physical offsets (segment files on disk). Distributed Walrus tracks logical entry counts:
+
+```
+Controller state:
+  offsets["logs:1"] = 42
+
+After append:
+  offsets["logs:1"] = 43
+
+Monitor checks:
+  if offsets["logs:1"] >= max_segment_entries:
+    trigger rollover
+```
+
+### 3. Read Cursor Advancement
+
+Cursors track position across sealed segments using metadata:
+
+```
+Metadata:
+  sealed_segments[1] = 1_000_000
+  sealed_segments[2] = 800_000
+  current_segment = 3
+
+Cursor: { segment: 1, delivered_in_segment: 1_000_000 }
+        → All entries consumed from segment 1
+        → Advance to segment 2
+
+Cursor: { segment: 2, delivered_in_segment: 800_000 }
+        → All entries consumed from segment 2
+        → Advance to segment 3 (active)
+```
+
+### 4. Leader Forwarding
+
+Non-leader nodes forward operations to the current leader:
+
+```
+Client → Node 1: PUT logs "data"
+Node 1 metadata lookup: logs → segment 1 → leader node 2
+Node 1 → Node 2: InternalOp::ForwardAppend
+Node 2: Perform local append
+Node 2 → Node 1: InternalResp::Ok
+Node 1 → Client: OK
+```
+
+## Configuration
+
+### Node Configuration (CLI flags)
+
+- `--node-id`: Unique node identifier (required)
+- `--data-dir`: Root directory for storage (default: `./data`)
+- `--raft-port`: Raft/Internal RPC port (default: 6000)
+- `--raft-host`: Raft bind address (default: 127.0.0.1)
+- `--raft-advertise-host`: Advertised Raft address for peers
+- `--client-port`: Client TCP listener port (default: 8080)
+- `--client-host`: Client bind address (default: 127.0.0.1)
+- `--join`: Address of existing node to join (e.g., "127.0.0.1:6001")
+- `--initial-peer`: Bootstrap peer addresses (leader only)
+
+### Environment Variables
+
+- `WALRUS_MAX_SEGMENT_ENTRIES`: Max entries before rollover (default: 1,000,000)
+- `WALRUS_MONITOR_CHECK_MS`: Monitor loop interval (default: 10000)
+- `WALRUS_DISABLE_IO_URING`: Disable io_uring, use mmap (for containers)
+- `RUST_LOG`: Log level (e.g., `debug`, `info`)
+
+## File Layout
+
+```
+data/
+  node_{id}/
+    user_data/           # Walrus data files (Storage bucket)
+      data_plane/
+        wal_{topic}_{segment}_*.wal
+        wal_{topic}_{segment}_*.idx
+    raft_meta/           # Raft write-ahead log and snapshots
+      *.wal
+      *.snapshot
+```
+
+## Testing Architecture
+
+The system includes comprehensive integration tests:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                     Test Suite                            │
+├──────────────────────────────────────────────────────────┤
+│ • logging_smoke_test.py                                  │
+│   - Basic REGISTER/PUT/GET operations                    │
+│                                                          │
+│ • rollover_read_test.py                                  │
+│   - Write beyond max_segment_entries                     │
+│   - Verify segment rollover and leadership rotation      │
+│   - Reads span sealed and active segments                │
+│                                                          │
+│ • resilience_test.py                                     │
+│   - Stop/restart nodes during writes                     │
+│   - Verify no data loss                                  │
+│                                                          │
+│ • recovery_test.py                                       │
+│   - Stop entire cluster                                  │
+│   - Restart and verify persistence                       │
+│                                                          │
+│ • stress_test.py                                         │
+│   - Concurrent writes from multiple clients              │
+│   - High throughput validation                           │
+│                                                          │
+│ • multi_topic_stress_test.py                            │
+│   - Multiple topics with distributed leadership          │
+│   - Load balancing verification                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+## Deployment Example
+
+A typical 3-node cluster setup:
+
+```
+Node 1 (bootstrap leader):
+  distributed-walrus \
+    --node-id 1 \
+    --raft-port 6001 \
+    --client-port 9091
+
+Node 2 (joins cluster):
+  distributed-walrus \
+    --node-id 2 \
+    --raft-port 6002 \
+    --client-port 9092 \
+    --join node1:6001
+
+Node 3 (joins cluster):
+  distributed-walrus \
+    --node-id 3 \
+    --raft-port 6003 \
+    --client-port 9093 \
+    --join node1:6001
+```
+
+After bootstrap, the cluster will:
+1. Node 1 becomes Raft leader
+2. Nodes 2 and 3 join as learners, then promoted to voters
+3. Topic leadership automatically distributed via hash-based assignment
+4. Monitor loops trigger rollovers every ~1M entries
+5. Leadership rotates round-robin across nodes
+
+## Failure Scenarios
+
+### Node Failure
+
+```
+Initial state:
+  logs → segment 1 → leader node 2 ✓
+  logs → segment 2 → leader node 3 ✓
+
+Node 2 fails:
+  - Raft detects heartbeat loss
+  - Writes to segment 1 fail (no leader)
+  - Reads from sealed portions of segment 1 still work (if stored locally)
+  - New segments assigned to remaining nodes (1, 3)
+
+Node 2 recovers:
+  - Rejoins cluster as follower
+  - Catches up Raft log from leader
+  - May receive new segment leadership on next rollover
+```
+
+### Split Brain Prevention
+
+Raft consensus prevents split brain:
+- Writes require quorum (majority of voters)
+- Leases only granted to Raft-acknowledged leader
+- Failed leader cannot serve writes (loses lease)
+
+### Network Partition
+
+```
+Partition: [Node 1, Node 2] | [Node 3]
+
+Majority partition [1, 2]:
+  - Continues operating normally
+  - Can commit Raft writes
+  - Serves reads and writes
+
+Minority partition [3]:
+  - Cannot achieve quorum
+  - Stops accepting writes
+  - Reads may serve stale data
+  - Rejoins when partition heals
+```
+
+## Performance Characteristics
+
+- **Write throughput**: Limited by Walrus storage engine and single-writer-per-segment
+- **Read throughput**: Scales with number of nodes (sealed segments readable from any replica)
+- **Latency**: ~1-2 RTT for forwarded operations, plus Walrus append latency
+- **Leadership rotation**: Automatic load balancing every ~1M entries per segment
+- **Consensus overhead**: Raft used only for metadata (topics, leases), not data path
+
+## Future Enhancements
+
+Potential improvements mentioned in the codebase:
+
+- Retention policies (currently disabled via `WALRUS_RETENTION_GENERATIONS=0`)
+- Configurable segment size limits (currently entry-based)
+- Consumer group management (currently single shared cursor)
+- Compaction for sealed segments
+- Multi-topic read optimization
+- Dynamic rebalancing based on load metrics
