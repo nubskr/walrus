@@ -32,6 +32,9 @@ pub struct Config {
 
     /// Number of log entries a follower can lag before leader triggers a snapshot (0 disables)
     pub snapshot_lag_threshold: u64,
+
+    /// Optional public address to advertise to peers (if different from bind_addr)
+    pub public_addr: Option<SocketAddr>,
 }
 
 impl Default for Config {
