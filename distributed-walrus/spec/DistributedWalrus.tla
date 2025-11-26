@@ -86,7 +86,6 @@ CreateTopic(t, leader) ==
     /\ readers' = [ x \in topics' |->
                     IF x = t THEN [segment |-> FirstSeg, delivered |-> 0] ELSE readers[x] ]
 
-\* Renamed to avoid clash with any built-in Append
 WalAppend(n, t) ==
     /\ t \in topics
     /\ n = topicInfo[t].leader

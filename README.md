@@ -9,53 +9,229 @@
 [![CI](https://github.com/nubskr/walrus/actions/workflows/ci.yml/badge.svg)](https://github.com/nubskr/walrus/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-
 </div>
 
-## Features
+## Overview
 
-- **High Performance**: Optimized for concurrent writes and reads
-- **Topic-based Organization**: Separate read/write streams per topic
-- **Configurable Consistency**: Choose between strict and relaxed consistency models
-- **Batched I/O**: Atomic batch append and capped batch read APIs with io_uring acceleration on Linux
-- **Dual Storage Backends**: FD backend with pread/pwrite (default) or mmap backend
-- **Persistent Read Offsets**: Read positions survive process restarts
-- **Coordination-free Deletion**: Atomic file cleanup without blocking operations
-- **Comprehensive Benchmarking**: Built-in performance testing suite
+Walrus is a distributed message streaming platform built on a high-performance log storage engine. It provides fault-tolerant streaming with automatic leadership rotation, segment-based partitioning, and Raft consensus for metadata coordination.
 
-## Benchmarks
+![Walrus Demo](distributed-walrus/docs/walrus.gif)
 
-Run the supplied load tests straight from the repo:
+**Key Features:**
+- **Automatic load balancing** via segment-based leadership rotation
+- **Fault tolerance** through Raft consensus (3+ nodes)
+- **Simple client protocol** (connect to any node, auto-forwarding)
+- **Sealed segments** for historical reads from any replica
+- **High-performance storage** with io_uring on Linux
 
-```bash
-make bench-writes    # sustained write throughput
-make bench-reads     # write phase + read phase
-make bench-scaling   # threads vs throughput sweep
-```
+## Architecture
 
-Each target honours the environment variables documented in `Makefile`. Tweak
-things like `FSYNC`, `THREADS`, or `WALRUS_DURATION` to explore other scenarios.
+### System Overview
+
+![Walrus Architecture](distributed-walrus/docs/Distributed%20walrus.png)
+
+Producers and consumers connect to any node (or via load balancer). The cluster automatically routes requests to the appropriate leader and manages segment rollovers for load distribution.
+
+### Node Internals
+
+![Walrus Node Architecture](distributed-walrus/docs/Distributed%20Walrus%20Node.png)
+
+Each node contains four key components: Node Controller (routing and lease management), Raft Engine (consensus for metadata), Cluster Metadata (replicated state), and Bucket Storage (Walrus engine with write fencing).
+
+### Core Components
+
+**Node Controller**
+- Routes client requests to appropriate segment leaders
+- Manages write leases (synced from cluster metadata every 100ms)
+- Tracks logical offsets for rollover detection
+- Forwards operations to remote leaders when needed
+
+**Raft Engine** (Octopii)
+- Maintains Raft consensus for metadata changes only (not data!)
+- Handles leader election and log replication
+- Syncs metadata across all nodes via AppendEntries RPCs
+
+**Cluster Metadata** (Raft State Machine)
+- Stores topic → segment → leader mappings
+- Tracks sealed segments and their entry counts
+- Maintains node addresses for routing
+- Replicated identically across all nodes
+
+**Storage Engine**
+- Wraps Walrus engine with lease-based write fencing
+- Only accepts writes if node holds lease for that segment
+- Stores actual data in WAL files on disk
+- Serves reads from any segment (sealed or active)
 
 ## Quick Start
 
-Add Walrus to your `Cargo.toml`:
+### Running a 3-Node Cluster
+
+```bash
+cd distributed-walrus
+
+make cluster-bootstrap
+
+# Interact via CLI
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+
+# In the CLI:
+> REGISTER logs
+> PUT logs "hello world"
+> GET logs
+> STATE logs
+> METRICS
+```
+
+## Client Protocol
+
+Simple length-prefixed text protocol over TCP:
+
+```
+Wire format:
+  [4 bytes: length (little-endian)] [UTF-8 command]
+
+Commands:
+  REGISTER <topic>       → Create topic if missing
+  PUT <topic> <payload>  → Append to topic
+  GET <topic>            → Read next entry (shared cursor)
+  STATE <topic>          → Get topic metadata (JSON)
+  METRICS                → Get Raft metrics (JSON)
+
+Responses:
+  OK [payload]           → Success
+  EMPTY                  → No data available (GET only)
+  ERR <message>          → Error
+```
+
+See [distributed-walrus/docs/cli.md](distributed-walrus/docs/cli.md) for detailed CLI usage.
+
+## Key Features
+
+### Segment-Based Sharding
+- Topics split into segments (~1M entries each by default)
+- Each segment has a leader node that handles writes
+- Leadership rotates round-robin on segment rollover
+- Automatic load distribution across cluster
+
+### Lease-Based Write Fencing
+- Only the leader for a segment can write to it
+- Leases derived from Raft-replicated metadata
+- 100ms sync loop ensures lease consistency
+- Prevents split-brain writes during leadership changes
+
+### Sealed Segment Reads
+- Old segments "sealed" when rolled over
+- Original leader retains sealed data for reads
+- Reads can be served from any replica with the data
+- No data movement required during rollover
+
+### Automatic Rollover
+- Monitor loop (10s) checks segment sizes
+- Triggers rollover when threshold exceeded
+- Proposes metadata change via Raft
+- Leader transfer happens automatically
+
+## Configuration
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--node-id` | (required) | Unique node identifier |
+| `--data-dir` | `./data` | Root directory for storage |
+| `--raft-port` | `6000` | Raft/Internal RPC port |
+| `--raft-host` | `127.0.0.1` | Raft bind address |
+| `--raft-advertise-host` | (raft-host) | Advertised Raft address |
+| `--client-port` | `8080` | Client TCP port |
+| `--client-host` | `127.0.0.1` | Client bind address |
+| `--join` | - | Address of existing node to join |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WALRUS_MAX_SEGMENT_ENTRIES` | `1000000` | Entries before rollover |
+| `WALRUS_MONITOR_CHECK_MS` | `10000` | Monitor loop interval |
+| `WALRUS_DISABLE_IO_URING` | - | Use mmap instead of io_uring |
+| `RUST_LOG` | `info` | Log level (debug, info, warn) |
+
+## Testing
+
+Comprehensive test suite included:
+
+```bash
+cd distributed-walrus
+
+# Run all tests
+make test
+
+# Individual tests
+make cluster-test-logs         # Basic smoke test
+make cluster-test-rollover     # Segment rollover
+make cluster-test-resilience   # Node failure recovery
+make cluster-test-recovery     # Cluster restart persistence
+make cluster-test-stress       # Concurrent writes
+make cluster-test-multi-topic  # Multiple topics
+```
+
+## Performance
+
+- **Write throughput**: Single writer per segment (lease-based)
+- **Read throughput**: Scales with replicas (sealed segments)
+- **Latency**: ~1-2 RTT for forwarded ops + storage latency
+- **Consensus overhead**: Metadata only (not data path)
+- **Segment rollover**: ~1M entries default (~100MB depending on payload size)
+
+### Storage Engine Benchmarks
+
+The underlying storage engine delivers exceptional performance:
+
+![Walrus vs RocksDB vs Kafka - No Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_no_fsync.png)
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|--------------------------|
+| Walrus   | 1,205,762                  | 876.22                | 1,593,984                   | 1,158.62                |
+| Kafka    | 1,112,120                  | 808.33                | 1,424,073                   | 1,035.74                |
+| RocksDB  | 432,821                    | 314.53                | 1,000,000                   | 726.53                  |
+
+
+![Walrus vs RocksDB vs Kafka - With Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.png)
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|--------------------------|
+| RocksDB  | 5,222                      | 3.79                  | 10,486                      | 7.63                    |
+| Walrus   | 4,980                      | 3.60                  | 11,389                      | 8.19                    |
+| Kafka    | 4,921                      | 3.57                  | 11,224                      | 8.34                    |
+
+*Benchmarks compare single Kafka broker (no replication, no networking overhead) and RocksDB's WAL against the legacy `append_for_topic()` endpoint using `pwrite()` syscalls (no io_uring batching).*
+
+## Documentation
+
+- **[Architecture Deep Dive](distributed-walrus/docs/architecture.md)** - Detailed component interactions, data flow diagrams, startup sequence, lease synchronization, rollover mechanics, and failure scenarios
+- **[CLI Guide](distributed-walrus/docs/cli.md)** - Interactive CLI usage and commands
+- **[System Documentation](distributed-walrus/README.md)** - Full system documentation
+
+## Using Walrus as a Library
+
+The core Walrus storage engine is also available as a standalone Rust library for embedded use cases:
+
+[![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
+[![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
 
 ```toml
 [dependencies]
 walrus-rust = "0.2.0"
 ```
 
-### Basic Usage
-
 ```rust
 use walrus_rust::{Walrus, ReadConsistency};
 
-// Create a new WAL instance with default settings
+// Create a new WAL instance
 let wal = Walrus::new()?;
 
 // Write data to a topic
-let data = b"Hello, Walrus!";
-wal.append_for_topic("my-topic", data)?;
+wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
 
 // Read data from the topic
 if let Some(entry) = wal.read_next("my-topic", true)? {
@@ -63,94 +239,7 @@ if let Some(entry) = wal.read_next("my-topic", true)? {
 }
 ```
 
-To peek without consuming an entry, call `read_next("my-topic", false)`; the cursor only advances
-when you pass `true`.
-
-### Advanced Configuration
-
-```rust
-use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule, enable_fd_backend};
-
-// Configure with custom consistency and fsync behavior
-let wal = Walrus::with_consistency_and_schedule(
-    ReadConsistency::AtLeastOnce { persist_every: 1000 },
-    FsyncSchedule::Milliseconds(500)
-)?;
-
-// Write and read operations work the same way
-wal.append_for_topic("events", b"event data")?;
-```
-
-## Configuration Basics
-
-- **Read consistency**: `StrictlyAtOnce` persists every checkpoint; `AtLeastOnce { persist_every }` favours throughput and tolerates replays.
-- **Fsync schedule**: choose `SyncEach`, `Milliseconds(n)`, or `NoFsync` when constructing `Walrus` to balance durability vs latency.
-- **Storage backend**: FD backend (default) uses pread/pwrite syscalls and enables io_uring for batch operations on Linux; `disable_fd_backend()` switches to the mmap backend.
-- **Namespacing & data dir**: set `WALRUS_INSTANCE_KEY` or use the `_for_key` constructors to isolate workloads; `WALRUS_DATA_DIR` relocates the entire tree.
-- **Noise control**: `WALRUS_QUIET=1` mutes debug logging from internal helpers.
-
-Benchmark targets (`make bench-writes`, etc.) honour flags like `FSYNC`, `THREADS`, `WALRUS_DURATION`, and `WALRUS_BATCH_SIZE`, check the `Makefile` for the full list.
-
-## API Reference
-
-### Constructors
-
-- `Walrus::new() -> io::Result<Self>` – StrictlyAtOnce reads, 200ms fsync cadence.
-- `Walrus::with_consistency(mode: ReadConsistency) -> io::Result<Self>` – Pick the read checkpoint model.
-- `Walrus::with_consistency_and_schedule(mode: ReadConsistency, schedule: FsyncSchedule) -> io::Result<Self>` – Set both read consistency and fsync policy explicitly.
-- `Walrus::new_for_key(key: &str) -> io::Result<Self>` – Namespace files under `wal_files/<sanitized-key>/`.
-- `Walrus::with_consistency_for_key(...)` / `with_consistency_and_schedule_for_key(...)` – Combine per-key isolation with custom consistency/fsync choices.
-
-Set `WALRUS_INSTANCE_KEY=<key>` to make the default constructors pick the same namespace without changing call-sites.
-
-### Topic Writes
-
-- `append_for_topic(&self, topic: &str, data: &[u8]) -> io::Result<()>` – Appends a single payload. Topics are created lazily. Returns `ErrorKind::WouldBlock` if a batch is currently running for the topic.
-- `batch_append_for_topic(&self, topic: &str, batch: &[&[u8]]) -> io::Result<()>` – Writes up to 2 000 entries (~10 GB including metadata) atomically. On Linux with the fd backend enabled the batch is submitted via io_uring; other platforms fall back to sequential writes. Failures roll back offsets and release provisional blocks.
-
-### Topic Reads
-
-- `read_next(&self, topic: &str, checkpoint: bool) -> io::Result<Option<Entry>>` – Returns the next entry, advancing the persisted cursor when `checkpoint` is `true`. Passing `false` lets you peek without consuming the entry.
-- `batch_read_for_topic(&self, topic: &str, max_bytes: usize, checkpoint: bool) -> io::Result<Vec<Entry>>` – Streams entries in commit order until either `max_bytes` of payload or the 2 000-entry ceiling is reached (always yields at least one entry when data is available). Respects the same checkpoint semantics as `read_next`.
-
-### Types
-
-```rust
-pub struct Entry {
-    pub data: Vec<u8>,
-}
-```
-
-# benchmarks
-
-I benchmarked the latest version of walrus against single kafka broker(without replication, no networking overhead) and rocksdb's WAL
-
-![alt text](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_no_fsync.png)
-this performance is with the legacy `append_for_topic()` endpoint which uses `pwrite()` syscall for each write operation, no io_uring batching is used for these benchmarks
-
-| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
-|----------|----------------------------|------------------------|-----------------------------|------------------------|
-| Walrus   | 1,205,762                  | 876.22                | 1,593,984                   | 1,158.62              |
-| Kafka    | 1,112,120                  | 808.33                | 1,424,073                   | 1,035.74              |
-| RocksDB  | 432,821                    | 314.53                | 1,000,000                   | 726.53                |
-
-
-### for synced writes
-
-![alt text](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.png)
-
-| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
-|----------|----------------------------|------------------------|-----------------------------|------------------------|
-| RocksDB  | 5,222                      | 3.79                  | 10,486                      | 7.63                  |
-| Walrus   | 4,980                      | 3.60                  | 11,389                      | 8.19                  |
-| Kafka    | 4,921                      | 3.57                  | 11,224                      | 8.34                  |
-
----
-
-## Further Reading
-
-Older deep dives live under `docs/` (architecture, batch design notes, etc.) if
-you need more than the basics above.
+See the [standalone library documentation](https://docs.rs/walrus-rust) for single node usage, configuration options, and API reference.
 
 ## Contributing
 
@@ -162,6 +251,14 @@ This project is licensed under the MIT License, see the [LICENSE](LICENSE) file 
 
 ## Changelog
 
+### Version 0.3.0
+- **New**: Distributed message streaming platform with Raft consensus
+- **New**: Segment-based leadership rotation and load balancing
+- **New**: Automatic rollover and lease-based write fencing
+- **New**: TCP client protocol with simple text commands
+- **New**: Interactive CLI for cluster interaction
+- **New**: Comprehensive test suite for distributed scenarios
+
 ### Version 0.2.0
 - **New**: Atomic batch write operations (`batch_append_for_topic`)
 - **New**: Batch read operations (`batch_read_for_topic`)
@@ -169,11 +266,9 @@ This project is licensed under the MIT License, see the [LICENSE](LICENSE) file 
 - **New**: Dual storage backends (FD backend with pread/pwrite, mmap backend)
 - **New**: Namespace isolation via `_for_key` constructors
 - **New**: `FsyncSchedule::SyncEach` and `FsyncSchedule::NoFsync` modes
-- **New**: Environment variables (`WALRUS_INSTANCE_KEY`, `WALRUS_DATA_DIR`, `WALRUS_QUIET`)
 - **Improved**: Comprehensive documentation with architecture and design docs
 - **Improved**: Enhanced benchmarking suite with batch operation benchmarks
 - **Fixed**: Tail read offset tracking in concurrent scenarios
-- **Fixed**: Reader persistence during concurrent batch writes
 
 ### Version 0.1.0
 - Initial release
