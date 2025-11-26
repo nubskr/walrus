@@ -16,15 +16,15 @@ Distributed Walrus is a distributed streaming log system built on top of the Wal
                     :8080-9093│                            │:8080-9093
                               │                            │
         ┌─────────────────────▼─────────┐   ┌─────────────▼──────────────┐
-        │        Node 1 (Leader)        │   │         Node 2              │
-        │                               │   │                             │
+        │        Node 1 (Leader)        │   │         Node 2             │
+        │                               │   │                            │
         │  ┌─────────────────────────┐  │   │  ┌─────────────────────┐   │
         │  │   Client Listener       │  │   │  │  Client Listener    │   │
         │  │   • Length-prefixed     │  │   │  │  • REGISTER/PUT/GET │   │
         │  │   • REGISTER/PUT/GET    │  │   │  │  • STATE/METRICS    │   │
         │  └──────────┬──────────────┘  │   │  └──────────┬──────────┘   │
-        │             │                  │   │             │              │
-        │             ▼                  │   │             ▼              │
+        │             │                 │   │             │              │
+        │             ▼                 │   │             ▼              │
         │  ┌─────────────────────────┐  │   │  ┌─────────────────────┐   │
         │  │   NodeController        │  │   │  │   NodeController    │   │
         │  │  ┌──────────────────┐   │  │   │  │  ┌──────────────┐   │   │
@@ -37,31 +37,31 @@ Distributed Walrus is a distributed streaming log system built on top of the Wal
         │  │  │ • 100ms loop     │   │  │   │  │  │ • 100ms loop │   │   │
         │  │  │ • update_leases()│   │  │   │  │  │ update_leases│   │   │
         │  │  └──────────────────┘   │  │   │  │  └──────────────┘   │   │
-        │  └─┬───────┬────────┬──────┘  │   │  └─┬───────┬─────┬────┘   │
+        │  └─┬───────┬────────┬──────┘  │   │  └─┬───────┬─────┬──-──┘   │
         │    │       │        │         │   │    │       │     │        │
         │    │       │        │         │   │    │       │     │        │
-        │ ┌──▼───┐ ┌▼──────┐ │         │   │ ┌──▼───┐ ┌▼────┐│        │
-        │ │Meta- │ │Bucket │ │         │   │ │Meta- │ │Buckｅ││        │
-        │ │data  │ │(Stor- │ │         │   │ │data  │ │t(Sto││        │
-        │ │State │ │age)   │ │         │   │ │State │ │rage)││        │
-        │ │      │ │       │ │         │   │ │      │ │     ││        │
-        │ │Topics│ │Leases:│ │         │   │ │Topics│ │Lease││        │
-        │ │Nodes │ │logs:1 │ │         │   │ │Nodes │ │logs:││        │
-        │ │Segs  │ │logs:2 │ │         │   │ │Segs  │ │     ││        │
-        │ └──┬───┘ └───┬───┘ │         │   │ └──┬───┘ └──┬──┘│        │
-        │    │         │     │         │   │    │        │   │        │
-        │    │    ┌────▼─────▼──────┐  │   │    │   ┌────▼───▼─────┐  │
-        │    │    │  Walrus Engine  │  │   │    │   │ Walrus Engine│  │
-        │    │    │  • batch_append │  │   │    │   │ • read_next  │  │
-        │    │    │  • read_next    │  │   │    │   │ • Disk I/O   │  │
-        │    │    └─────────────────┘  │   │    │   └──────────────┘  │
-        │    │                         │   │    │                     │
-        │    │    ┌──Monitor Loop────┐ │   │    │    ┌─Monitor Loop┐ │
-        │    │    │ • Check segments │ │   │    │    │ • Rollover  │ │
-        │    │    │ • Trigger        │ │   │    │    │   checks    │ │
-        │    │    │   rollover       │ │   │    │    └─────────────┘ │
-        │    │    └──────────────────┘ │   │    │                     │
-        │    │                         │   │    │                     │
+        │ ┌──▼───┐ ┌▼──────┐ │          │   │ ┌──▼───┐ ┌▼────┐│         │ 
+        │ │Meta- │ │Bucket │ │          │   │ │Meta- │ │Buckｅ││        │
+        │ │data  │ │(Stor- │ │          │   │ │data  │ │t(Sto││        │
+        │ │State │ │age)   │ │          │   │ │State │ │rage)││        │
+        │ │      │ │       │ │          │   │ │      │ │     ││        │
+        │ │Topics│ │Leases:│ │          │   │ │Topics│ │Lease││        │
+        │ │Nodes │ │logs:1 │ │          │   │ │Nodes │ │logs:││        │
+        │ │Segs  │ │logs:2 │ │          │   │ │Segs  │ │     ││        │
+        │ └──┬───┘ └───┬───┘ │          │   │ └──┬───┘ └──┬──┘│        │
+        │    │         │     │          │   │    │        │   │        │
+        │    │    ┌────▼─────▼──────┐   │   │    │   ┌────▼───▼─────┐  │
+        │    │    │  Walrus Engine  │   │   │    │   │ Walrus Engine│  │
+        │    │    │  • batch_append │   │   │    │   │ • read_next  │  │
+        │    │    │  • read_next    │   │   │    │   │ • Disk I/O   │  │
+        │    │    └─────────────────┘   │   │    │   └──────────────┘  │
+        │    │                          │   │    │                     │
+        │    │    ┌──Monitor Loop────┐  │   │    │    ┌─Monitor Loop┐  │
+        │    │    │ • Check segments │  │   │    │    │ • Rollover  │  │
+        │    │    │ • Trigger        │  │   │    │    │   checks    │  │
+        │    │    │   rollover       │  │   │    │    └─────────────┘  │
+        │    │    └──────────────────┘  │   │    │                     │
+        │    │                          │   │    │                     │
         │ ┌──▼─────────────────────────▼┐ │   │ ┌──▼─────────────────▼┐
         │ │   Octopii (Raft Engine)    │ │   │ │  Octopii (Raft)     │
         │ │   • Metadata replication   │◄┼───┼─┤  • Follower         │
