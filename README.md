@@ -1,8 +1,8 @@
 <div align="center">
   <img src="./figures/walrus1.png"
        alt="walrus"
-       width="30%">
-    <div>Walrus: A high performance storage engine in Rust</div>
+       width="25%">
+    <div>Walrus: A Distributed Message Streaming Engine</div>
 
 [![Crates.io](https://img.shields.io/crates/v/walrus-rust.svg)](https://crates.io/crates/walrus-rust)
 [![Documentation](https://docs.rs/walrus-rust/badge.svg)](https://docs.rs/walrus-rust)
@@ -11,7 +11,6 @@
 
 </div>
 
-## Overview
 
 Walrus is a distributed message streaming platform built on a high-performance log storage engine. It provides fault-tolerant streaming with automatic leadership rotation, segment-based partitioning, and Raft consensus for metadata coordination.
 
@@ -76,10 +75,20 @@ make cluster-bootstrap
 cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
 
 # In the CLI:
+
+# create a topic named 'logs'
 > REGISTER logs
+
+# produce a message to the topic
 > PUT logs "hello world"
+
+# consume message from topic
 > GET logs
+
+# get the segment states of the topic
 > STATE logs
+
+# get cluster state
 > METRICS
 ```
 
@@ -182,6 +191,29 @@ make cluster-test-multi-topic  # Multiple topics
 - **Latency**: ~1-2 RTT for forwarded ops + storage latency
 - **Consensus overhead**: Metadata only (not data path)
 - **Segment rollover**: ~1M entries default (~100MB depending on payload size)
+
+## Correctness
+
+Walrus includes a formal TLA+ specification of the distributed data plane that models segment-based sharding, lease-based write fencing, and cursor advancement across sealed segments.
+
+**Specification:** [distributed-walrus/spec/DistributedWalrus.tla](distributed-walrus/spec/DistributedWalrus.tla)
+
+### Verified Invariants
+
+- **Domain Consistency**: Topic metadata, WAL entries, and reader cursors stay synchronized
+- **Single Writer per Segment**: Only the designated leader can write to each segment
+- **No Writes Past Open Segment**: Closed segments remain immutable after rollover
+- **Sealed Counts Stable**: Entry counts for sealed segments match actual WAL contents
+- **Read Cursor Bounds**: Cursors never exceed segment boundaries or entry counts
+- **Sequential Write Order**: Entries within each segment maintain strict ordering
+
+### Liveness Properties
+
+- **Rollover Progress**: Segments exceeding the entry threshold eventually roll over
+- **Read Progress**: Available entries eventually get consumed by readers
+
+The specification abstracts Raft consensus as a single authoritative metadata source and models Walrus storage as per-segment entry sequences. Model checking with TLC verifies correctness under concurrent operations
+
 
 ### Storage Engine Benchmarks
 
