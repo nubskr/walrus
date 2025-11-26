@@ -399,7 +399,7 @@ impl Walrus {
         };
 
         // 1) Prepare state (Chain + Position)
-        let held_arc: Option<Arc<RwLock<ColReaderInfo>>>;
+        let mut _held_arc: Option<Arc<RwLock<ColReaderInfo>>> = None;
 
         let (
             chain,
@@ -411,7 +411,6 @@ impl Walrus {
             mut initial_trim,
             mut first_end_hint,
         ) = if let Some(req_offset) = start_offset {
-            held_arc = None;
             // --- Stateless Read (Offset Provided) ---
             let map = self.reader.data.read().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
@@ -606,8 +605,8 @@ impl Walrus {
                     .clone()
             };
 
-            held_arc = Some(info_arc);
-            let mut info = held_arc.as_ref().unwrap().write().map_err(|_| {
+            _held_arc = Some(info_arc);
+            let mut info = _held_arc.as_ref().unwrap().write().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
             })?;
 
@@ -738,11 +737,11 @@ impl Walrus {
                                             };
                                             let meta2_res: Result<Metadata, _> =
                                                 archived2.deserialize(&mut rkyv::Infallible);
-                                            if let Ok(meta2) = meta2_res {
-                                                let size2 = meta2.read_size;
-                                                let required2 = (PREFIX_META_SIZE + size2) as u64;
-                                                final_required = required1 + required2;
-                                            }
+                                            let meta2 = meta2_res
+                                                .expect("infallible metadata deserialize");
+                                            let size2 = meta2.read_size;
+                                            let required2 = (PREFIX_META_SIZE + size2) as u64;
+                                            final_required = required1 + required2;
                                         }
                                     }
                                 }

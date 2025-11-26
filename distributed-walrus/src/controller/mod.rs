@@ -113,7 +113,10 @@ impl NodeController {
     async fn resolve_node_addr(&self, addr: &str) -> Option<SocketAddr> {
         match addr.parse() {
             Ok(sock) => Some(sock),
-            Err(_) => tokio::net::lookup_host(addr).await.ok().and_then(|mut it| it.next()),
+            Err(_) => tokio::net::lookup_host(addr)
+                .await
+                .ok()
+                .and_then(|mut it| it.next()),
         }
     }
 
@@ -396,7 +399,9 @@ impl NodeController {
         }
 
         let Some(leader_id) = leader_id else {
-            return Err(anyhow!("no raft leader known for metadata proposal after retries"));
+            return Err(anyhow!(
+                "no raft leader known for metadata proposal after retries"
+            ));
         };
 
         if leader_id == self.node_id {
@@ -434,7 +439,7 @@ impl NodeController {
             .await?;
 
         match resp.payload {
-            ResponsePayload::CustomResponse { success, data } if success => Ok(()),
+            ResponsePayload::CustomResponse { success, data: _ } if success => Ok(()),
             ResponsePayload::CustomResponse { data, .. } => {
                 let err = bincode::deserialize::<InternalResp>(&data)
                     .ok()

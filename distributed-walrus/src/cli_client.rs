@@ -53,7 +53,10 @@ impl CliClient {
         stream.write_all(bytes).await.context("write payload")?;
 
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.context("read length")?;
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .context("read length")?;
         let resp_len = u32::from_le_bytes(len_buf) as usize;
         let mut buf = vec![0u8; resp_len];
         stream.read_exact(&mut buf).await.context("read payload")?;

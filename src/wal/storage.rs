@@ -52,6 +52,7 @@ impl FdBackend {
         self.len
     }
 
+    #[allow(dead_code)]
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
     }
@@ -103,6 +104,7 @@ impl StorageImpl {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
         if let StorageImpl::Fd(fd) = self {
             Some(fd)
@@ -181,6 +183,7 @@ impl SharedMmap {
         self.storage.read(offset, dest);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.storage.len()
     }
@@ -189,6 +192,7 @@ impl SharedMmap {
         self.storage.flush()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn storage(&self) -> &StorageImpl {
         &self.storage
     }
@@ -249,6 +253,7 @@ pub(crate) fn set_fsync_schedule(schedule: FsyncSchedule) {
     let _ = GLOBAL_FSYNC_SCHEDULE.set(schedule);
 }
 
+#[allow(dead_code)]
 pub(crate) fn fsync_schedule() -> Option<FsyncSchedule> {
     GLOBAL_FSYNC_SCHEDULE.get().copied()
 }

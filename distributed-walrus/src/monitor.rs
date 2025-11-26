@@ -40,7 +40,7 @@ impl MonitorLimits {
 
 pub struct Monitor {
     controller: Arc<NodeController>,
-    config: NodeConfig,
+    _config: NodeConfig,
     limits: MonitorLimits,
 }
 
@@ -48,7 +48,7 @@ impl Monitor {
     pub fn new(controller: Arc<NodeController>, config: NodeConfig) -> Self {
         Self {
             controller,
-            config,
+            _config: config,
             limits: MonitorLimits::load(),
         }
     }

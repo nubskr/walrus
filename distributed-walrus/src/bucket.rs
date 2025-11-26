@@ -84,6 +84,7 @@ impl Storage {
             .clone()
     }
 
+    #[allow(dead_code)]
     pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64 {
         self.engine.get_topic_size(wal_key)
     }

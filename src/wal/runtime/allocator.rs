@@ -162,7 +162,7 @@ impl BlockAllocator {
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };
         if next_id > data.id {
-            let diff = next_id - data.id;
+            let _diff = next_id - data.id;
             data.id = next_id;
             // Assume sequential blocks in current file
             // This might be wrong if we spanned multiple files, but startup_chore

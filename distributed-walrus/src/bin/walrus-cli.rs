@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use distributed_walrus::cli_client::CliClient;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::signal;
-use tokio::sync::mpsc;
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::Editor;
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Lightweight CLI for talking to a distributed-walrus cluster.
@@ -40,6 +40,10 @@ enum Command {
     Metrics,
 }
 
+const PROMPT: &str = "🦭 > ";
+const RESET: &str = "\x1b[0m";
+const BANNER_COLOR: &str = "\x1b[38;5;80m"; // teal
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = fmt::Subscriber::builder()
@@ -49,7 +53,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = args.addr.clone();
     let client = CliClient::new(addr.clone());
-    println!("walrus> connected target: {}", addr);
+    println!("→ connected target: {}", addr);
     match args.command.unwrap_or(Command::Repl) {
         Command::Repl => run_repl(client).await?,
         Command::Register { topic } => client.register(&topic).await?,
@@ -65,25 +69,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run_repl(client: CliClient) -> Result<()> {
-    println!("walrus> type commands (REGISTER/PUT/GET/STATE/METRICS). 'exit' or Ctrl+C to quit.");
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    print_banner();
+    println!("type commands (REGISTER/PUT/GET/STATE/METRICS). 'exit' or Ctrl+C to quit.");
 
-    // Reader task to handle stdin asynchronously.
-    tokio::spawn({
-        let tx = tx.clone();
-        async move {
-            let stdin = tokio::io::stdin();
-            let mut lines = BufReader::new(stdin).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(line);
-            }
-        }
-    });
+    let mut editor = Editor::<(), DefaultHistory>::new()?;
 
     loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => break,
-            Some(line) = rx.recv() => {
+        match editor.readline(PROMPT) {
+            Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -91,13 +84,42 @@ async fn run_repl(client: CliClient) -> Result<()> {
                 if matches!(trimmed.to_lowercase().as_str(), "exit" | "quit" | "q") {
                     break;
                 }
+
+                if editor.add_history_entry(trimmed).is_err() {
+                    eprintln!("ERR failed to store command in history");
+                }
+
                 match client.send_raw(trimmed).await {
                     Ok(resp) => println!("{resp}"),
                     Err(e) => eprintln!("ERR {e}"),
                 }
             }
-            else => break,
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(e) => {
+                eprintln!("ERR failed to read input: {e}");
+                break;
+            }
         }
     }
     Ok(())
 }
+
+fn print_banner() {
+    for line in WALRUS_ASCII.lines() {
+        println!("{BANNER_COLOR}{line}{RESET}");
+    }
+    println!();
+}
+
+const WALRUS_ASCII: &str = r#"
+██╗    ██╗ █████╗ ██╗     ██████╗ ██╗   ██╗███████╗
+██║    ██║██╔══██╗██║     ██╔══██╗██║   ██║██╔════╝
+██║ █╗ ██║███████║██║     ██████╔╝██║   ██║█████╗  
+██║███╗██║██╔══██║██║     ██╔══██╗██║   ██║╚════██║
+╚███╔███╔╝██║  ██║███████╗██║  ██║╚██████╔╝███████║
+ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+                                                    
+"#;

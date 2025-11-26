@@ -69,7 +69,9 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
         Err(_) => tokio::net::lookup_host(&advertised_addr)
             .await?
             .next()
-            .ok_or_else(|| anyhow::anyhow!("could not resolve advertised addr {}", advertised_addr))?,
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not resolve advertised addr {}", advertised_addr)
+            })?,
     };
 
     let mut join_target_resolved: Option<std::net::SocketAddr> = None;
