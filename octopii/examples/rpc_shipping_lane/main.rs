@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures::FutureExt;
 use octopii::rpc::{self, RequestPayload, ResponsePayload, RpcHandler};
 use octopii::transport::QuicTransport;
 use octopii::ShippingLane;
@@ -32,18 +33,24 @@ pub async fn run_negotiated_transfer() -> Result<Bytes, Box<dyn Error>> {
                     let addr_str = match String::from_utf8(data.to_vec()) {
                         Ok(s) => s,
                         Err(e) => {
-                            return ResponsePayload::Error {
-                                message: format!("invalid utf-8 address: {}", e),
+                            return async move {
+                                ResponsePayload::Error {
+                                    message: format!("invalid utf-8 address: {}", e),
+                                }
                             }
+                            .boxed()
                         }
                     };
 
                     let addr: SocketAddr = match addr_str.parse() {
                         Ok(a) => a,
                         Err(e) => {
-                            return ResponsePayload::Error {
-                                message: format!("invalid address: {}", e),
+                            return async move {
+                                ResponsePayload::Error {
+                                    message: format!("invalid address: {}", e),
+                                }
                             }
+                            .boxed()
                         }
                     };
 
@@ -56,14 +63,20 @@ pub async fn run_negotiated_transfer() -> Result<Bytes, Box<dyn Error>> {
                         }
                     });
 
-                    ResponsePayload::CustomResponse {
-                        success: true,
-                        data: Bytes::from(format!("READY {}", bytes.len())),
+                    async move {
+                        ResponsePayload::CustomResponse {
+                            success: true,
+                            data: Bytes::from(format!("READY {}", bytes.len())),
+                        }
+                    }
+                    .boxed()
+                }
+                _ => async {
+                    ResponsePayload::Error {
+                        message: "unsupported request".into(),
                     }
                 }
-                _ => ResponsePayload::Error {
-                    message: "unsupported request".into(),
-                },
+                .boxed(),
             }
         })
         .await;
