@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures::FutureExt;
 use octopii::rpc::{self, RequestPayload, ResponsePayload, RpcHandler};
 use octopii::transport::QuicTransport;
 use std::error::Error;
@@ -23,14 +24,20 @@ pub async fn run_rpc_example() -> Result<String, Box<dyn Error>> {
         .set_request_handler(|req| match req.payload {
             RequestPayload::Custom { data, .. } => {
                 let upper = String::from_utf8_lossy(&data).to_uppercase();
-                ResponsePayload::CustomResponse {
-                    success: true,
-                    data: Bytes::from(upper),
+                async {
+                    ResponsePayload::CustomResponse {
+                        success: true,
+                        data: Bytes::from(upper),
+                    }
+                }
+                .boxed()
+            }
+            _ => async {
+                ResponsePayload::Error {
+                    message: "unsupported payload".into(),
                 }
             }
-            _ => ResponsePayload::Error {
-                message: "unsupported payload".into(),
-            },
+            .boxed(),
         })
         .await;
 
