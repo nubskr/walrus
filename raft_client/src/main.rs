@@ -1,3 +1,11 @@
+//! # Raft Client - coordinates metadata across the Walrus cluster
+//! 
+//! This module implements a Raft client used by Walrus nodes or external clients
+//! to query and manage cluster membership and metadata.
+//! 
+//! The Raft client is responsible for connecting to a Raft node, obtaining cluster
+//! metadata, and exposing them to higher-level components.
+//! 
 use anyhow::Result;
 use octopii::{Config as OctopiiConfig, OctopiiNode, OctopiiRuntime};
 use std::collections::BTreeMap;
@@ -11,16 +19,19 @@ use openraft::impls::BasicNode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing with env-based filters, defaulting to INFO logs.
     fmt::Subscriber::builder()
         .with_env_filter(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
         .init();
 
+    // Node ID and address to query
     let node_id = 1;
     let raft_port = 5001;
     let bind_addr: SocketAddr = format!("127.0.0.1:{}", raft_port).parse()?;
 
     info!("Raft Client: Connecting to Node {} at {}", node_id, bind_addr);
 
+    // Initialize the Raft client node
     let oct_cfg = OctopiiConfig {
         node_id,
         bind_addr,
@@ -30,8 +41,10 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // Initialize the Octopii execution environment
     let runtime = OctopiiRuntime::from_handle(tokio::runtime::Handle::current());
 
+    // Initialize the Raft client node
     let node = Arc::new(OctopiiNode::new(oct_cfg, runtime.clone()).await?);
 
     // Give the cluster some time to stabilize
@@ -44,6 +57,7 @@ async fn main() -> Result<()> {
     info!("  Current Leader: {:?}", metrics.current_leader);
     info!("  State: {:?}", metrics.state);
 
+    // Gather the current nodes in the cluster
     let current_nodes: BTreeMap<u64, BasicNode> = metrics.membership_config.nodes().map(|(id, node_info)| (*id, node_info.clone())).collect();
     info!("  Nodes: {:?}", current_nodes);
 
@@ -54,6 +68,7 @@ async fn main() -> Result<()> {
         (3, "127.0.0.1:5003".to_string()),
     ]);
 
+    // Ensure all expected nodes are part of the cluster
     let mut all_voters_present = true;
 
     for (expected_id, expected_addr) in &expected_voters {
@@ -72,6 +87,7 @@ async fn main() -> Result<()> {
         info!("All expected nodes (1, 2, 3) are present in the cluster membership.");
     }
 
+    // Record whether this node holds leadership
     if metrics.current_leader == Some(node_id) {
         info!("Node {} is the current leader.", node_id);
     } else {
