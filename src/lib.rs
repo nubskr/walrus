@@ -254,3 +254,11 @@ pub mod wal;
 pub use wal::{
     Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, disable_fd_backend, enable_fd_backend,
 };
+
+pub fn topic_entry_count(wal: &Walrus, topic: &str) -> u64 {
+    wal.get_topic_entry_count(topic)
+}
+
+pub fn topic_entry_counts(wal: &Walrus) -> std::collections::HashMap<String, u64> {
+    wal.get_topic_entry_counts()
+}
