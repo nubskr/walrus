@@ -267,14 +267,28 @@ impl Writer {
         #[cfg(target_os = "linux")]
         {
             if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                return self.submit_batch_via_io_uring(
+                // Prefer io_uring for FD backend, but fall back to the portable path if io_uring
+                // is unavailable (e.g. kernel/config restrictions) so behavior remains correct.
+                match self.submit_batch_via_io_uring(
                     &write_plan,
                     batch,
                     &mut revert_info,
                     &mut *cur_offset,
                     planning_offset,
                     total_bytes_usize,
-                );
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if e.to_string().contains("io_uring init failed") {
+                            debug_print!(
+                                "[batch] io_uring unavailable; falling back: {}",
+                                e
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
 

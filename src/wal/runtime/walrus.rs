@@ -33,6 +33,7 @@ pub struct Walrus {
     pub(super) fsync_schedule: FsyncSchedule,
     pub(super) paths: Arc<WalPathManager>,
     topic_clean_tracker: Arc<TopicCleanTracker>,
+    topic_entry_counts: RwLock<HashMap<String, u64>>,
 }
 
 impl Walrus {
@@ -97,6 +98,7 @@ impl Walrus {
             fsync_schedule,
             paths,
             topic_clean_tracker,
+            topic_entry_counts: RwLock::new(HashMap::new()),
         };
         instance.startup_chore()?;
         Ok(instance)
@@ -112,6 +114,21 @@ impl Walrus {
 
     pub fn topic_is_clean(&self, topic: &str) -> bool {
         self.topic_clean_tracker.topic_is_clean(topic)
+    }
+
+    pub fn get_topic_entry_count(&self, topic: &str) -> u64 {
+        self.topic_entry_counts
+            .read()
+            .ok()
+            .and_then(|m| m.get(topic).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn get_topic_entry_counts(&self) -> HashMap<String, u64> {
+        self.topic_entry_counts
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     pub fn get_topic_size(&self, topic: &str) -> u64 {
@@ -153,6 +170,26 @@ impl Walrus {
     #[cfg(test)]
     pub(crate) fn force_flush_clean_markers_for_test(&self) -> std::io::Result<()> {
         self.topic_clean_tracker.force_flush_for_test()
+    }
+
+    pub(super) fn increment_topic_entry_count(&self, topic: &str, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.topic_entry_counts.write() {
+            let entry = guard.entry(topic.to_string()).or_insert(0);
+            *entry = entry.saturating_add(delta);
+        }
+    }
+
+    pub(super) fn decrement_topic_entry_count(&self, topic: &str, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.topic_entry_counts.write() {
+            let entry = guard.entry(topic.to_string()).or_insert(0);
+            *entry = entry.saturating_sub(delta);
+        }
     }
 
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
@@ -224,6 +261,7 @@ impl Walrus {
         // synthetic block ids btw
         let mut next_block_id: usize = 1;
         let mut seen_files = HashSet::new();
+        let mut topic_block_entry_counts: HashMap<String, Vec<u64>> = HashMap::new();
 
         for file_path in files.iter() {
             let mmap = match SharedMmapKeeper::get_mmap_arc(file_path) {
@@ -247,6 +285,7 @@ impl Walrus {
                 }
 
                 let mut used: u64 = 0;
+                let mut entries_in_block: u64 = 0;
 
                 // try to read first metadata to get column name (with 2-byte length prefix)
                 let mut meta_buf = vec![0u8; PREFIX_META_SIZE];
@@ -287,6 +326,7 @@ impl Walrus {
                         Ok((_entry, consumed)) => {
                             used += consumed as u64;
                             in_block_off += consumed as u64;
+                            entries_in_block = entries_in_block.saturating_add(1);
                             if in_block_off >= DEFAULT_BLOCK_SIZE {
                                 break;
                             }
@@ -311,6 +351,10 @@ impl Walrus {
                 FileStateTracker::add_block_to_file_state(file_path);
                 if !col_name.is_empty() {
                     let _ = self.reader.append_block_to_chain(&col_name, block.clone());
+                    topic_block_entry_counts
+                        .entry(col_name.clone())
+                        .or_default()
+                        .push(entries_in_block);
                     debug_print!(
                         "[recovery] appended block: file={}, block_id={}, used={}, col={}",
                         file_path,
@@ -323,6 +367,8 @@ impl Walrus {
                 block_offset += DEFAULT_BLOCK_SIZE;
             }
         }
+
+        self.rebuild_topic_entry_counts_after_recovery(&topic_block_entry_counts)?;
 
         // hydrate index into memory and mark checkpointed blocks
         if let Ok(idx_guard) = self.read_offset_index.read() {
@@ -363,6 +409,131 @@ impl Walrus {
 
         unsafe {
             self.allocator.fast_forward(next_block_id as u64);
+        }
+
+        Ok(())
+    }
+}
+
+impl Walrus {
+    fn rebuild_topic_entry_counts_after_recovery(
+        &self,
+        topic_block_entry_counts: &HashMap<String, Vec<u64>>,
+    ) -> std::io::Result<()> {
+        const TAIL_FLAG: u64 = 1u64 << 63;
+
+        fn count_entries_in_block_up_to(block: &Block, limit: u64) -> u64 {
+            let limit = limit.min(block.used);
+            let mut off: u64 = 0;
+            let mut count: u64 = 0;
+            while off < limit {
+                match block.read(off) {
+                    Ok((_entry, consumed)) => {
+                        let next = off.saturating_add(consumed as u64);
+                        if next > limit {
+                            break;
+                        }
+                        count = count.saturating_add(1);
+                        off = next;
+                    }
+                    Err(_) => break,
+                }
+            }
+            count
+        }
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+
+        let idx_guard = self.read_offset_index.read().ok();
+        let reader_guard = self.reader.data.read().ok();
+
+        if let Some(reader_guard) = reader_guard {
+            for (topic, info_arc) in reader_guard.iter() {
+                let Ok(info) = info_arc.read() else {
+                    continue;
+                };
+
+                let total_entries: u64 = topic_block_entry_counts
+                    .get(topic)
+                    .map(|v| v.iter().copied().sum())
+                    .unwrap_or(0);
+
+                let mut consumed_entries: u64 = 0;
+
+                if let Some(idx_guard) = idx_guard.as_ref() {
+                    if let Some(pos) = idx_guard.get(topic) {
+                        if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+                            let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
+                            if let Some(tail_idx) = info
+                                .chain
+                                .iter()
+                                .position(|b| b.id == tail_block_id)
+                            {
+                                // full blocks before tail_idx
+                                if let Some(per_block) = topic_block_entry_counts.get(topic) {
+                                    consumed_entries = consumed_entries.saturating_add(
+                                        per_block
+                                            .iter()
+                                            .take(tail_idx)
+                                            .copied()
+                                            .sum::<u64>(),
+                                    );
+                                }
+                                // partial within tail block
+                                if let Some(block) = info.chain.get(tail_idx) {
+                                    if pos.cur_block_offset >= block.used {
+                                        if let Some(per_block) = topic_block_entry_counts.get(topic)
+                                        {
+                                            consumed_entries = consumed_entries.saturating_add(
+                                                per_block.get(tail_idx).copied().unwrap_or(0),
+                                            );
+                                        }
+                                    } else {
+                                        consumed_entries = consumed_entries.saturating_add(
+                                            count_entries_in_block_up_to(
+                                                block,
+                                                pos.cur_block_offset,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            let block_idx = (pos.cur_block_idx as usize).min(info.chain.len());
+
+                            if let Some(per_block) = topic_block_entry_counts.get(topic) {
+                                consumed_entries = consumed_entries.saturating_add(
+                                    per_block
+                                        .iter()
+                                        .take(block_idx)
+                                        .copied()
+                                        .sum::<u64>(),
+                                );
+                            }
+
+                            if let Some(block) = info.chain.get(block_idx) {
+                                if pos.cur_block_offset >= block.used {
+                                    if let Some(per_block) = topic_block_entry_counts.get(topic) {
+                                        consumed_entries = consumed_entries.saturating_add(
+                                            per_block.get(block_idx).copied().unwrap_or(0),
+                                        );
+                                    }
+                                } else {
+                                    consumed_entries = consumed_entries.saturating_add(
+                                        count_entries_in_block_up_to(block, pos.cur_block_offset),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                counts.insert(topic.to_string(), total_entries.saturating_sub(consumed_entries));
+            }
+        }
+
+        if let Ok(mut guard) = self.topic_entry_counts.write() {
+            *guard = counts;
         }
 
         Ok(())
@@ -452,8 +623,7 @@ mod tests {
     #[test]
     fn test_batch_read_scanning() {
         let key = unique_key();
-        // Ensure we use mmap backend for this test to match the "fix" environment
-        crate::wal::config::disable_fd_backend();
+        crate::wal::config::enable_fd_backend();
 
         let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
 
@@ -527,6 +697,277 @@ mod tests {
         }
 
         assert_eq!(total_read_entries, count);
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_decrement_on_checkpoint_and_survive_restart_strict() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        {
+            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
+                .unwrap();
+            wal.append_for_topic("counts", b"one").unwrap();
+            wal.append_for_topic("counts", b"two").unwrap();
+            wal.batch_append_for_topic("counts", &[b"three", b"four"])
+                .unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 4);
+
+            // checkpoint consumes
+            let _ = wal.read_next("counts", true).unwrap().unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 3);
+
+            // peek does not consume
+            let _ = wal.read_next("counts", false).unwrap().unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 3);
+        }
+
+        {
+            // Restart should rebuild counts from WAL + persisted read offsets.
+            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
+                .unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 3);
+
+            let entries = wal
+                .batch_read_for_topic("counts", 16 * 1024, true, None)
+                .unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(wal.get_topic_entry_count("counts"), 0);
+        }
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_increment_immediately_single_and_batch() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+
+        assert_eq!(wal.get_topic_entry_count("a"), 0);
+        wal.append_for_topic("a", b"1").unwrap();
+        assert_eq!(wal.get_topic_entry_count("a"), 1);
+        wal.append_for_topic("a", b"2").unwrap();
+        assert_eq!(wal.get_topic_entry_count("a"), 2);
+
+        wal.batch_append_for_topic("a", &[b"3", b"4", b"5"]).unwrap();
+        assert_eq!(wal.get_topic_entry_count("a"), 5);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_are_per_topic() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("t1", b"a").unwrap();
+        wal.batch_append_for_topic("t2", &[b"a", b"b"]).unwrap();
+        wal.append_for_topic("t1", b"b").unwrap();
+
+        assert_eq!(wal.get_topic_entry_count("t1"), 2);
+        assert_eq!(wal.get_topic_entry_count("t2"), 2);
+        assert_eq!(wal.get_topic_entry_count("missing"), 0);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_decrement_on_read_next_checkpoint_only() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+        let _ = wal.read_next("t", false).unwrap().unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+        let _ = wal.read_next("t", true).unwrap().unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 2);
+
+        let _ = wal.read_next("t", true).unwrap().unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 1);
+
+        let _ = wal.read_next("t", true).unwrap().unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+
+        // No entry => no decrement below zero
+        assert!(wal.read_next("t", true).unwrap().is_none());
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_decrement_on_batch_read_checkpoint_only() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.batch_append_for_topic("t", &[b"a", b"b", b"c", b"d", b"e"])
+            .unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 5);
+
+        // checkpoint=false does not decrement
+        let entries = wal.batch_read_for_topic("t", 16 * 1024, false, None).unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(wal.get_topic_entry_count("t"), 5);
+
+        // checkpoint=true decrements
+        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+
+        // empty read => no decrement below zero
+        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_survive_restart_after_partial_read_next_strict() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            wal.batch_append_for_topic("t", &[b"a", b"b", b"c", b"d"])
+                .unwrap();
+            assert_eq!(wal.get_topic_entry_count("t"), 4);
+
+            let _ = wal.read_next("t", true).unwrap().unwrap();
+            let _ = wal.read_next("t", true).unwrap().unwrap();
+            assert_eq!(wal.get_topic_entry_count("t"), 2);
+        }
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            assert_eq!(wal.get_topic_entry_count("t"), 2);
+        }
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_survive_restart_after_batch_read_strict() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+            assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+            let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(wal.get_topic_entry_count("t"), 0);
+        }
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            assert_eq!(wal.get_topic_entry_count("t"), 0);
+        }
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_survive_restart_with_multiple_topics_strict() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            wal.batch_append_for_topic("t1", &[b"a", b"b"]).unwrap();
+            wal.batch_append_for_topic("t2", &[b"a", b"b", b"c"]).unwrap();
+            assert_eq!(wal.get_topic_entry_count("t1"), 2);
+            assert_eq!(wal.get_topic_entry_count("t2"), 3);
+
+            let _ = wal.read_next("t2", true).unwrap().unwrap();
+            assert_eq!(wal.get_topic_entry_count("t2"), 2);
+        }
+
+        {
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+            assert_eq!(wal.get_topic_entry_count("t1"), 2);
+            assert_eq!(wal.get_topic_entry_count("t2"), 2);
+        }
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn batch_append_over_limit_does_not_change_count() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("t", b"seed").unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 1);
+
+        let too_big: Vec<&[u8]> = std::iter::repeat(b"x".as_slice()).take(2001).collect();
+        let err = wal.batch_append_for_topic("t", &too_big).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(wal.get_topic_entry_count("t"), 1);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn stateless_batch_read_checkpoint_does_not_change_count() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+        // Stateless read (start_offset=Some) should not advance the shared cursor,
+        // so "checkpoint" must not affect the global count.
+        let entries = wal
+            .batch_read_for_topic("t", 16 * 1024, true, Some(0))
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_are_accurate_in_process_at_least_once_mode() {
+        let key = unique_key();
+        crate::wal::config::enable_fd_backend();
+
+        let wal = Walrus::with_consistency_for_key(
+            &key,
+            ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+        )
+        .unwrap();
+
+        wal.append_for_topic("t", b"a").unwrap();
+        wal.batch_append_for_topic("t", &[b"b", b"c"]).unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 3);
+
+        let _ = wal.read_next("t", true).unwrap().unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 2);
+
+        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+
         cleanup_key(&key);
     }
 }
