@@ -1170,11 +1170,13 @@ impl Walrus {
                     PersistTarget::Tail { blk_id, off } => {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
                             let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
+                            let _ = idx_guard.decrement_count(col_name, entries.len() as u64);
                         }
                     }
                     PersistTarget::Sealed { idx, off } => {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
                             let _ = idx_guard.set(col_name.to_string(), idx, off);
+                            let _ = idx_guard.decrement_count(col_name, entries.len() as u64);
                         }
                     }
                     PersistTarget::None => {}

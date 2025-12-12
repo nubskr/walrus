@@ -114,6 +114,13 @@ impl Walrus {
         self.topic_clean_tracker.topic_is_clean(topic)
     }
 
+    pub fn get_topic_entry_count(&self, topic: &str) -> u64 {
+        if let Ok(idx_guard) = self.read_offset_index.read() {
+            return idx_guard.get_count(topic);
+        }
+        0
+    }
+
     pub fn get_topic_size(&self, topic: &str) -> u64 {
         // 1. Get sealed size from reader
         let sealed_size: u64 = if let Some(info_arc) = self
@@ -527,6 +534,37 @@ mod tests {
         }
 
         assert_eq!(total_read_entries, count);
+        cleanup_key(&key);
+    }
+
+    #[test]
+    fn entry_counts_persist_and_decrement_on_checkpoint() {
+        let key = unique_key();
+        crate::wal::config::disable_fd_backend();
+
+        {
+            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
+                .unwrap();
+            wal.append_for_topic("counts", b"one").unwrap();
+            wal.append_for_topic("counts", b"two").unwrap();
+            wal.batch_append_for_topic("counts", &[b"three", b"four"]).unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 4);
+        }
+
+        {
+            // Ensure count survives restart.
+            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
+                .unwrap();
+            assert_eq!(wal.get_topic_entry_count("counts"), 4);
+
+            // Checkpoint read should decrement counts by the number of entries returned.
+            let entries = wal
+                .batch_read_for_topic("counts", 16 * 1024, true, None)
+                .unwrap();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(wal.get_topic_entry_count("counts"), 0);
+        }
+
         cleanup_key(&key);
     }
 }

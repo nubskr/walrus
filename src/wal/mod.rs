@@ -1,8 +1,8 @@
-mod block;
-mod config;
-mod paths;
-mod runtime;
-mod storage;
+pub mod block;
+pub mod config;
+pub mod paths;
+pub mod runtime;
+pub mod storage;
 
 pub use block::Entry;
 pub use config::{FsyncSchedule, PREFIX_META_SIZE, disable_fd_backend, enable_fd_backend};
