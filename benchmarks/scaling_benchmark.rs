@@ -196,8 +196,8 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
             start_barrier_clone.wait();
 
             let start_time = Instant::now();
-            let mut local_writes = 0u64;
-            let mut local_errors = 0u64;
+            let mut _local_writes = 0u64;
+            let mut _local_errors = 0u64;
             let mut counter = 0u64;
             let mut rng = rand::thread_rng();
 
@@ -228,12 +228,12 @@ fn run_benchmark_with_threads(num_threads: usize) -> f64 {
 
                 match wal_clone.append_for_topic(&topic, &data) {
                     Ok(_) => {
-                        local_writes += 1;
+                        _local_writes += 1;
                         // Update global counter in real-time
                         total_writes_clone.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
-                        local_errors += 1;
+                        _local_errors += 1;
                         write_errors_clone.fetch_add(1, Ordering::Relaxed);
                     }
                 }

@@ -127,10 +127,12 @@ impl TestEnv {
         Self { key, dir }
     }
 
+    #[allow(dead_code)]
     pub fn namespace_key(&self) -> &str {
         &self.key
     }
 
+    #[allow(dead_code)]
     pub fn unique_key(&self, base: &str) -> String {
         format!("{}-{}", base, self.key)
     }
@@ -150,6 +152,7 @@ impl Drop for TestEnv {
     }
 }
 
+#[allow(dead_code)]
 pub fn current_wal_dir() -> PathBuf {
     let mut base = ensure_base_dir();
     let key = THREAD_KEYS.with(|state| {

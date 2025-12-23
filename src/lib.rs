@@ -64,7 +64,7 @@
 //!
 //! // Batch read with byte limit (returns at least 1 entry if available)
 //! let max_bytes = 1024 * 1024; // 1MB
-//! let entries = wal.batch_read_for_topic("events", max_bytes, true)?;
+//! let entries = wal.batch_read_for_topic("events", max_bytes, true, None)?;
 //! for entry in entries {
 //!     println!("Read: {} bytes", entry.data.len());
 //! }
@@ -221,10 +221,11 @@
 //! ## Types
 //!
 //! ```rust
-//! # use walrus_rust::Entry;
-//! // Entry returned by read operations
-//! pub struct Entry {
-//!     pub data: Vec<u8>,
+//! use walrus_rust::Entry;
+//!
+//! // `Entry` is returned by read operations and contains the payload bytes.
+//! fn payload_len(e: &Entry) -> usize {
+//!     e.data.len()
 //! }
 //! ```
 //!
@@ -242,17 +243,22 @@
 //! ### Write Operations
 //!
 //! - [`Walrus::append_for_topic()`]: Append single entry to topic
+//! - [`Walrus::append_for_topic_with_cursor()`]: Append and return a cursor for committing
 //! - [`Walrus::batch_append_for_topic()`]: Atomic batch write (up to 2,000 entries)
 //!
 //! ### Read Operations
 //!
 //! - [`Walrus::read_next()`]: Read next entry (checkpoint=true consumes, false peeks)
 //! - [`Walrus::batch_read_for_topic()`]: Read multiple entries up to byte limit
+//! - [`Walrus::get_cursor()`]: Get the committed cursor for a topic
+//! - [`Walrus::read_next_after()`]: Read using an explicit cursor (no checkpointing)
+//! - [`Walrus::commit_to_cursor()`]: Persist a cursor and enable reclamation
 
 #![recursion_limit = "256"]
 pub mod wal;
 pub use wal::{
-    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, disable_fd_backend, enable_fd_backend,
+    Cursor, Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, disable_fd_backend,
+    enable_fd_backend,
 };
 
 pub fn topic_entry_count(wal: &Walrus, topic: &str) -> u64 {

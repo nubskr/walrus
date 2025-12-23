@@ -51,7 +51,7 @@ fn test_zeroed_header_stops_block_scanning() {
 
         assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
 
-        let offset_0 = 0;
+        let _offset_0 = 0;
         let offset_1 = entry_offset("entry_0".len());
         let offset_2 = offset_1 + entry_offset("entry_1".len());
 

@@ -13,6 +13,6 @@ mod writer;
 
 #[allow(unused_imports)]
 pub use index::{BlockPos, WalIndex};
-pub use walrus::{ReadConsistency, Walrus};
+pub use walrus::{Cursor, ReadConsistency, Walrus};
 
 pub(super) static DELETION_TX: OnceLock<Arc<mpsc::Sender<String>>> = OnceLock::new();

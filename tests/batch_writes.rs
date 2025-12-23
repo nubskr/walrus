@@ -4,7 +4,7 @@ use common::{TestEnv, current_wal_dir};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, disable_fd_backend, enable_fd_backend};
+use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus, enable_fd_backend};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -122,7 +122,7 @@ fn test_concurrent_batch_writes_rejected() {
 
     let mut handles = vec![];
 
-    for i in 0..2 {
+    for _i in 0..2 {
         let wal_clone = wal.clone();
         let barrier_clone = barrier.clone();
         let success = success_count.clone();
@@ -263,7 +263,7 @@ fn test_batch_spans_multiple_blocks() {
 
     wal.batch_append_for_topic("test_topic", &entries).unwrap();
 
-    for i in 0..100 {
+    for _i in 0..100 {
         let entry = wal.read_next("test_topic", true).unwrap().unwrap();
         assert_eq!(entry.data.len(), 5 * 1024 * 1024);
         assert_eq!(entry.data[0], 0xAB);
@@ -482,11 +482,11 @@ fn test_chaos_batch_write_with_concurrent_readers() {
         let stop = stop_flag.clone();
 
         let handle = thread::spawn(move || {
-            let mut read_count = 0;
+            let mut _read_count = 0;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok(Some(entry)) = wal_clone.read_next("chaos_rw_topic", true) {
                     assert!(!entry.data.is_empty());
-                    read_count += 1;
+                    _read_count += 1;
                 } else {
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -571,7 +571,7 @@ fn test_chaos_alternating_tiny_and_huge_batches() {
     )
     .unwrap();
 
-    for round in 0..10 {
+    for _round in 0..10 {
         let tiny: Vec<&[u8]> = vec![b"t"];
         wal.batch_append_for_topic("alternating", &tiny).unwrap();
 
@@ -580,7 +580,7 @@ fn test_chaos_alternating_tiny_and_huge_batches() {
         wal.batch_append_for_topic("alternating", &huge).unwrap();
     }
 
-    for round in 0..10 {
+    for _round in 0..10 {
         let tiny_entry = wal.read_next("alternating", true).unwrap().unwrap();
         assert_eq!(tiny_entry.data, b"t");
 
@@ -1727,7 +1727,7 @@ fn test_rollback_preserves_existing_data() {
     }
 
     let mut read_entries = Vec::new();
-    for i in 0..5 {
+    for _i in 0..5 {
         let entry = wal.read_next("rollback_preserve", true).unwrap().unwrap();
         read_entries.push(entry.data);
     }

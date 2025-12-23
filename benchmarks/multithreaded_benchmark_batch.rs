@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -417,7 +416,6 @@ fn multithreaded_batch_benchmark() {
     let total_batches_monitor = Arc::clone(&total_batches);
     let total_entries_monitor = Arc::clone(&total_entries);
     let total_write_bytes_monitor = Arc::clone(&total_write_bytes);
-    let throughput_tx_clone = throughput_tx.clone();
     let monitor_duration = write_duration;
 
     let monitor_handle = thread::spawn(move || {
@@ -427,11 +425,10 @@ fn multithreaded_batch_benchmark() {
             .open("batch_benchmark_throughput.csv")
             .expect("Failed to open CSV file");
 
-        let mut start_time = Instant::now();
+        let mut _start_time = Instant::now();
         let mut last_batches = 0u64;
         let mut last_entries = 0u64;
         let mut last_bytes = 0u64;
-        let mut last_time = start_time;
         let mut tick_index: u64 = 0;
 
         // Wait for benchmark to start
@@ -452,8 +449,7 @@ fn multithreaded_batch_benchmark() {
         csv_file.flush().expect("Failed to flush CSV");
 
         // Reset timing and wait before first measurement
-        start_time = Instant::now();
-        last_time = start_time;
+        _start_time = Instant::now();
         thread::sleep(Duration::from_millis(500));
 
         loop {
@@ -464,7 +460,6 @@ fn multithreaded_batch_benchmark() {
             let interval_s = 0.5f64;
             let elapsed_total = tick_index as f64 * interval_s;
 
-            let current_time = Instant::now();
             let current_batches = total_batches_monitor.load(Ordering::Relaxed);
             let current_entries = total_entries_monitor.load(Ordering::Relaxed);
             let current_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
@@ -523,7 +518,6 @@ fn multithreaded_batch_benchmark() {
             last_batches = current_batches;
             last_entries = current_entries;
             last_bytes = current_bytes;
-            last_time = current_time;
 
             // Stop monitoring after write phase (duration + 30s buffer)
             let max_monitor_time = monitor_duration.as_secs_f64() + 30.0;
@@ -558,7 +552,7 @@ fn multithreaded_batch_benchmark() {
             let mut counter = 0u64;
 
             // Batch write phase
-            let mut rng = rand::thread_rng();
+            // deterministic payloads; no RNG needed
 
             while start_time.elapsed() < write_duration {
                 // Create a batch of entries
