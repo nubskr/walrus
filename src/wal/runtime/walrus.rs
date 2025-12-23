@@ -514,19 +514,13 @@ impl Walrus {
                     if let Some(pos) = idx_guard.get(topic) {
                         if (pos.cur_block_idx & TAIL_FLAG) != 0 {
                             let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
-                            if let Some(tail_idx) = info
-                                .chain
-                                .iter()
-                                .position(|b| b.id == tail_block_id)
+                            if let Some(tail_idx) =
+                                info.chain.iter().position(|b| b.id == tail_block_id)
                             {
                                 // full blocks before tail_idx
                                 if let Some(per_block) = topic_block_entry_counts.get(topic) {
                                     consumed_entries = consumed_entries.saturating_add(
-                                        per_block
-                                            .iter()
-                                            .take(tail_idx)
-                                            .copied()
-                                            .sum::<u64>(),
+                                        per_block.iter().take(tail_idx).copied().sum::<u64>(),
                                     );
                                 }
                                 // partial within tail block
@@ -553,11 +547,7 @@ impl Walrus {
 
                             if let Some(per_block) = topic_block_entry_counts.get(topic) {
                                 consumed_entries = consumed_entries.saturating_add(
-                                    per_block
-                                        .iter()
-                                        .take(block_idx)
-                                        .copied()
-                                        .sum::<u64>(),
+                                    per_block.iter().take(block_idx).copied().sum::<u64>(),
                                 );
                             }
 
@@ -578,7 +568,10 @@ impl Walrus {
                     }
                 }
 
-                counts.insert(topic.to_string(), total_entries.saturating_sub(consumed_entries));
+                counts.insert(
+                    topic.to_string(),
+                    total_entries.saturating_sub(consumed_entries),
+                );
             }
         }
 
@@ -756,8 +749,8 @@ mod tests {
         crate::wal::config::enable_fd_backend();
 
         {
-            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
-                .unwrap();
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
             wal.append_for_topic("counts", b"one").unwrap();
             wal.append_for_topic("counts", b"two").unwrap();
             wal.batch_append_for_topic("counts", &[b"three", b"four"])
@@ -775,8 +768,8 @@ mod tests {
 
         {
             // Restart should rebuild counts from WAL + persisted read offsets.
-            let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce)
-                .unwrap();
+            let wal =
+                Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
             assert_eq!(wal.get_topic_entry_count("counts"), 3);
 
             let entries = wal
@@ -802,7 +795,8 @@ mod tests {
         wal.append_for_topic("a", b"2").unwrap();
         assert_eq!(wal.get_topic_entry_count("a"), 2);
 
-        wal.batch_append_for_topic("a", &[b"3", b"4", b"5"]).unwrap();
+        wal.batch_append_for_topic("a", &[b"3", b"4", b"5"])
+            .unwrap();
         assert_eq!(wal.get_topic_entry_count("a"), 5);
 
         cleanup_key(&key);
@@ -831,7 +825,8 @@ mod tests {
         crate::wal::config::enable_fd_backend();
 
         let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
-        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"])
+            .unwrap();
         assert_eq!(wal.get_topic_entry_count("t"), 3);
 
         let _ = wal.read_next("t", false).unwrap().unwrap();
@@ -864,17 +859,23 @@ mod tests {
         assert_eq!(wal.get_topic_entry_count("t"), 5);
 
         // checkpoint=false does not decrement
-        let entries = wal.batch_read_for_topic("t", 16 * 1024, false, None).unwrap();
+        let entries = wal
+            .batch_read_for_topic("t", 16 * 1024, false, None)
+            .unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(wal.get_topic_entry_count("t"), 5);
 
         // checkpoint=true decrements
-        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        let entries = wal
+            .batch_read_for_topic("t", 16 * 1024, true, None)
+            .unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(wal.get_topic_entry_count("t"), 0);
 
         // empty read => no decrement below zero
-        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        let entries = wal
+            .batch_read_for_topic("t", 16 * 1024, true, None)
+            .unwrap();
         assert!(entries.is_empty());
         assert_eq!(wal.get_topic_entry_count("t"), 0);
 
@@ -915,10 +916,13 @@ mod tests {
         {
             let wal =
                 Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
-            wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+            wal.batch_append_for_topic("t", &[b"a", b"b", b"c"])
+                .unwrap();
             assert_eq!(wal.get_topic_entry_count("t"), 3);
 
-            let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+            let entries = wal
+                .batch_read_for_topic("t", 16 * 1024, true, None)
+                .unwrap();
             assert_eq!(entries.len(), 3);
             assert_eq!(wal.get_topic_entry_count("t"), 0);
         }
@@ -941,7 +945,8 @@ mod tests {
             let wal =
                 Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
             wal.batch_append_for_topic("t1", &[b"a", b"b"]).unwrap();
-            wal.batch_append_for_topic("t2", &[b"a", b"b", b"c"]).unwrap();
+            wal.batch_append_for_topic("t2", &[b"a", b"b", b"c"])
+                .unwrap();
             assert_eq!(wal.get_topic_entry_count("t1"), 2);
             assert_eq!(wal.get_topic_entry_count("t2"), 3);
 
@@ -982,7 +987,8 @@ mod tests {
         crate::wal::config::enable_fd_backend();
 
         let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
-        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"]).unwrap();
+        wal.batch_append_for_topic("t", &[b"a", b"b", b"c"])
+            .unwrap();
         assert_eq!(wal.get_topic_entry_count("t"), 3);
 
         // Stateless read (start_offset=Some) should not advance the shared cursor,
@@ -1003,7 +1009,9 @@ mod tests {
 
         let wal = Walrus::with_consistency_for_key(
             &key,
-            ReadConsistency::AtLeastOnce { persist_every: 10_000 },
+            ReadConsistency::AtLeastOnce {
+                persist_every: 10_000,
+            },
         )
         .unwrap();
 
@@ -1014,7 +1022,9 @@ mod tests {
         let _ = wal.read_next("t", true).unwrap().unwrap();
         assert_eq!(wal.get_topic_entry_count("t"), 2);
 
-        let entries = wal.batch_read_for_topic("t", 16 * 1024, true, None).unwrap();
+        let entries = wal
+            .batch_read_for_topic("t", 16 * 1024, true, None)
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(wal.get_topic_entry_count("t"), 0);
 

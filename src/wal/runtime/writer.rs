@@ -361,10 +361,7 @@ impl Writer {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         if e.to_string().contains("io_uring init failed") {
-                            debug_print!(
-                                "[batch] io_uring unavailable; falling back: {}",
-                                e
-                            );
+                            debug_print!("[batch] io_uring unavailable; falling back: {}", e);
                         } else {
                             return Err(e);
                         }

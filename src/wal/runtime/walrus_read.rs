@@ -1,7 +1,7 @@
 use super::allocator::BlockStateTracker;
 use super::reader::ColReaderInfo;
-use super::{ReadConsistency, Walrus};
 use super::walrus::Cursor;
+use super::{ReadConsistency, Walrus};
 use crate::wal::block::{Block, Entry, Metadata};
 use crate::wal::config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print};
 use std::io;
@@ -57,7 +57,9 @@ impl Walrus {
             .and_then(|arc| arc.read().ok().map(|info| info.chain.clone()))
             .unwrap_or_default();
 
-        let writer_meta = writer_snapshot.as_ref().map(|(b, written)| (b.id, *written));
+        let writer_meta = writer_snapshot
+            .as_ref()
+            .map(|(b, written)| (b.id, *written));
 
         #[derive(Clone, Copy)]
         enum NormalizedPos {
@@ -68,7 +70,7 @@ impl Walrus {
         fn normalize_cursor(
             cursor: &Cursor,
             chain: &[Block],
-            writer_meta: Option<(u64 /*active_id*/, u64 /*written*/)> ,
+            writer_meta: Option<(u64 /*active_id*/, u64 /*written*/)>,
         ) -> io::Result<NormalizedPos> {
             if let Some(tail_bid) = cursor.tail_block_id() {
                 if let Some(idx) = chain.iter().position(|b| b.id == tail_bid) {
@@ -83,7 +85,9 @@ impl Walrus {
                                 "cursor tail offset is beyond active written bytes",
                             ));
                         }
-                        return Ok(NormalizedPos::Tail { off: cursor.offset() });
+                        return Ok(NormalizedPos::Tail {
+                            off: cursor.offset(),
+                        });
                     }
                 }
                 return Err(io::Error::new(
@@ -144,63 +148,77 @@ impl Walrus {
         }
 
         // Derive how many entries were committed (for `topic_entry_count` bookkeeping).
-        // This avoids callers having to pass a separate count and keeps `Cursor` immutable.
         let mut entries_committed: u64 = 0;
         match (cur_norm, new_norm) {
-            (NormalizedPos::Sealed { idx: cidx, off: coff }, NormalizedPos::Sealed { idx: nidx, off: noff }) => {
+            (
+                NormalizedPos::Sealed {
+                    idx: cidx,
+                    off: coff,
+                },
+                NormalizedPos::Sealed {
+                    idx: nidx,
+                    off: noff,
+                },
+            ) => {
                 if cidx == nidx {
                     if let Some(block) = chain.get(cidx) {
-                        entries_committed = count_entries_in_range(block, coff, noff.min(block.used));
+                        entries_committed =
+                            count_entries_in_range(block, coff, noff.min(block.used));
                     }
                 } else {
                     if let Some(block) = chain.get(cidx) {
-                        entries_committed = entries_committed.saturating_add(
-                            count_entries_in_range(block, coff, block.used),
-                        );
+                        entries_committed = entries_committed
+                            .saturating_add(count_entries_in_range(block, coff, block.used));
                     }
                     for i in (cidx + 1)..nidx {
                         if let Some(block) = chain.get(i) {
-                            entries_committed = entries_committed.saturating_add(
-                                count_entries_in_range(block, 0, block.used),
-                            );
+                            entries_committed = entries_committed
+                                .saturating_add(count_entries_in_range(block, 0, block.used));
                         }
                     }
                     if let Some(block) = chain.get(nidx) {
-                        entries_committed = entries_committed.saturating_add(
-                            count_entries_in_range(block, 0, noff.min(block.used)),
-                        );
+                        entries_committed = entries_committed
+                            .saturating_add(count_entries_in_range(block, 0, noff.min(block.used)));
                     }
                 }
             }
-            (NormalizedPos::Sealed { idx: cidx, off: coff }, NormalizedPos::Tail { off: noff }) => {
+            (
+                NormalizedPos::Sealed {
+                    idx: cidx,
+                    off: coff,
+                },
+                NormalizedPos::Tail { off: noff },
+            ) => {
                 if cidx < chain.len() {
                     if let Some(block) = chain.get(cidx) {
-                        entries_committed = entries_committed.saturating_add(
-                            count_entries_in_range(block, coff, block.used),
-                        );
+                        entries_committed = entries_committed
+                            .saturating_add(count_entries_in_range(block, coff, block.used));
                     }
                     for i in (cidx + 1)..chain.len() {
                         if let Some(block) = chain.get(i) {
-                            entries_committed = entries_committed.saturating_add(
-                                count_entries_in_range(block, 0, block.used),
-                            );
+                            entries_committed = entries_committed
+                                .saturating_add(count_entries_in_range(block, 0, block.used));
                         }
                     }
                 }
                 if let Some((active_block, written)) = writer_snapshot.as_ref() {
                     let end = noff.min(*written);
-                    entries_committed = entries_committed.saturating_add(
-                        count_entries_in_range(active_block, 0, end),
-                    );
+                    entries_committed = entries_committed.saturating_add(count_entries_in_range(
+                        active_block,
+                        0,
+                        end,
+                    ));
                 }
             }
             (NormalizedPos::Tail { off: coff }, NormalizedPos::Tail { off: noff }) => {
                 if let Some((active_block, written)) = writer_snapshot.as_ref() {
                     let start = coff.min(*written);
                     let end = noff.min(*written);
-                    entries_committed = entries_committed.saturating_add(
-                        count_entries_in_range(active_block, start, end),
-                    );
+                    entries_committed = entries_committed.saturating_add(count_entries_in_range(
+                        active_block,
+                        start,
+                        end,
+                    ));
                 }
             }
             (NormalizedPos::Tail { .. }, NormalizedPos::Sealed { .. }) => {
@@ -212,7 +230,10 @@ impl Walrus {
         // Persist cursor to index
         {
             let mut idx_guard = self.read_offset_index.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "read_offset_index write lock poisoned")
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "read_offset_index write lock poisoned",
+                )
             })?;
             idx_guard.set(col_name.to_string(), cursor.raw_index(), cursor.offset())?;
         }
@@ -1063,8 +1084,8 @@ impl Walrus {
                                             };
                                             let meta2_res: Result<Metadata, _> =
                                                 archived2.deserialize(&mut rkyv::Infallible);
-                                            let meta2 = meta2_res
-                                                .expect("infallible metadata deserialize");
+                                            let meta2 =
+                                                meta2_res.expect("infallible metadata deserialize");
                                             let size2 = meta2.read_size;
                                             let required2 = (PREFIX_META_SIZE + size2) as u64;
                                             final_required = required1 + required2;
