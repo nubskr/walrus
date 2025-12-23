@@ -1,6 +1,7 @@
 use super::allocator::BlockStateTracker;
 use super::reader::ColReaderInfo;
 use super::{ReadConsistency, Walrus};
+use super::walrus::Cursor;
 use crate::wal::block::{Block, Entry, Metadata};
 use crate::wal::config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print};
 use std::io;
@@ -21,6 +22,325 @@ use io_uring;
 use std::os::unix::io::AsRawFd;
 
 impl Walrus {
+    pub fn get_cursor(&self, col_name: &str) -> Cursor {
+        let topic: Arc<str> = Arc::from(col_name);
+        if let Ok(idx_guard) = self.read_offset_index.read() {
+            if let Some(pos) = idx_guard.get(col_name) {
+                return Cursor::new(topic, pos.cur_block_idx, pos.cur_block_offset);
+            }
+        }
+        Cursor::new(topic, 0, 0)
+    }
+
+    pub fn commit_to_cursor(&self, cursor: &Cursor) -> io::Result<()> {
+        self.commit_cursor_inner(cursor)
+    }
+
+    fn commit_cursor_inner(&self, cursor: &Cursor) -> io::Result<()> {
+        let col_name = cursor.topic();
+
+        // Snapshot active writer state (if any) for normalization and tail counting.
+        let writer_snapshot: Option<(Block, u64)> = self
+            .writers
+            .read()
+            .ok()
+            .and_then(|m| m.get(col_name).cloned())
+            .and_then(|w| w.snapshot_block().ok());
+
+        // Snapshot chain and active writer block id (if any) for normalization + reclamation marking
+        let chain: Vec<Block> = self
+            .reader
+            .data
+            .read()
+            .ok()
+            .and_then(|m| m.get(col_name).cloned())
+            .and_then(|arc| arc.read().ok().map(|info| info.chain.clone()))
+            .unwrap_or_default();
+
+        let writer_meta = writer_snapshot.as_ref().map(|(b, written)| (b.id, *written));
+
+        #[derive(Clone, Copy)]
+        enum NormalizedPos {
+            Sealed { idx: usize, off: u64 },
+            Tail { off: u64 },
+        }
+
+        fn normalize_cursor(
+            cursor: &Cursor,
+            chain: &[Block],
+            writer_meta: Option<(u64 /*active_id*/, u64 /*written*/)> ,
+        ) -> io::Result<NormalizedPos> {
+            if let Some(tail_bid) = cursor.tail_block_id() {
+                if let Some(idx) = chain.iter().position(|b| b.id == tail_bid) {
+                    let off = cursor.offset().min(chain[idx].used);
+                    return Ok(NormalizedPos::Sealed { idx, off });
+                }
+                if let Some((active_id, written)) = writer_meta {
+                    if active_id == tail_bid {
+                        if cursor.offset() > written {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "cursor tail offset is beyond active written bytes",
+                            ));
+                        }
+                        return Ok(NormalizedPos::Tail { off: cursor.offset() });
+                    }
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cursor tail block id is not present in chain and is not the active block",
+                ));
+            }
+
+            let mut idx = cursor.raw_index() as usize;
+            if idx > chain.len() {
+                idx = chain.len();
+            }
+            let off = if idx < chain.len() {
+                cursor.offset().min(chain[idx].used)
+            } else {
+                0
+            };
+            Ok(NormalizedPos::Sealed { idx, off })
+        }
+
+        fn pos_key(pos: NormalizedPos, chain_len: usize) -> (usize, u64) {
+            match pos {
+                NormalizedPos::Sealed { idx, off } => (idx, off),
+                NormalizedPos::Tail { off } => (chain_len, off),
+            }
+        }
+
+        fn count_entries_in_range(block: &Block, start: u64, end: u64) -> u64 {
+            let mut off = start.min(end);
+            let end = end;
+            let mut count = 0u64;
+            while off < end {
+                match block.read(off) {
+                    Ok((_e, consumed)) => {
+                        let next = off.saturating_add(consumed as u64);
+                        if next > end {
+                            break;
+                        }
+                        count = count.saturating_add(1);
+                        off = next;
+                    }
+                    Err(_) => break,
+                }
+            }
+            count
+        }
+
+        // Enforce monotonicity against the current committed cursor (best-effort, based on current chain)
+        let current = self.get_cursor(col_name);
+        let cur_norm = normalize_cursor(&current, &chain, writer_meta)?;
+        let new_norm = normalize_cursor(cursor, &chain, writer_meta)?;
+
+        if pos_key(new_norm, chain.len()) < pos_key(cur_norm, chain.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "commit cursor must be monotonic for a topic",
+            ));
+        }
+
+        // Derive how many entries were committed (for `topic_entry_count` bookkeeping).
+        // This avoids callers having to pass a separate count and keeps `Cursor` immutable.
+        let mut entries_committed: u64 = 0;
+        match (cur_norm, new_norm) {
+            (NormalizedPos::Sealed { idx: cidx, off: coff }, NormalizedPos::Sealed { idx: nidx, off: noff }) => {
+                if cidx == nidx {
+                    if let Some(block) = chain.get(cidx) {
+                        entries_committed = count_entries_in_range(block, coff, noff.min(block.used));
+                    }
+                } else {
+                    if let Some(block) = chain.get(cidx) {
+                        entries_committed = entries_committed.saturating_add(
+                            count_entries_in_range(block, coff, block.used),
+                        );
+                    }
+                    for i in (cidx + 1)..nidx {
+                        if let Some(block) = chain.get(i) {
+                            entries_committed = entries_committed.saturating_add(
+                                count_entries_in_range(block, 0, block.used),
+                            );
+                        }
+                    }
+                    if let Some(block) = chain.get(nidx) {
+                        entries_committed = entries_committed.saturating_add(
+                            count_entries_in_range(block, 0, noff.min(block.used)),
+                        );
+                    }
+                }
+            }
+            (NormalizedPos::Sealed { idx: cidx, off: coff }, NormalizedPos::Tail { off: noff }) => {
+                if cidx < chain.len() {
+                    if let Some(block) = chain.get(cidx) {
+                        entries_committed = entries_committed.saturating_add(
+                            count_entries_in_range(block, coff, block.used),
+                        );
+                    }
+                    for i in (cidx + 1)..chain.len() {
+                        if let Some(block) = chain.get(i) {
+                            entries_committed = entries_committed.saturating_add(
+                                count_entries_in_range(block, 0, block.used),
+                            );
+                        }
+                    }
+                }
+                if let Some((active_block, written)) = writer_snapshot.as_ref() {
+                    let end = noff.min(*written);
+                    entries_committed = entries_committed.saturating_add(
+                        count_entries_in_range(active_block, 0, end),
+                    );
+                }
+            }
+            (NormalizedPos::Tail { off: coff }, NormalizedPos::Tail { off: noff }) => {
+                if let Some((active_block, written)) = writer_snapshot.as_ref() {
+                    let start = coff.min(*written);
+                    let end = noff.min(*written);
+                    entries_committed = entries_committed.saturating_add(
+                        count_entries_in_range(active_block, start, end),
+                    );
+                }
+            }
+            (NormalizedPos::Tail { .. }, NormalizedPos::Sealed { .. }) => {
+                // If the committed cursor was in tail but that block is now sealed, normalization
+                // would have folded it into the sealed chain. Reaching here implies an inconsistent view.
+            }
+        }
+
+        // Persist cursor to index
+        {
+            let mut idx_guard = self.read_offset_index.write().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "read_offset_index write lock poisoned")
+            })?;
+            idx_guard.set(col_name.to_string(), cursor.raw_index(), cursor.offset())?;
+        }
+
+        // Mark fully-covered sealed blocks as checkpointed so the existing reclamation logic can run.
+        // (Never checkpoint the active tail block.)
+        match normalize_cursor(cursor, &chain, writer_meta)? {
+            NormalizedPos::Sealed { idx, off } => {
+                for i in 0..idx.min(chain.len()) {
+                    BlockStateTracker::set_checkpointed_true(chain[i].id as usize);
+                }
+                if idx < chain.len() && off >= chain[idx].used {
+                    BlockStateTracker::set_checkpointed_true(chain[idx].id as usize);
+                }
+            }
+            NormalizedPos::Tail { .. } => {
+                for i in 0..chain.len() {
+                    BlockStateTracker::set_checkpointed_true(chain[i].id as usize);
+                }
+            }
+        }
+
+        if entries_committed > 0 {
+            self.decrement_topic_entry_count(col_name, entries_committed);
+        }
+
+        Ok(())
+    }
+
+    pub fn read_next_after(&self, cursor: &Cursor) -> io::Result<Option<(Entry, Cursor)>> {
+        let col_name = cursor.topic();
+        let topic: Arc<str> = Arc::from(col_name);
+        // Snapshot sealed chain (if any)
+        let chain: Vec<Block> = self
+            .reader
+            .data
+            .read()
+            .ok()
+            .and_then(|m| m.get(col_name).cloned())
+            .and_then(|arc| arc.read().ok().map(|info| info.chain.clone()))
+            .unwrap_or_default();
+
+        // Snapshot active writer state (if any) before parsing
+        let writer_snapshot: Option<(Block, u64)> = self
+            .writers
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "writers read lock poisoned"))?
+            .get(col_name)
+            .cloned()
+            .and_then(|w| w.snapshot_block().ok());
+
+        // Convert tail cursor to sealed cursor if that block has since been sealed.
+        let mut cur_idx: usize;
+        let mut cur_off: u64;
+        let mut tail_cursor: Option<(u64, u64)> = None;
+
+        if let Some(tail_bid) = cursor.tail_block_id() {
+            if let Some(idx) = chain.iter().position(|b| b.id == tail_bid) {
+                cur_idx = idx;
+                cur_off = cursor.offset().min(chain[idx].used);
+            } else {
+                tail_cursor = Some((tail_bid, cursor.offset()));
+                cur_idx = chain.len();
+                cur_off = 0;
+            }
+        } else {
+            cur_idx = cursor.raw_index() as usize;
+            if cur_idx > chain.len() {
+                cur_idx = chain.len();
+            }
+            cur_off = if cur_idx < chain.len() {
+                cursor.offset().min(chain[cur_idx].used)
+            } else {
+                0
+            };
+        }
+
+        // Sealed chain path
+        while cur_idx < chain.len() {
+            let block = chain[cur_idx].clone();
+            if cur_off >= block.used {
+                cur_idx += 1;
+                cur_off = 0;
+                continue;
+            }
+
+            let (entry, consumed) = match block.read(cur_off) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let new_off = cur_off + consumed as u64;
+            return Ok(Some((
+                entry,
+                Cursor::new(topic.clone(), cur_idx as u64, new_off),
+            )));
+        }
+
+        // Tail path (active writer block)
+        let Some((active_block, written)) = writer_snapshot else {
+            return Ok(None);
+        };
+
+        let mut tail_off = 0u64;
+        if let Some((tail_bid, off)) = tail_cursor {
+            if tail_bid != active_block.id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cursor tail block id does not match current active block",
+                ));
+            }
+            tail_off = off.min(written);
+        }
+
+        if tail_off >= written {
+            return Ok(None);
+        }
+
+        let (entry, consumed) = match active_block.read(tail_off) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let new_off = tail_off + consumed as u64;
+        Ok(Some((
+            entry,
+            Cursor::new(topic, active_block.id | (1u64 << 63), new_off),
+        )))
+    }
+
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {

@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::thread;
 use std::time::Duration;
 use walrus_rust::ReadConsistency;
-use walrus_rust::wal::{Entry, WalIndex, Walrus};
+use walrus_rust::wal::{Cursor, Entry, WalIndex, Walrus};
 
 fn setup_wal_env() -> TestEnv {
     TestEnv::new()
@@ -91,6 +91,71 @@ fn basic_roundtrip_multi_topic() {
     wal.append_for_topic("b", b"2").unwrap();
     assert_eq!(wal.read_next("a", true).unwrap().unwrap().data, b"1");
     assert_eq!(wal.read_next("b", true).unwrap().unwrap().data, b"2");
+}
+
+#[test]
+fn cursor_read_next_after_and_commit_persists_across_restart() {
+    let _guard = setup_wal_env();
+
+    {
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+        wal.append_for_topic("t", b"a").unwrap();
+        wal.append_for_topic("t", b"b").unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 2);
+
+        let mut cur: Cursor = wal.get_cursor("t");
+        let (e1, c1) = wal.read_next_after(&cur).unwrap().unwrap();
+        assert_eq!(e1.data, b"a");
+        cur = c1;
+
+        let (e2, c2) = wal.read_next_after(&cur).unwrap().unwrap();
+        assert_eq!(e2.data, b"b");
+        cur = c2;
+
+        assert!(wal.read_next_after(&cur).unwrap().is_none());
+
+        wal.commit_to_cursor(&cur).unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+    }
+
+    // Restart should respect committed cursor.
+    thread::sleep(Duration::from_millis(50));
+    let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+    let cur2 = wal2.get_cursor("t");
+    assert!(wal2.read_next_after(&cur2).unwrap().is_none());
+}
+
+#[test]
+fn cursor_commit_must_be_monotonic() {
+    let _guard = setup_wal_env();
+    let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+    wal.append_for_topic("t", b"a").unwrap();
+    wal.append_for_topic("t", b"b").unwrap();
+
+    let cur0 = wal.get_cursor("t");
+    let (_e1, c1) = wal.read_next_after(&cur0).unwrap().unwrap();
+    let (_e2, c2) = wal.read_next_after(&c1).unwrap().unwrap();
+
+    wal.commit_to_cursor(&c2).unwrap();
+    assert!(wal.commit_to_cursor(&c1).is_err());
+}
+
+#[test]
+fn append_with_cursor_then_commit_to_cursor() {
+    let _guard = setup_wal_env();
+
+    {
+        let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+        let cur = wal.append_for_topic_with_cursor("t", b"a").unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 1);
+        wal.commit_to_cursor(&cur).unwrap();
+        assert_eq!(wal.get_topic_entry_count("t"), 0);
+    }
+
+    thread::sleep(Duration::from_millis(50));
+    let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
+    let cur2 = wal2.get_cursor("t");
+    assert!(wal2.read_next_after(&cur2).unwrap().is_none());
 }
 
 #[test]

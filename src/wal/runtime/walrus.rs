@@ -23,6 +23,56 @@ pub enum ReadConsistency {
     AtLeastOnce { persist_every: u32 },
 }
 
+/// A stable checkpoint cursor for a topic.
+///
+/// The topic is carried with the cursor to avoid accidental mismatches.
+/// The position is encoded in the same format as `WalIndex`:
+/// - `raw_index` is either a sealed-chain block index, or a tail sentinel (bit 63 set)
+///   where the lower 63 bits store the active block id.
+/// - `offset` is the in-block offset (bytes).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Cursor {
+    topic: Arc<str>,
+    raw_index: u64,
+    offset: u64,
+}
+
+impl Cursor {
+    const TAIL_FLAG: u64 = 1u64 << 63;
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn raw_index(&self) -> u64 {
+        self.raw_index
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn is_tail(&self) -> bool {
+        (self.raw_index & Self::TAIL_FLAG) != 0
+    }
+
+    pub fn tail_block_id(&self) -> Option<u64> {
+        if self.is_tail() {
+            Some(self.raw_index & (!Self::TAIL_FLAG))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn new(topic: Arc<str>, raw_index: u64, offset: u64) -> Self {
+        Self {
+            topic,
+            raw_index,
+            offset,
+        }
+    }
+}
+
 pub struct Walrus {
     pub(super) allocator: Arc<BlockAllocator>,
     pub(super) reader: Arc<Reader>,

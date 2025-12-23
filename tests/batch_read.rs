@@ -1118,7 +1118,7 @@ fn test_simple_deadlock_repro() {
         test_println!("Reader 2 finished");
     });
 
-    let timeout = std::time::Duration::from_secs(30);
+    let _timeout = std::time::Duration::from_secs(30);
 
     match writer.join() {
         Ok(_) => test_println!("Writer joined successfully"),

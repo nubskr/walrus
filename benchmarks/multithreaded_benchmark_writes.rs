@@ -324,7 +324,6 @@ fn multithreaded_benchmark() {
     // Spawn throughput monitoring thread
     let total_writes_monitor = Arc::clone(&total_writes);
     let total_write_bytes_monitor = Arc::clone(&total_write_bytes);
-    let throughput_tx_clone = throughput_tx.clone();
     let monitor_duration = write_duration;
 
     let monitor_handle = thread::spawn(move || {
@@ -334,10 +333,9 @@ fn multithreaded_benchmark() {
             .open("benchmark_throughput.csv")
             .expect("Failed to open CSV file");
 
-        let mut start_time = Instant::now();
+        let mut _start_time = Instant::now();
         let mut last_writes = 0u64;
         let mut last_bytes = 0u64;
-        let mut last_time = start_time;
         let mut tick_index: u64 = 0;
 
         // Wait for benchmark to start
@@ -358,8 +356,7 @@ fn multithreaded_benchmark() {
         csv_file.flush().expect("Failed to flush CSV");
 
         // Reset timing and wait before first measurement
-        start_time = Instant::now();
-        last_time = start_time;
+        _start_time = Instant::now();
         thread::sleep(Duration::from_millis(500));
 
         loop {
@@ -370,7 +367,6 @@ fn multithreaded_benchmark() {
             let interval_s = 0.5f64;
             let elapsed_total = tick_index as f64 * interval_s;
 
-            let current_time = Instant::now();
             let current_writes = total_writes_monitor.load(Ordering::Relaxed);
             let current_bytes = total_write_bytes_monitor.load(Ordering::Relaxed);
 
@@ -422,7 +418,6 @@ fn multithreaded_benchmark() {
 
             last_writes = current_writes;
             last_bytes = current_bytes;
-            last_time = current_time;
 
             // Stop monitoring after write phase (duration + 30s buffer)
             let max_monitor_time = monitor_duration.as_secs_f64() + 30.0;

@@ -132,6 +132,87 @@ impl Writer {
         Ok(())
     }
 
+    pub(super) fn write_with_tail_cursor(&self, data: &[u8]) -> std::io::Result<(u64, u64)> {
+        // Check if batch write is in progress
+        if self.is_batch_writing.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "batch write in progress for this topic",
+            ));
+        }
+
+        let mut block = self.current_block.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+        })?;
+        let mut cur = self.current_offset.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+        })?;
+
+        let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
+        if *cur + need > block.limit {
+            debug_print!(
+                "[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}",
+                self.col,
+                block.id,
+                *cur,
+                need,
+                block.limit
+            );
+            FileStateTracker::set_block_unlocked(block.id as usize);
+            let mut sealed = block.clone();
+            sealed.used = *cur;
+            sealed.mmap.flush()?;
+            let _ = self.reader.append_block_to_chain(&self.col, sealed);
+            debug_print!("[writer] appended sealed block to chain: col={}", self.col);
+            // switch to new block
+            // SAFETY: We hold `current_block` and `current_offset` mutexes, so
+            // this writer has exclusive ownership of the active block. The
+            // allocator's internal lock ensures unique block handout.
+            let new_block = unsafe { self.allocator.alloc_block(need) }?;
+            debug_print!(
+                "[writer] switched to new block: col={}, new_block_id={}",
+                self.col,
+                new_block.id
+            );
+            *block = new_block;
+            *cur = 0;
+        }
+        let next_block_start = block.offset + block.limit; // simplistic for now
+        block.write(*cur, data, &self.col, next_block_start)?;
+        debug_print!(
+            "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
+            self.col,
+            block.id,
+            *cur,
+            need,
+            *cur + need
+        );
+        *cur += need;
+
+        // Handle fsync based on schedule
+        match self.fsync_schedule {
+            FsyncSchedule::SyncEach => {
+                // Immediate mmap flush, skip background flusher
+                block.mmap.flush()?;
+                debug_print!(
+                    "[writer] immediate fsync: col={}, block_id={}",
+                    self.col,
+                    block.id
+                );
+            }
+            FsyncSchedule::Milliseconds(_) => {
+                // Send to background flusher
+                let _ = self.publisher.send(block.file_path.clone());
+            }
+            FsyncSchedule::NoFsync => {
+                // No fsyncing at all - maximum throughput, no durability guarantees
+                debug_print!("[writer] no fsync: col={}, block_id={}", self.col, block.id);
+            }
+        }
+
+        Ok((block.id, *cur))
+    }
+
     pub(super) fn batch_write(&self, batch: &[&[u8]]) -> std::io::Result<()> {
         // RAII guard to ensure batch flag is released
         struct BatchGuard<'a> {
