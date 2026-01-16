@@ -126,6 +126,12 @@ impl Metadata {
         guard.auth.authenticate(username, password).ok().cloned()
     }
 
+    /// Authenticate with API key (fast, requires write lock for index rebuild)
+    pub fn authenticate_with_api_key(&self, api_key: &str) -> Option<User> {
+        let mut guard = self.state.write().ok()?;
+        guard.auth.authenticate_with_api_key(api_key).cloned()
+    }
+
     pub fn user_exists(&self, username: &str) -> bool {
         self.state
             .read()

@@ -162,20 +162,30 @@ impl NodeController {
         Ok(())
     }
 
-    /// Add a new user to the authentication system
-    pub async fn add_user(&self, username: &str, password: &str) -> Result<()> {
-        let user = User::new(username.to_string(), password, UserRole::User)?;
-        let cmd = MetadataCmd::AddUser { user };
-        self.propose_metadata(cmd).await?;
-        Ok(())
-    }
-
     /// Add an admin user (for initial setup)
     pub async fn add_admin_user(&self, username: &str, password: &str) -> Result<()> {
         let user = User::new(username.to_string(), password, UserRole::Admin)?;
         let cmd = MetadataCmd::AddUser { user };
         self.propose_metadata(cmd).await?;
         Ok(())
+    }
+
+    /// Add a producer user (can publish messages) and return API key
+    pub async fn add_producer(&self, username: &str, password: &str) -> Result<String> {
+        let user = User::new(username.to_string(), password, UserRole::Producer)?;
+        let api_key = user.api_key.clone();
+        let cmd = MetadataCmd::AddUser { user };
+        self.propose_metadata(cmd).await?;
+        Ok(api_key)
+    }
+
+    /// Add a consumer user (can read messages) and return API key
+    pub async fn add_consumer(&self, username: &str, password: &str) -> Result<String> {
+        let user = User::new(username.to_string(), password, UserRole::Consumer)?;
+        let api_key = user.api_key.clone();
+        let cmd = MetadataCmd::AddUser { user };
+        self.propose_metadata(cmd).await?;
+        Ok(api_key)
     }
 
     /// Append data for the given topic. Only succeeds if this node is the leader.

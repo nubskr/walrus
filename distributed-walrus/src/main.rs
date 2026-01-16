@@ -357,19 +357,64 @@ async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::R
 
     // Check if any users exist
     if !controller.metadata.has_users() {
-        info!("No users found. Creating default admin user...");
+        info!("====================================================================");
+        info!("No users found. Creating default users for development...");
+        info!("====================================================================");
+
+        // Create admin user
         match controller.add_admin_user("admin", "admin123").await {
             Ok(_) => {
-                info!("Default admin user created successfully");
-                info!("Username: admin, Password: admin123");
-                info!("IMPORTANT: Please change the default password after first login!");
+                info!("✓ Admin user created");
+                info!("  Username: admin");
+                info!("  Password: admin123");
+                info!("  Role: Admin (full access)");
             }
             Err(e) => {
                 error!("Failed to create default admin user: {}", e);
+                return Err(e);
             }
         }
+
+        // Create producer user
+        match controller.add_producer("producer1", "producer123").await {
+            Ok(api_key) => {
+                info!("✓ Producer user created");
+                info!("  Username: producer1");
+                info!("  Password: producer123");
+                info!("  Role: Producer (can publish messages)");
+                info!("  API_KEY: {}", api_key);
+            }
+            Err(e) => {
+                error!("Failed to create producer user: {}", e);
+            }
+        }
+
+        // Create consumer user
+        match controller.add_consumer("consumer1", "consumer123").await {
+            Ok(api_key) => {
+                info!("✓ Consumer user created");
+                info!("  Username: consumer1");
+                info!("  Password: consumer123");
+                info!("  Role: Consumer (can read messages)");
+                info!("  API_KEY: {}", api_key);
+            }
+            Err(e) => {
+                error!("Failed to create consumer user: {}", e);
+            }
+        }
+
+        info!("====================================================================");
+        info!("IMPORTANT: These are default credentials for DEVELOPMENT ONLY!");
+        info!("Please change passwords and create production users immediately!");
+        info!("");
+        info!("Usage:");
+        info!("  1. First time: LOGIN <username> <password>");
+        info!("     This returns your permanent API key");
+        info!("  2. Save the API key for long-term use");
+        info!("  3. Future connections: APIKEY <your_api_key>");
+        info!("====================================================================");
     } else {
-        info!("Users already exist, skipping default admin creation");
+        info!("Users already exist, skipping default user creation");
     }
 
     Ok(())

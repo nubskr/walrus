@@ -28,7 +28,7 @@ pub async fn start_client_listener(
 
 async fn handle_connection(mut socket: TcpStream, controller: Arc<NodeController>) -> Result<()> {
     let mut authenticated = false;
-    let mut authenticated_user: Option<String> = None;
+    let mut authenticated_user: Option<crate::auth::User> = None;
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -76,54 +76,55 @@ async fn handle_command(
     line: &str,
     controller: Arc<NodeController>,
     authenticated: &mut bool,
-    authenticated_user: &mut Option<String>,
+    authenticated_user: &mut Option<crate::auth::User>,
 ) -> Result<String> {
     let mut parts = line.splitn(3, ' ');
     let Some(op) = parts.next() else {
         return Err(anyhow!("empty command"));
     };
-    tracing::info!("client command received: {}", line);
+    // Mask API key in logs for security
+    let log_line = if op == "APIKEY" {
+        "client command received: APIKEY <redacted>".to_string()
+    } else {
+        format!("client command received: {}", line)
+    };
+    tracing::info!("{}", log_line);
 
-    // AUTH command doesn't require authentication - authenticates with username/password and returns a token
-    if op == "AUTH" {
-        let username = parts
+    // APIKEY command - authenticate with permanent API key (no expiration)
+    // Can also use LOGIN with username/password to get API key
+    if op == "APIKEY" {
+        let api_key = parts
             .next()
-            .ok_or_else(|| anyhow!("AUTH requires username"))?;
-        let password = parts
-            .next()
-            .ok_or_else(|| anyhow!("AUTH requires password"))?;
+            .ok_or_else(|| anyhow!("APIKEY requires api_key"))?;
 
-        if let Some(user) = controller.metadata.authenticate(username, password) {
+        if let Some(user) = controller.metadata.authenticate_with_api_key(api_key) {
             *authenticated = true;
-            *authenticated_user = Some(user.username.clone());
-
-            // Generate JWT token for future fast authentication
-            let token = token::generate_token(&user.username)
-                .map_err(|e| anyhow!("Failed to generate token: {}", e))?;
-
-            info!("User {} authenticated successfully", username);
-            return Ok(format!("OK authenticated {}", token));
+            *authenticated_user = Some(user.clone());
+            info!("User {} authenticated via API key (role: {:?})", user.username, user.role);
+            return Ok(format!("OK authenticated as {} (role: {:?})", user.username, user.role));
         } else {
-            return Err(anyhow!("authentication failed"));
+            return Err(anyhow!("invalid API key"));
         }
     }
 
-    // AUTHTOKEN command - fast authentication using JWT token (no bcrypt verification needed)
-    if op == "AUTHTOKEN" {
-        let token = parts
+    // LOGIN command - authenticate with username/password and returns API key
+    if op == "LOGIN" {
+        let username = parts
             .next()
-            .ok_or_else(|| anyhow!("AUTHTOKEN requires token"))?;
+            .ok_or_else(|| anyhow!("LOGIN requires username"))?;
+        let password = parts
+            .next()
+            .ok_or_else(|| anyhow!("LOGIN requires password"))?;
 
-        match token::validate_token(token) {
-            Ok(username) => {
-                *authenticated = true;
-                *authenticated_user = Some(username.clone());
-                info!("User {} authenticated via token", username);
-                return Ok("OK authenticated".into());
-            }
-            Err(e) => {
-                return Err(anyhow!("token authentication failed: {}", e));
-            }
+        if let Some(user) = controller.metadata.authenticate(username, password) {
+            *authenticated = true;
+            *authenticated_user = Some(user.clone());
+
+            info!("User {} authenticated successfully via LOGIN", username);
+            return Ok(format!("OK authenticated\nAPI_KEY: {}\nROLE: {:?}\n\nSave this API key and use 'APIKEY <key>' for future connections",
+                user.api_key, user.role));
+        } else {
+            return Err(anyhow!("invalid username or password"));
         }
     }
 
@@ -131,18 +132,30 @@ async fn handle_command(
     // Allow unauthenticated access only if no users exist (for initial setup)
     let requires_auth = controller.metadata.has_users();
     if requires_auth && !*authenticated {
-        return Err(anyhow!("authentication required - use AUTH <username> <password>"));
+        return Err(anyhow!("authentication required - use APIKEY <key> or LOGIN <username> <password>"));
     }
 
     match op {
         "REGISTER" => {
+            // Check write permission
+            if let Some(user) = authenticated_user {
+                if !user.can_write() {
+                    return Err(anyhow!("permission denied - this operation requires Producer or Admin role"));
+                }
+            }
             let topic = parts
                 .next()
                 .ok_or_else(|| anyhow!("REGISTER requires a topic"))?;
             controller.ensure_topic(topic).await?;
-            Ok("OK".into())
+            Ok("OK topic registered".into())
         }
         "PUT" => {
+            // Check write permission
+            if let Some(user) = authenticated_user {
+                if !user.can_write() {
+                    return Err(anyhow!("permission denied - this operation requires Producer or Admin role"));
+                }
+            }
             let topic = parts
                 .next()
                 .ok_or_else(|| anyhow!("PUT requires a topic"))?;
@@ -152,9 +165,15 @@ async fn handle_command(
             controller
                 .append_for_topic(topic, payload.as_bytes().to_vec())
                 .await?;
-            Ok("OK".into())
+            Ok("OK message published".into())
         }
         "GET" => {
+            // Check read permission
+            if let Some(user) = authenticated_user {
+                if !user.can_read() {
+                    return Err(anyhow!("permission denied - this operation requires Consumer or Admin role"));
+                }
+            }
             let topic = parts
                 .next()
                 .ok_or_else(|| anyhow!("GET requires a topic"))?;
@@ -164,25 +183,84 @@ async fn handle_command(
             }
         }
         "STATE" => {
+            // Check read permission
+            if let Some(user) = authenticated_user {
+                if !user.can_read() {
+                    return Err(anyhow!("permission denied - this operation requires Consumer or Admin role"));
+                }
+            }
             let topic = parts
                 .next()
                 .ok_or_else(|| anyhow!("STATE requires a topic"))?;
             Ok(controller.topic_snapshot(topic)?)
         }
-        "METRICS" => Ok(controller.get_metrics()?),
+        "METRICS" => {
+            // Check read permission
+            if let Some(user) = authenticated_user {
+                if !user.can_read() {
+                    return Err(anyhow!("permission denied - this operation requires Consumer or Admin role"));
+                }
+            }
+            Ok(controller.get_metrics()?)
+        }
         "ADDUSER" => {
-            // Only allow if authenticated
-            if !*authenticated {
+            // Check admin permission
+            if let Some(user) = authenticated_user {
+                if !user.is_admin() {
+                    return Err(anyhow!("permission denied - this operation requires Admin role"));
+                }
+            } else {
                 return Err(anyhow!("authentication required"));
             }
             let username = parts
                 .next()
-                .ok_or_else(|| anyhow!("ADDUSER requires username"))?;
+                .ok_or_else(|| anyhow!("ADDUSER requires <username> <password> <role>"))?;
             let password = parts
                 .next()
-                .ok_or_else(|| anyhow!("ADDUSER requires password"))?;
-            controller.add_user(username, password).await?;
-            Ok("OK user added".into())
+                .ok_or_else(|| anyhow!("ADDUSER requires <username> <password> <role>"))?;
+
+            // For now, default to Producer role for backward compatibility
+            // Can extend to parse role from command later
+            let api_key = controller.add_producer(username, password).await?;
+            Ok(format!("OK user added as Producer\nAPI_KEY: {}", api_key))
+        }
+        "ADDPRODUCER" => {
+            // Check admin permission
+            if let Some(user) = authenticated_user {
+                if !user.is_admin() {
+                    return Err(anyhow!("permission denied - this operation requires Admin role"));
+                }
+            } else {
+                return Err(anyhow!("authentication required"));
+            }
+            let username = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDPRODUCER requires <username> <password>"))?;
+            let password = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDPRODUCER requires <username> <password>"))?;
+
+            let api_key = controller.add_producer(username, password).await?;
+            Ok(format!("OK Producer added\nAPI_KEY: {}", api_key))
+        }
+        "ADDCONSUMER" => {
+            // Check admin permission
+            if let Some(user) = authenticated_user {
+                if !user.is_admin() {
+                    return Err(anyhow!("permission denied - this operation requires Admin role"));
+                }
+            } else {
+                return Err(anyhow!("authentication required"));
+            }
+            let username = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDCONSUMER requires <username> <password>"))?;
+            let password = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDCONSUMER requires <username> <password>"))?;
+
+            let api_key = controller.add_consumer(username, password).await?;
+            Ok(format!("OK Consumer added\nAPI_KEY: {}", api_key))
         }
         _ => Err(anyhow!("unknown command")),
     }
