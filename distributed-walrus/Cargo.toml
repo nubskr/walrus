@@ -22,6 +22,8 @@ walrus-rust = { path = ".." }
 octopii = { path = "../octopii", features = ["openraft"] }
 bcrypt = "0.15"
 sha2 = "0.10"
+jsonwebtoken = "9.3"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

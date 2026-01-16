@@ -8,6 +8,7 @@ mod controller;
 mod metadata;
 mod monitor;
 mod rpc;
+mod token;
 
 use bucket::Storage;
 use clap::Parser;

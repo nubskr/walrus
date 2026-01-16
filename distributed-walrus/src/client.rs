@@ -1,4 +1,5 @@
 use crate::controller::NodeController;
+use crate::token;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,7 +84,7 @@ async fn handle_command(
     };
     tracing::info!("client command received: {}", line);
 
-    // AUTH command doesn't require authentication
+    // AUTH command doesn't require authentication - authenticates with username/password and returns a token
     if op == "AUTH" {
         let username = parts
             .next()
@@ -95,10 +96,34 @@ async fn handle_command(
         if let Some(user) = controller.metadata.authenticate(username, password) {
             *authenticated = true;
             *authenticated_user = Some(user.username.clone());
+
+            // Generate JWT token for future fast authentication
+            let token = token::generate_token(&user.username)
+                .map_err(|e| anyhow!("Failed to generate token: {}", e))?;
+
             info!("User {} authenticated successfully", username);
-            return Ok("OK authenticated".into());
+            return Ok(format!("OK authenticated {}", token));
         } else {
             return Err(anyhow!("authentication failed"));
+        }
+    }
+
+    // AUTHTOKEN command - fast authentication using JWT token (no bcrypt verification needed)
+    if op == "AUTHTOKEN" {
+        let token = parts
+            .next()
+            .ok_or_else(|| anyhow!("AUTHTOKEN requires token"))?;
+
+        match token::validate_token(token) {
+            Ok(username) => {
+                *authenticated = true;
+                *authenticated_user = Some(username.clone());
+                info!("User {} authenticated via token", username);
+                return Ok("OK authenticated".into());
+            }
+            Err(e) => {
+                return Err(anyhow!("token authentication failed: {}", e));
+            }
         }
     }
 
