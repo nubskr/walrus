@@ -358,15 +358,38 @@ async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::R
     // Check if any users exist
     if !controller.metadata.has_users() {
         info!("====================================================================");
-        info!("No users found. Creating default users for development...");
+        info!("No users found. Creating default users...");
         info!("====================================================================");
 
+        // Read passwords from environment variables or use defaults
+        let admin_password = std::env::var("WALRUS_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| "admin123".to_string());
+        let producer_password = std::env::var("WALRUS_PRODUCER_PASSWORD")
+            .unwrap_or_else(|_| "producer123".to_string());
+        let consumer_password = std::env::var("WALRUS_CONSUMER_PASSWORD")
+            .unwrap_or_else(|_| "consumer123".to_string());
+
+        // Warn if using default passwords
+        let using_defaults = !std::env::var("WALRUS_ADMIN_PASSWORD").is_ok();
+        if using_defaults {
+            info!("⚠️  WARNING: Using default passwords!");
+            info!("⚠️  For production, set environment variables:");
+            info!("    WALRUS_ADMIN_PASSWORD=<strong_password>");
+            info!("    WALRUS_PRODUCER_PASSWORD=<strong_password>");
+            info!("    WALRUS_CONSUMER_PASSWORD=<strong_password>");
+            info!("");
+        }
+
         // Create admin user
-        match controller.add_admin_user("admin", "admin123").await {
+        match controller.add_admin_user("admin", &admin_password).await {
             Ok(_) => {
                 info!("✓ Admin user created");
                 info!("  Username: admin");
-                info!("  Password: admin123");
+                if using_defaults {
+                    info!("  Password: {} (DEFAULT - CHANGE THIS!)", admin_password);
+                } else {
+                    info!("  Password: <from WALRUS_ADMIN_PASSWORD>");
+                }
                 info!("  Role: Admin (full access)");
             }
             Err(e) => {
@@ -376,11 +399,15 @@ async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::R
         }
 
         // Create producer user
-        match controller.add_producer("producer1", "producer123").await {
+        match controller.add_producer("producer1", &producer_password).await {
             Ok(api_key) => {
                 info!("✓ Producer user created");
                 info!("  Username: producer1");
-                info!("  Password: producer123");
+                if using_defaults {
+                    info!("  Password: {} (DEFAULT)", producer_password);
+                } else {
+                    info!("  Password: <from WALRUS_PRODUCER_PASSWORD>");
+                }
                 info!("  Role: Producer (can publish messages)");
                 info!("  API_KEY: {}", api_key);
             }
@@ -390,11 +417,15 @@ async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::R
         }
 
         // Create consumer user
-        match controller.add_consumer("consumer1", "consumer123").await {
+        match controller.add_consumer("consumer1", &consumer_password).await {
             Ok(api_key) => {
                 info!("✓ Consumer user created");
                 info!("  Username: consumer1");
-                info!("  Password: consumer123");
+                if using_defaults {
+                    info!("  Password: {} (DEFAULT)", consumer_password);
+                } else {
+                    info!("  Password: <from WALRUS_CONSUMER_PASSWORD>");
+                }
                 info!("  Role: Consumer (can read messages)");
                 info!("  API_KEY: {}", api_key);
             }
@@ -404,14 +435,17 @@ async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::R
         }
 
         info!("====================================================================");
-        info!("IMPORTANT: These are default credentials for DEVELOPMENT ONLY!");
-        info!("Please change passwords and create production users immediately!");
-        info!("");
         info!("Usage:");
         info!("  1. First time: LOGIN <username> <password>");
         info!("     This returns your permanent API key");
         info!("  2. Save the API key for long-term use");
         info!("  3. Future connections: APIKEY <your_api_key>");
+        if using_defaults {
+            info!("");
+            info!("⚠️  SECURITY WARNING:");
+            info!("    Default passwords are in use. Set environment variables");
+            info!("    or change passwords immediately after first login!");
+        }
         info!("====================================================================");
     } else {
         info!("Users already exist, skipping default user creation");

@@ -11,3 +11,8 @@ distributed-walrus/tests/__pycache__/
 distributed-walrus/target/
 distributed-walrus/.venv/
 distributed-walrus/test_data/
+
+# Environment configuration files (may contain sensitive data)
+.env
+*.env
+!.env.example
