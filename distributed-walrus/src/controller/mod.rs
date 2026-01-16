@@ -3,6 +3,7 @@
 //! mapping logical offsets onto Walrus’ physical offsets, and keeping leases in sync with
 //! metadata. It does not parse Kafka or manage retention—that lives elsewhere.
 
+use crate::auth::{User, UserRole};
 use crate::bucket::Storage;
 use crate::metadata::{Metadata, MetadataCmd, NodeId};
 use crate::monitor::max_segment_entries;
@@ -157,6 +158,22 @@ impl NodeController {
 
     pub async fn upsert_node(&self, node_id: NodeId, addr: String) -> Result<()> {
         let cmd = MetadataCmd::UpsertNode { node_id, addr };
+        self.propose_metadata(cmd).await?;
+        Ok(())
+    }
+
+    /// Add a new user to the authentication system
+    pub async fn add_user(&self, username: &str, password: &str) -> Result<()> {
+        let user = User::new(username.to_string(), password, UserRole::User)?;
+        let cmd = MetadataCmd::AddUser { user };
+        self.propose_metadata(cmd).await?;
+        Ok(())
+    }
+
+    /// Add an admin user (for initial setup)
+    pub async fn add_admin_user(&self, username: &str, password: &str) -> Result<()> {
+        let user = User::new(username.to_string(), password, UserRole::Admin)?;
+        let cmd = MetadataCmd::AddUser { user };
         self.propose_metadata(cmd).await?;
         Ok(())
     }

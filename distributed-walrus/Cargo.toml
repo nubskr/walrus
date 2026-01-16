@@ -20,6 +20,8 @@ rustyline = "11"
 
 walrus-rust = { path = ".." }
 octopii = { path = "../octopii", features = ["openraft"] }
+bcrypt = "0.15"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

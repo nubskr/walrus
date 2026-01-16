@@ -26,6 +26,9 @@ pub async fn start_client_listener(
 }
 
 async fn handle_connection(mut socket: TcpStream, controller: Arc<NodeController>) -> Result<()> {
+    let mut authenticated = false;
+    let mut authenticated_user: Option<String> = None;
+
     loop {
         let mut len_buf = [0u8; 4];
         if let Err(e) = socket.read_exact(&mut len_buf).await {
@@ -52,7 +55,14 @@ async fn handle_connection(mut socket: TcpStream, controller: Arc<NodeController
             }
         };
 
-        let response = match handle_command(text.trim_end(), controller.clone()).await {
+        let response = match handle_command(
+            text.trim_end(),
+            controller.clone(),
+            &mut authenticated,
+            &mut authenticated_user,
+        )
+        .await
+        {
             Ok(msg) => msg,
             Err(e) => format!("ERR {}", e),
         };
@@ -61,12 +71,43 @@ async fn handle_connection(mut socket: TcpStream, controller: Arc<NodeController
     }
 }
 
-async fn handle_command(line: &str, controller: Arc<NodeController>) -> Result<String> {
+async fn handle_command(
+    line: &str,
+    controller: Arc<NodeController>,
+    authenticated: &mut bool,
+    authenticated_user: &mut Option<String>,
+) -> Result<String> {
     let mut parts = line.splitn(3, ' ');
     let Some(op) = parts.next() else {
         return Err(anyhow!("empty command"));
     };
     tracing::info!("client command received: {}", line);
+
+    // AUTH command doesn't require authentication
+    if op == "AUTH" {
+        let username = parts
+            .next()
+            .ok_or_else(|| anyhow!("AUTH requires username"))?;
+        let password = parts
+            .next()
+            .ok_or_else(|| anyhow!("AUTH requires password"))?;
+
+        if let Some(user) = controller.metadata.authenticate(username, password) {
+            *authenticated = true;
+            *authenticated_user = Some(user.username.clone());
+            info!("User {} authenticated successfully", username);
+            return Ok("OK authenticated".into());
+        } else {
+            return Err(anyhow!("authentication failed"));
+        }
+    }
+
+    // Check if authentication is required
+    // Allow unauthenticated access only if no users exist (for initial setup)
+    let requires_auth = controller.metadata.has_users();
+    if requires_auth && !*authenticated {
+        return Err(anyhow!("authentication required - use AUTH <username> <password>"));
+    }
 
     match op {
         "REGISTER" => {
@@ -104,6 +145,20 @@ async fn handle_command(line: &str, controller: Arc<NodeController>) -> Result<S
             Ok(controller.topic_snapshot(topic)?)
         }
         "METRICS" => Ok(controller.get_metrics()?),
+        "ADDUSER" => {
+            // Only allow if authenticated
+            if !*authenticated {
+                return Err(anyhow!("authentication required"));
+            }
+            let username = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDUSER requires username"))?;
+            let password = parts
+                .next()
+                .ok_or_else(|| anyhow!("ADDUSER requires password"))?;
+            controller.add_user(username, password).await?;
+            Ok("OK user added".into())
+        }
         _ => Err(anyhow!("unknown command")),
     }
 }

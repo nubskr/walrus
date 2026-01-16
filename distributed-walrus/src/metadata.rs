@@ -3,6 +3,7 @@ use octopii::StateMachineTrait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use crate::auth::{AuthManager, User};
 
 pub type NodeId = u64;
 pub type TopicName = String;
@@ -13,6 +14,9 @@ pub struct ClusterState {
     /// Map node id -> advertised Raft/internal RPC address.
     #[serde(default)]
     pub nodes: HashMap<NodeId, String>,
+    /// User authentication manager
+    #[serde(default)]
+    pub auth: AuthManager,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +48,12 @@ pub enum MetadataCmd {
     UpsertNode {
         node_id: NodeId,
         addr: String,
+    },
+    AddUser {
+        user: User,
+    },
+    RemoveUser {
+        username: String,
     },
 }
 
@@ -110,6 +120,27 @@ impl Metadata {
             .and_then(|t| t.segment_leaders.get(&segment).copied())
             .or_else(|| guard.topics.get(topic).map(|t| t.leader_node))
     }
+
+    pub fn authenticate(&self, username: &str, password: &str) -> Option<User> {
+        let guard = self.state.read().ok()?;
+        guard.auth.authenticate(username, password).ok().cloned()
+    }
+
+    pub fn user_exists(&self, username: &str) -> bool {
+        self.state
+            .read()
+            .ok()
+            .map(|g| g.auth.user_exists(username))
+            .unwrap_or(false)
+    }
+
+    pub fn has_users(&self) -> bool {
+        self.state
+            .read()
+            .ok()
+            .map(|g| !g.auth.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 impl StateMachineTrait for Metadata {
@@ -167,6 +198,20 @@ impl StateMachineTrait for Metadata {
             MetadataCmd::UpsertNode { node_id, addr } => {
                 state.nodes.insert(node_id, addr);
                 Ok(Bytes::from_static(b"NODE"))
+            }
+            MetadataCmd::AddUser { user } => {
+                state
+                    .auth
+                    .add_user(user)
+                    .map(|_| Bytes::from_static(b"USER_ADDED"))
+                    .map_err(|e| e.to_string())
+            }
+            MetadataCmd::RemoveUser { username } => {
+                state
+                    .auth
+                    .remove_user(&username)
+                    .map(|_| Bytes::from_static(b"USER_REMOVED"))
+                    .map_err(|e| e.to_string())
             }
         }
     }

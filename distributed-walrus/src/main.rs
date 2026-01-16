@@ -1,5 +1,6 @@
 // Binary wiring only: construct the bucket (Walrus IO), metadata (Raft state machine), controller
 // (routing), Kafka facade, monitor loop, and join/bootstrap helpers.
+mod auth;
 mod bucket;
 mod client;
 mod config;
@@ -196,6 +197,9 @@ async fn start_node(node_config: NodeConfig) -> anyhow::Result<()> {
     bootstrap_node_one(&controller, &raft, has_existing_meta).await?;
     attempt_join(&raft, &node_config, &advertised_addr, join_target_resolved).await?;
 
+    // Initialize default admin user if no users exist
+    initialize_default_admin(&controller).await?;
+
     controller.update_leases().await;
     let sync_controller = controller.clone();
     tokio::spawn(async move {
@@ -343,5 +347,29 @@ async fn attempt_join(
     if !joined {
         error!("Failed to join cluster after retries");
     }
+    Ok(())
+}
+
+async fn initialize_default_admin(controller: &Arc<NodeController>) -> anyhow::Result<()> {
+    // Wait for metadata to be ready
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Check if any users exist
+    if !controller.metadata.has_users() {
+        info!("No users found. Creating default admin user...");
+        match controller.add_admin_user("admin", "admin123").await {
+            Ok(_) => {
+                info!("Default admin user created successfully");
+                info!("Username: admin, Password: admin123");
+                info!("IMPORTANT: Please change the default password after first login!");
+            }
+            Err(e) => {
+                error!("Failed to create default admin user: {}", e);
+            }
+        }
+    } else {
+        info!("Users already exist, skipping default admin creation");
+    }
+
     Ok(())
 }
