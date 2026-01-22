@@ -227,6 +227,7 @@ The underlying storage engine delivers exceptional performance:
 | Kafka    | 1,112,120                  | 808.33                | 1,424,073                   | 1,035.74                |
 | RocksDB  | 432,821                    | 314.53                | 1,000,000                   | 726.53                  |
 
+With fsync enabled on each write (ensuring data is flushed to disk before acknowledging):
 
 ![Walrus vs RocksDB vs Kafka - With Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.png)
 
