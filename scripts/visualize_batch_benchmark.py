@@ -8,6 +8,8 @@ Reads batch_benchmark_throughput.csv and renders time-series plots for:
 
 Usage:
     python scripts/visualize_batch_benchmark.py --file batch_benchmark_throughput.csv
+    python scripts/visualize_batch_benchmark.py --file batch_benchmark_throughput.csv --headless
+    python scripts/visualize_batch_benchmark.py --file batch_benchmark_throughput.csv --output plot.png
 
 Requires pandas and matplotlib (pip install pandas matplotlib).
 """
@@ -15,9 +17,11 @@ Requires pandas and matplotlib (pip install pandas matplotlib).
 import argparse
 import os
 
-import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import pandas as pd
+
+# matplotlib.pyplot will be imported after backend configuration in main()
+plt = None
 
 
 class BatchBenchmarkVisualizer:
@@ -49,7 +53,7 @@ class BatchBenchmarkVisualizer:
         )
         self.ax_bw.yaxis.set_major_formatter(bandwidth_fmt)
 
-    def render(self) -> None:
+    def render(self, output_path=None) -> None:
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"{self.csv_path} not found; run the benchmark first.")
 
@@ -81,7 +85,11 @@ class BatchBenchmarkVisualizer:
         )
 
         self.fig.tight_layout()
-        plt.show()
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches="tight")
+            print(f"Saved batch benchmark plot to: {output_path}")
+        else:
+            plt.show()
 
 
 def main() -> None:
@@ -92,11 +100,36 @@ def main() -> None:
         default="batch_benchmark_throughput.csv",
         help="Path to CSV produced by multithreaded batch benchmark.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Save to file instead of displaying (for environments without a display)",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Output file path (implies --headless)",
+    )
     args = parser.parse_args()
+    
+    # Configure backend based on headless/output
+    if args.headless or args.output:
+        import matplotlib
+        matplotlib.use("Agg")
+    
+    global plt
+    import matplotlib.pyplot as plt
+    
+    if args.output:
+        output_path = args.output
+    elif args.headless:
+        output_path = "batch_benchmark.png"
+    else:
+        output_path = None
 
     visualizer = BatchBenchmarkVisualizer(args.file)
     try:
-        visualizer.render()
+        visualizer.render(output_path=output_path)
     except (FileNotFoundError, ValueError) as exc:
         print(exc)
 
