@@ -8,19 +8,22 @@ real-time graphs of write throughput and bandwidth, or analyzes thread scaling.
 Usage:
     python visualize_throughput.py [--file benchmark_throughput.csv]
     python visualize_throughput.py --mode scaling --thread-files 1:bench_1t.csv 2:bench_2t.csv 4:bench_4t.csv
+    python visualize_throughput.py --headless --output plot.png
 
 Requirements:
     pip install matplotlib pandas
 """
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 import matplotlib.ticker as ticker
 import argparse
 import os
 import time
 from datetime import datetime
+
+# These will be imported after backend configuration in main()
+plt = None
+animation = None
 
 class ThroughputVisualizer:
     def __init__(self, csv_file='benchmark_throughput.csv', mode='realtime'):
@@ -274,9 +277,46 @@ Max ({thread_counts[-1]} threads):
         else:
             plt.show()
     
-    def start_monitoring(self, interval=1000):
+    def start_monitoring(self, interval=1000, headless=False, output_file=None, single_shot=False, max_frames=None):
         if self.mode != 'realtime':
             print("Error: start_monitoring only works in realtime mode")
+            return
+        
+        if headless:
+            if output_file is None:
+                output_file = 'throughput_monitor.png'
+            
+            print(f"Starting real-time monitoring of {self.csv_file} (headless)")
+            print(f"Output file: {output_file}")
+            print(f"Update interval: {interval} ms")
+            print("Press Ctrl+C to stop monitoring\n")
+            
+            frame_count = 0
+            
+            try:
+                while True:
+                    if single_shot:
+                        self.update_plot(frame_count)
+                        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                        timestamp = datetime.now().strftime('%H:%M:%S')
+                        print(f"[{timestamp}] Single-shot plot saved to {output_file}")
+                        break
+                    
+                    if max_frames is not None and frame_count >= max_frames:
+                        print(f"\nReached maximum frame count ({max_frames})")
+                        break
+                    
+                    self.update_plot(frame_count)
+                    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    print(f"[{timestamp}] Frame {frame_count}: Plot updated and saved to {output_file}")
+                    
+                    frame_count += 1
+                    time.sleep(interval / 1000.0)
+            except KeyboardInterrupt:
+                print("\nMonitoring stopped by user")
+                print(f"Total frames generated: {frame_count}")
+                print(f"Final plot saved to: {output_file}")
             return
             
         print(f"Starting real-time monitoring of {self.csv_file}")
@@ -300,6 +340,7 @@ Examples:
   python visualize_throughput.py --file benchmark_throughput.csv
   python visualize_throughput.py --mode scaling --thread-files 1:bench_1t.csv 2:bench_2t.csv 4:bench_4t.csv
   python visualize_throughput.py --mode scaling --thread-files 1:bench_1t.csv 2:bench_2t.csv --output scaling.png
+  python visualize_throughput.py --single-shot --output plot.png
         """)
     
     parser.add_argument('--file', '-f', default='benchmark_throughput.csv',
@@ -312,9 +353,24 @@ Examples:
     parser.add_argument('--thread-files', nargs='+', metavar='THREADS:FILE',
                        help='Thread scaling files in format "1:file1.csv 2:file2.csv 4:file4.csv"')
     parser.add_argument('--output', '-o',
-                       help='Output file path to save the plot (scaling mode only)')
+                       help='Output file path to save the plot (implies --headless)')
+    parser.add_argument('--headless', action='store_true',
+                       help='Save to file instead of displaying (for environments without a display)')
+    parser.add_argument('--single-shot', action='store_true',
+                       help='Generate a single plot and exit (realtime mode only)')
+    parser.add_argument('--max-frames', type=int,
+                       help='Maximum number of frames to generate before stopping (realtime mode only)')
     
     args = parser.parse_args()
+    
+    # Configure matplotlib backend before importing pyplot/animation
+    if args.headless or args.output:
+        import matplotlib
+        matplotlib.use('Agg')
+    
+    global plt, animation
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
     
     print("=" * 50)
     print("WAL Benchmark Throughput Visualizer")
@@ -329,7 +385,17 @@ Examples:
             return
         
         visualizer = ThroughputVisualizer(args.file, mode='realtime')
-        visualizer.start_monitoring(args.interval)
+        
+        headless = bool(args.headless or args.output)
+        output_file = args.output if args.output else None
+        
+        visualizer.start_monitoring(
+            interval=args.interval,
+            headless=headless,
+            output_file=output_file,
+            single_shot=args.single_shot,
+            max_frames=args.max_frames,
+        )
         
     elif args.mode == 'scaling':
         if not args.thread_files:
@@ -357,7 +423,16 @@ Examples:
             return
         
         visualizer = ThroughputVisualizer(mode='thread-scaling')
-        visualizer.plot_thread_scaling(thread_files, args.output)
+        
+        headless = bool(args.headless or args.output)
+        if args.output:
+            output_file = args.output
+        elif headless:
+            output_file = 'thread_scaling_analysis.png'
+        else:
+            output_file = None
+        
+        visualizer.plot_thread_scaling(thread_files, output_file)
 
 if __name__ == '__main__':
     main()
