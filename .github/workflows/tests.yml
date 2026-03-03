@@ -13,7 +13,7 @@ env:
 
 jobs:
   run-all-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false

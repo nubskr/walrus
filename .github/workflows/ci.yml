@@ -13,7 +13,7 @@ env:
 
 jobs:
   unit-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +39,7 @@ jobs:
           cargo test --lib --bins --test unit
 
   integration-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,7 +65,7 @@ jobs:
           cargo test --test integration
 
   configuration-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
           cargo test --test configuration
 
   e2e-sustained-mixed-workload:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     # needs: [unit-tests, integration-tests]  # Only run after main tests pass
     steps:
@@ -119,7 +119,7 @@ jobs:
           cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --nocapture
 
   e2e-realistic-application-simulation:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     # needs: [unit-tests, integration-tests]  # Only run after main tests pass
     steps:
@@ -147,7 +147,7 @@ jobs:
           cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --nocapture
 
   e2e-recovery-and-persistence-marathon:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     # needs: [unit-tests, integration-tests]  # Only run after main tests pass
     steps:
@@ -175,7 +175,7 @@ jobs:
           cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --nocapture
 
   e2e-massive-data-throughput:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     # needs: [unit-tests, integration-tests]  # Only run after main tests pass
     steps:
@@ -203,7 +203,7 @@ jobs:
           cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --nocapture
 
   e2e-system-stress-and-stability:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     # needs: [unit-tests, integration-tests]  # Only run after main tests pass
     steps:

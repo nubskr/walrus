@@ -17,7 +17,7 @@ env:
 
 jobs:
   scaling-benchmark:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - name: Checkout
