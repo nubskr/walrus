@@ -149,6 +149,23 @@
 //! # }
 //! ```
 //!
+//! ## Builder API (Recommended for Concurrent Initialization)
+//!
+//! When multiple threads need to create `Walrus` instances with different data
+//! directories, use the builder API to avoid race conditions with the
+//! `WALRUS_DATA_DIR` environment variable:
+//!
+//! ```rust,no_run
+//! use walrus_rust::Walrus;
+//! use std::path::PathBuf;
+//!
+//! let wal = Walrus::builder()
+//!     .data_dir(PathBuf::from("/var/lib/myapp/wal"))
+//!     .key("tenant-123")
+//!     .build()
+//!     .unwrap();
+//! ```
+//!
 //! ## Storage Backends
 //!
 //! Walrus supports two storage backends that can be selected at runtime:
@@ -232,6 +249,7 @@
 //!
 //! ### Constructors
 //!
+//! - [`Walrus::builder()`]: Builder API for explicit data directory and full configuration
 //! - [`Walrus::new()`]: Default constructor (StrictlyAtOnce, 200ms fsync)
 //! - [`Walrus::with_consistency()`]: Set read consistency model
 //! - [`Walrus::with_consistency_and_schedule()`]: Set consistency and fsync policy
@@ -252,7 +270,8 @@
 #![recursion_limit = "256"]
 pub mod wal;
 pub use wal::{
-    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, disable_fd_backend, enable_fd_backend,
+    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, WalrusBuilder,
+    disable_fd_backend, enable_fd_backend,
 };
 
 pub fn topic_entry_count(wal: &Walrus, topic: &str) -> u64 {

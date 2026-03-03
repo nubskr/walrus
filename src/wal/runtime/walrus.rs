@@ -70,7 +70,17 @@ impl Walrus {
         Self::with_paths(Arc::new(paths), mode, fsync_schedule)
     }
 
-    fn with_paths(
+    /// Returns a [`WalrusBuilder`] for constructing a `Walrus` instance
+    /// with explicit configuration.
+    ///
+    /// This is the recommended way to create instances when you need to
+    /// specify the data directory without relying on the `WALRUS_DATA_DIR`
+    /// environment variable.
+    pub fn builder() -> super::WalrusBuilder {
+        super::WalrusBuilder::new()
+    }
+
+    pub(super) fn with_paths(
         paths: Arc<WalPathManager>,
         mode: ReadConsistency,
         fsync_schedule: FsyncSchedule,

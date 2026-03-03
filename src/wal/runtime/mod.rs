@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 mod allocator;
 mod background;
+mod builder;
 mod index;
 mod reader;
 mod topic_clean;
@@ -12,6 +13,7 @@ mod walrus_write;
 mod writer;
 
 #[allow(unused_imports)]
+pub use builder::WalrusBuilder;
 pub use index::{BlockPos, WalIndex};
 pub use walrus::{ReadConsistency, Walrus};
 
