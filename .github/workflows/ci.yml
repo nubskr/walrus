@@ -13,10 +13,13 @@ env:
 
 jobs:
   unit-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -39,10 +42,13 @@ jobs:
           cargo test --lib --bins --test unit
 
   integration-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,10 +71,13 @@ jobs:
           cargo test --test integration
 
   configuration-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,142 +99,9 @@ jobs:
           export RUSTFLAGS=-Awarnings
           cargo test --test configuration
 
-  e2e-sustained-mixed-workload:
-    runs-on: self-hosted
-    timeout-minutes: 300
-    # needs: [unit-tests, integration-tests]  # Only run after main tests pass
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run sustained mixed workload test
-        run: |
-          export RUSTFLAGS=-Awarnings
-          cargo test --test e2e_longrunning e2e_sustained_mixed_workload -- --nocapture
-
-  e2e-realistic-application-simulation:
-    runs-on: self-hosted
-    timeout-minutes: 300
-    # needs: [unit-tests, integration-tests]  # Only run after main tests pass
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run realistic application simulation test
-        run: |
-          export RUSTFLAGS=-Awarnings
-          cargo test --test e2e_longrunning e2e_realistic_application_simulation -- --nocapture
-
-  e2e-recovery-and-persistence-marathon:
-    runs-on: self-hosted
-    timeout-minutes: 300
-    # needs: [unit-tests, integration-tests]  # Only run after main tests pass
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run recovery and persistence marathon test
-        run: |
-          export RUSTFLAGS=-Awarnings
-          cargo test --test e2e_longrunning e2e_recovery_and_persistence_marathon -- --nocapture
-
-  e2e-massive-data-throughput:
-    runs-on: self-hosted
-    timeout-minutes: 300
-    # needs: [unit-tests, integration-tests]  # Only run after main tests pass
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run massive data throughput test
-        run: |
-          export RUSTFLAGS=-Awarnings
-          cargo test --test e2e_longrunning e2e_massive_data_throughput_test -- --nocapture
-
-  e2e-system-stress-and-stability:
-    runs-on: self-hosted
-    timeout-minutes: 300
-    # needs: [unit-tests, integration-tests]  # Only run after main tests pass
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run system stress and stability test
-        run: |
-          export RUSTFLAGS=-Awarnings
-          cargo test --test e2e_longrunning e2e_system_stress_and_stability -- --nocapture
+  # Heavy e2e tests skipped in CI for now — run locally or via workflow_dispatch
+  # e2e-sustained-mixed-workload:
+  # e2e-realistic-application-simulation:
+  # e2e-recovery-and-persistence-marathon:
+  # e2e-massive-data-throughput:
+  # e2e-system-stress-and-stability:

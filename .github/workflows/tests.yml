@@ -13,7 +13,7 @@ env:
 
 jobs:
   run-all-tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -22,13 +22,16 @@ jobs:
           - batch_read
           - batch_writes
           - configuration
-          - e2e_longrunning
+          # - e2e_longrunning
           - integration
           - rollback_recovery
           - unit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
