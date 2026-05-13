@@ -11,8 +11,8 @@ use super::DELETION_TX;
 
 pub(super) struct BlockAllocator {
     next_block: UnsafeCell<Block>,
-    lock: AtomicBool,
     paths: Arc<WalPathManager>,
+    lock: AtomicBool,
 }
 
 impl BlockAllocator {
@@ -30,12 +30,12 @@ impl BlockAllocator {
                 id: 1,
                 offset: 0,
                 limit: DEFAULT_BLOCK_SIZE,
+                used: 0,
                 file_path: file1,
                 mmap,
-                used: 0,
             }),
-            lock: AtomicBool::new(false),
             paths,
+            lock: AtomicBool::new(false),
         })
     }
 
@@ -116,11 +116,11 @@ impl BlockAllocator {
         }
         let ret = Block {
             id: data.id,
-            file_path: data.file_path.clone(),
             offset: data.offset,
             limit: alloc_size,
-            mmap: data.mmap.clone(),
             used: 0,
+            file_path: data.file_path.clone(),
+            mmap: data.mmap.clone(),
         };
         // register the new block before handing it out
         BlockStateTracker::register_block(ret.id as usize, &ret.file_path);
@@ -200,8 +200,8 @@ pub(super) fn flush_check(file_path: String) {
 }
 
 struct BlockState {
-    is_checkpointed: AtomicBool,
     file_path: String,
+    is_checkpointed: AtomicBool,
 }
 
 pub(super) struct BlockStateTracker {}

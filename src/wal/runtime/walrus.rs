@@ -26,14 +26,14 @@ pub enum ReadConsistency {
 pub struct Walrus {
     pub(super) allocator: Arc<BlockAllocator>,
     pub(super) reader: Arc<Reader>,
-    pub(super) writers: RwLock<HashMap<String, Arc<Writer>>>,
     pub(super) fsync_tx: Arc<mpsc::Sender<String>>,
     pub(super) read_offset_index: Arc<RwLock<WalIndex>>,
-    pub(super) read_consistency: ReadConsistency,
-    pub(super) fsync_schedule: FsyncSchedule,
     pub(super) paths: Arc<WalPathManager>,
     topic_clean_tracker: Arc<TopicCleanTracker>,
+    pub(super) writers: RwLock<HashMap<String, Arc<Writer>>>,
     topic_entry_counts: RwLock<HashMap<String, u64>>,
+    pub(super) read_consistency: ReadConsistency,
+    pub(super) fsync_schedule: FsyncSchedule,
 }
 
 impl Walrus {
@@ -101,14 +101,14 @@ impl Walrus {
         let instance = Walrus {
             allocator,
             reader,
-            writers: RwLock::new(HashMap::new()),
             fsync_tx: tx_arc,
             read_offset_index: Arc::new(RwLock::new(idx)),
-            read_consistency: mode,
-            fsync_schedule,
             paths,
             topic_clean_tracker,
+            writers: RwLock::new(HashMap::new()),
             topic_entry_counts: RwLock::new(HashMap::new()),
+            read_consistency: mode,
+            fsync_schedule,
         };
         instance.startup_chore()?;
         Ok(instance)
@@ -324,11 +324,11 @@ impl Walrus {
                 // scan entries to compute used
                 let block_stub = Block {
                     id: next_block_id as u64,
-                    file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
                     used: 0,
+                    file_path: file_path.clone(),
+                    mmap: mmap.clone(),
                 };
                 let mut in_block_off: u64 = 0;
                 loop {
@@ -350,11 +350,11 @@ impl Walrus {
 
                 let block = Block {
                     id: next_block_id as u64,
-                    file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
                     used,
+                    file_path: file_path.clone(),
+                    mmap: mmap.clone(),
                 };
                 // register and append
                 BlockStateTracker::register_block(next_block_id, file_path);
