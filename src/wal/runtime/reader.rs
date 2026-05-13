@@ -9,11 +9,11 @@ pub(super) struct ColReaderInfo {
     pub(super) chain: Vec<Block>,
     pub(super) cur_block_idx: usize,
     pub(super) cur_block_offset: u64,
-    pub(super) reads_since_persist: u32,
     // In-memory progress for tail (active writer block). This allows AtLeastOnce
     // to advance between reads within a single process without persisting every time.
     pub(super) tail_block_id: u64,
     pub(super) tail_offset: u64,
+    pub(super) reads_since_persist: u32,
     // Ensure we only hydrate from persisted index once per process per column
     pub(super) hydrated_from_index: bool,
 }
@@ -69,9 +69,9 @@ impl Reader {
                         chain: Vec::new(),
                         cur_block_idx: 0,
                         cur_block_offset: 0,
-                        reads_since_persist: 0,
                         tail_block_id: 0,
                         tail_offset: 0,
+                        reads_since_persist: 0,
                         hydrated_from_index: false,
                     }))
                 })

@@ -21,11 +21,11 @@ pub(crate) struct Metadata {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub(crate) id: u64,
-    pub(crate) file_path: String,
     pub(crate) offset: u64,
     pub(crate) limit: u64,
-    pub(crate) mmap: Arc<SharedMmap>,
     pub(crate) used: u64,
+    pub(crate) file_path: String,
+    pub(crate) mmap: Arc<SharedMmap>,
 }
 
 impl Block {

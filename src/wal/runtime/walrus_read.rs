@@ -40,9 +40,9 @@ impl Walrus {
                         chain: Vec::new(),
                         cur_block_idx: 0,
                         cur_block_offset: 0,
-                        reads_since_persist: 0,
                         tail_block_id: 0,
                         tail_offset: 0,
+                        reads_since_persist: 0,
                         hydrated_from_index: false,
                     }))
                 })

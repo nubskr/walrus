@@ -21,10 +21,10 @@ use std::os::unix::io::AsRawFd;
 
 pub(super) struct Writer {
     allocator: Arc<BlockAllocator>,
-    current_block: Mutex<Block>,
     reader: Arc<Reader>,
-    col: String,
     publisher: Arc<mpsc::Sender<String>>,
+    col: String,
+    current_block: Mutex<Block>,
     current_offset: Mutex<u64>,
     fsync_schedule: FsyncSchedule,
     is_batch_writing: AtomicBool,
@@ -41,10 +41,10 @@ impl Writer {
     ) -> Self {
         Writer {
             allocator,
-            current_block: Mutex::new(current_block),
             reader,
-            col: col.clone(),
             publisher,
+            col: col.clone(),
+            current_block: Mutex::new(current_block),
             current_offset: Mutex::new(0),
             fsync_schedule,
             is_batch_writing: AtomicBool::new(false),
