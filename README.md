@@ -219,7 +219,7 @@ The specification abstracts Raft consensus as a single authoritative metadata so
 
 The underlying storage engine delivers exceptional performance:
 
-![Walrus vs RocksDB vs Kafka - No Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_no_fsync.png)
+![Walrus vs RocksDB vs Kafka - No Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_no_fsync.webp)
 
 | System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
 |----------|----------------------------|------------------------|-----------------------------|--------------------------|
@@ -229,7 +229,7 @@ The underlying storage engine delivers exceptional performance:
 
 With fsync enabled on each write (ensuring data is flushed to disk before acknowledging):
 
-![Walrus vs RocksDB vs Kafka - With Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.png)
+![Walrus vs RocksDB vs Kafka - With Fsync](https://nubskr.com/assets/images/walrus/walrus_vs_rocksdb_kafka_fsync.webp)
 
 | System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
 |----------|----------------------------|------------------------|-----------------------------|--------------------------|
