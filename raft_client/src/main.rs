@@ -21,11 +21,16 @@ async fn main() -> Result<()> {
 
     info!("Raft Client: Connecting to Node {} at {}", node_id, bind_addr);
 
+    // We bind the `TempDir` to a variable `temp_dir` to keep it in scope
+    // the directory will now persist until `main()` finishes
+    let temp_dir = tempfile::tempdir()?;
+    let wal_dir_path = temp_dir.path().to_path_buf();
+
     let oct_cfg = OctopiiConfig {
         node_id,
         bind_addr,
         peers: vec![], // No peers needed for a client that only queries
-        wal_dir: tempfile::tempdir()?.path().to_path_buf(), // Temp dir for client's WAL
+        wal_dir: wal_dir_path, // Use the path derived from the live `TempDir`
         is_initial_leader: false,
         ..Default::default()
     };
@@ -77,6 +82,7 @@ async fn main() -> Result<()> {
     } else {
         info!("Node {} is NOT the current leader (leader is {:?}).", node_id, metrics.current_leader);
     }
+    // `temp_dir` is dropped here when `main` returns, cleaning up the directory.
 
     Ok(())
 }
